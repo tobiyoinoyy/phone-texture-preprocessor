@@ -1,0 +1,18 @@
+{
+  "name": "phone-texture-preprocessor",
+  "version": "1.0.0",
+  "description": "手机贴图预处理：图片标准化、四面边框摆正、按钮与天线结构对齐。",
+  "author": {
+    "name": "tobiyoinoyy"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "手机贴图预处理工具",
+    "shortDescription": "合并图片标准化、边框角度矫正与结构对齐。",
+    "longDescription": "统一入口完成六面标准化、四面边框摆正及按钮与天线对齐；按各 SKU 背板和模型 UV 标定接缝，成品与过程文件分开保存。",
+    "developerName": "tobiyoinoyy",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "处理手机六面贴图：按输入状态选择标准化或边框摆正，按钮按指定SKU对齐，天线按各自背板及当前模型UV标定；六面成品与过程资料分开保存。"
+  }
+}

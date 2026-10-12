@@ -1,0 +1,41 @@
+{
+  "normalizer": {
+    "repository": "https://github.com/tobiyoinoyy/phone-product-normalizer.git",
+    "base_commit": "49b28b1e7acbe8a00bbd5e429dfd4d81171e40ae",
+    "source_files": {
+      "phone_normalizer/__init__.py": "0ba116f3ea157a7ff7321e8b3678d79efdcf20a81f138dfbd38d82a2856fbbb3",
+      "phone_normalizer/__main__.py": "4ea23cb874af634f4c957311ce8f34c3405afa2b0d9ec2f37adfefd878d0ad9d",
+      "phone_normalizer/api.py": "03b6e9ec550b485f910a72b6ec2277eea03e17042a21d858b37ef0ffdc595f3b",
+      "phone_normalizer/body_geometry.py": "06c613168fc74cddb17c38fc8b5d605a583f743cb82039dc504d7a839fe697c5",
+      "phone_normalizer/cli.py": "485e96e6978d4fc7fb20aa241956eb82da2ee2e8e06c6295bd0962ff6eaa8d91",
+      "phone_normalizer/frame_cli.py": "979e351018ddc7f4e19fae6ff8a683b7bec72b554e435c26b2b39cf82e72f9de",
+      "phone_normalizer/frame_strip.py": "49ce9d39c63677d3228f59f0f5bb725f1d461afa3c454256eabb3a611dc02dce",
+      "phone_normalizer/uv.py": "69f2b25670af3509a88fa1630b7119eb2d7baa6b3f6c7799fb2c817b43864f0b",
+      "phone_normalizer/uv_cli.py": "7f94c470a80ed9b1fcee3deed49ec280c68010fc878c5cf2d3c3d86a639db6dd",
+      "phone_normalizer/uv_diagnostics.py": "d04d3916ec000fac68198ccb43e788f4469da7993fd48118963f97adb5c01644",
+      "phone_normalizer/uv_profile.py": "72628320ab6fe66f0e0d5295d0378f3ef99148dc6bfe920e7b69a3dfe4d309e4",
+      "scripts/__init__.py": "e033b6d5b8b02a58a0fb6418cc4c500057fc5f1078c5f295f911e3f1658b9e9e",
+      "scripts/batch_normalize.py": "a9e1b97450b218261fbd720efddbc5efe463da98505bf4fde635ae45ac2e0eca",
+      "scripts/geometry_postprocess.py": "1799e60033a378807a5307642a178dbd1a2004cc49022dd00fc1f94fa7895c4e",
+      "scripts/phone_normalizer_gui.py": "a59877fa02173116a02956710f6304d69b51f51a7917fe20185349c091557d86",
+      "scripts/precise_geometry.py": "a5ae340ddd34cc264b143e4125016324644019883dbf5dc50614976c059e8601",
+      "scripts/segmentation.py": "09aecb72cb7165477e6a587edfcce844743adc931f2a23926c637e63a60468aa"
+    },
+    "local_changes": [
+      "phone_normalizer/frame_cli.py",
+      "phone_normalizer/frame_strip.py",
+      "tests/test_frame_strip.py"
+    ]
+  },
+  "alignment": {
+    "repository": "https://github.com/tobiyoinoyy/texture-button-aligner.git",
+    "base_commit": "f98f6e757fd121cec4d2f6f18becd8b026ef2143",
+    "source_files": {
+      "scripts/align_textures.py": "28bc266319230361f400c6191339a329f60bfa9ade8d303ad52718deb58e71fe",
+      "scripts/blender_scene_guard.py": "beb7af71f69ed9fbb26a9b4560e92c0ece74dbc5b96928b18d96ece7e1e7bf6e",
+      "scripts/calibrate_antennas_17pro.py": "d91dd77b23a78330d7e704c6b5afcbe3be6eec47f0ebeba91d69050ead1ce11c",
+      "scripts/seam_targets.py": "da160d6a3f3c64f04d273e4cb7ff1d4ed85bed36bbf161339354730862ddde38"
+    },
+    "local_changes": []
+  }
+}

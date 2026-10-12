@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><title>按钮与天线高度对齐</title>
+<style>body{margin:24px;background:#17191d;color:#eee;font:15px system-ui}header{position:sticky;top:0;background:#17191d;padding:12px;z-index:2;border-bottom:1px solid #555}button,select,input{padding:8px;margin:4px}main{display:flex;gap:35px;padding:20px}.column{display:flex;flex-direction:column;align-items:center}canvas{background:repeating-conic-gradient(#292c31 0% 25%,#24272b 0% 50%) 50%/16px 16px;cursor:crosshair}p{max-width:1000px;line-height:1.6}#status{color:#ffd17c}.legend{color:#aab1be}</style>
+<header><b>按钮与天线高度对齐 · 顶部和底部固定</b><p>先标 sku0，再标其他 SKU。同一侧按从上到下的顺序点选上方天线、每个按钮、下方天线的上沿和下沿；两侧可以使用不同数量的点。点击已有线附近可删除。红线是 sku0 目标，绿色是当前图标记。全部完成后导出标记文件。</p>
+<select id="side"><option>left</option><option>right</option></select><select id="sku"></select>
+<button id="undo">撤销当前图最后一个点</button><button id="clear">清空当前图</button><button id="save">导出标记文件</button><label>载入标记<input type="file" id="load" accept=".json"></label>
+<span id="status"></span><div class="legend">纵向显示原始像素，横向放大方便点选。天线有倾斜参数时显示的是中心位置；不要增删点，应同时维护对应斜率数组。页面不联网；刷新前请导出保存。</div></header>
+<main><div class="column"><h3 id="refTitle"></h3><canvas id="refCanvas"></canvas></div><div class="column"><h3 id="currentTitle"></h3><canvas id="currentCanvas"></canvas></div></main>
+<script>
+const payload=/*PAYLOAD*/;
+let annotations=payload.annotations;const images=payload.images, cache={}, history=[];
+const $=s=>document.getElementById(s),reference=annotations.reference;
+Object.keys(annotations.points).sort((a,b)=>a===reference?-1:b===reference?1:a.localeCompare(b,undefined,{numeric:true})).forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;$('sku').append(o)});
+function points(name){return annotations.points[name][$('side').value]}
+function renderCanvas(id,name){const side=$('side').value,entry=images.find(i=>i.sku===name&&i.side===side),canvas=$(id);
+ if(!cache[entry.file]){let im=new Image();cache[entry.file]=im;im.onload=render;im.src=entry.url;return}
+ const im=cache[entry.file];if(!im.complete)return;
+ canvas.width=Math.max(180,entry.width);canvas.height=entry.height;
+ const ctx=canvas.getContext('2d');ctx.drawImage(im,0,0,canvas.width,canvas.height);
+ for(const [vals,color] of [[annotations.targets_by_sku?.[name]?.[$('side').value] ?? annotations.targets?.[$('side').value] ?? points(reference),'#ff6a68'],[points(name),'#56edab']]) vals.forEach((y,i)=>{ctx.strokeStyle=color;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,y+.5);ctx.lineTo(canvas.width,y+.5);ctx.stroke();ctx.fillStyle=color;ctx.font='12px monospace';ctx.fillText((i+1)+': '+y,3,Math.max(12,y-3))});
+}
+function render(){const name=$('sku').value; $('refTitle').textContent=reference+(annotations.targets_by_sku?' · 按钮基准；天线用各自背板目标':' · 基准（可直接点击标注）');$('currentTitle').textContent=name+' · 当前';renderCanvas('refCanvas',reference);renderCanvas('currentCanvas',name);const side=$('side').value,n=points(reference).length;let done=Object.keys(annotations.points).filter(k=>points(k).length===n&&n>0).length;$('status').textContent=`${side}：基准 ${n} 点；当前 ${points(name).length} 点；数量匹配 ${done}/${Object.keys(annotations.points).length}`}
+function click(e,name){const canvas=e.currentTarget,r=canvas.getBoundingClientRect(),y=Math.round((e.clientY-r.top)*canvas.height/r.height);if(y<=0||y>=annotations.height-1)return;const p=points(name);history.push({name,side:$('side').value,points:[...p]});const near=p.findIndex(v=>Math.abs(v-y)<=3);if(near>=0)p.splice(near,1);else{p.push(y);p.sort((a,b)=>a-b)}render()}
+$('refCanvas').onclick=e=>click(e,reference);$('currentCanvas').onclick=e=>click(e,$('sku').value);$('side').onchange=render;$('sku').onchange=render;
+$('undo').onclick=()=>{const name=$('sku').value,side=$('side').value;for(let i=history.length-1;i>=0;i--)if(history[i].name===name&&history[i].side===side){annotations.points[name][side]=history.splice(i,1)[0].points;render();break}};
+$('clear').onclick=()=>{const name=$('sku').value;history.push({name,side:$('side').value,points:[...points(name)]});annotations.points[name][$('side').value]=[];render()};
+$('save').onclick=()=>{const blob=new Blob([JSON.stringify(annotations,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='landmarks.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+$('load').onchange=async e=>{try{const a=JSON.parse(await e.target.files[0].text());if(a.reference!==reference||a.height!==annotations.height)throw Error('基准或高度不匹配');for(const name of Object.keys(annotations.points))for(const side of ['left','right']){const p=a.points[name][side];if(!Array.isArray(p)||p.some((v,i)=>!Number.isFinite(v)||v<=0||v>=a.height-1||(i&&v<=p[i-1])))throw Error('标记无效')}annotations=a;history.length=0;render()}catch(err){alert(err.message)}};
+render();
+</script>
