@@ -45,7 +45,9 @@ def face_files(folder):
     return files
 
 
-def intake(source, work, skus=None, single_name='SKU_01'):
+def intake(source, work, skus=None, single_name='SKU_01', delivery_goal='model_textures', goal_reason=None):
+    if delivery_goal not in ('model_textures', 'photos') or (delivery_goal == 'photos' and not goal_reason):
+        raise ValueError('Photos-only delivery needs an explicit user scope reason')
     source, work = separate_paths(source, work)
     fresh(work)
     is_single = any(p.is_file() and p.stem.lower() in FACES and p.suffix.lower() in EXTENSIONS for p in source.iterdir())
@@ -61,7 +63,7 @@ def intake(source, work, skus=None, single_name='SKU_01'):
     if not selected or (is_single and skus and set(skus) != {single_name}):
         raise ValueError('Empty selection or invalid single-folder selection')
     records = {sku: face_files(folder) for sku, folder in selected.items()}
-    manifest = {'source_root': str(source), 'skus': {}}
+    manifest = {'source_root': str(source), 'delivery_goal': delivery_goal, 'goal_reason': goal_reason, 'skus': {}}
     work.mkdir(parents=True)
     for sku, faces in records.items():
         (work/'input'/sku).mkdir(parents=True)
@@ -186,9 +188,16 @@ def delivery_overview(before, after, path):
     sheet.save(path)
 
 
-def publish(work, plan_path, output):
+def publish(work, plan_path, output, structure_process=None, structure_review=None):
     work, output = Path(work).resolve(), Path(output).resolve()
     manifest = read(work/'intake.json')
+    goal = manifest.get('delivery_goal', 'model_textures')
+    if goal not in ('model_textures', 'photos'):
+        raise ValueError('Unknown delivery goal')
+    if goal == 'photos' and not manifest.get('goal_reason'):
+        raise ValueError('Photos-only delivery lacks user scope reason')
+    if goal == 'model_textures' and (not structure_process or not structure_review):
+        raise ValueError('Model textures require structure alignment and visual review before publication')
     separate_paths(work, output, manifest['source_root'])
     fresh(output)
     baseline, plan = read(work/'geometry.json'), read(plan_path)
@@ -260,6 +269,18 @@ def publish(work, plan_path, output):
                 record['local_review_sha256'] = check_review(intended, src, dst, entry['local_review'])
                 record['local_status'] = 'effect_and_visual_review_passed'
             after[sku][face], report[sku][face] = dst, record
+    structure = {'status': 'not_requested_photos_only'}
+    if goal == 'model_textures':
+        from phone_texture.structure_review import verify_delivery
+        separate_paths(output, structure_process)
+        after, structure = verify_delivery(after, structure_process, structure_review)
+        for sku, faces in after.items():
+            for face, path in faces.items():
+                record = report[sku][face]
+                record['lighting_output_sha256'] = record['output_sha256']
+                record['pixel_constraints_stage'] = 'lighting_before_structure'
+                record['output_sha256'] = sha(path)
+                record['structure_changed'] = record['output_sha256'] != record['lighting_output_sha256']
     # Recheck at publication, then copy to a sibling staging directory. A failed
     # validation never creates a misleading complete-looking delivery folder.
     check_sources(manifest)
@@ -278,7 +299,7 @@ def publish(work, plan_path, output):
     finally:
         if staged.exists():
             shutil.rmtree(staged)
-    save(work/'validation.json', {'geometry_status':'approved', 'lighting_status': 'pixel_constraints_passed',
+    save(work/'validation.json', {'delivery_goal':goal, 'structure':structure, 'geometry_status':'approved', 'lighting_status': 'pixel_constraints_passed',
                                  'lighting_scope_sha256': sha(work/'lighting-scope.json'),
                                  'perimeter_status': 'passed' if any(v.get('perimeter_status') for fs in report.values() for v in fs.values()) else 'not_requested',
                                  'model_seams': 'not_checked', 'skus': report})
@@ -294,6 +315,8 @@ def main():
     p.add_argument('--work', required=True)
     p.add_argument('--skus', nargs='+')
     p.add_argument('--single-name', default='SKU_01')
+    p.add_argument('--delivery-goal', choices=('model_textures','photos'), default='model_textures')
+    p.add_argument('--goal-reason', help='User-authorized photos-only scope; never use to bypass failed alignment')
     p = sub.add_parser('checkpoint')
     p.add_argument('--work', required=True)
     p.add_argument('--geometry', required=True)
@@ -307,13 +330,22 @@ def main():
     p.add_argument('--face', choices=('front', 'back'), required=True)
     p.add_argument('--candidate', required=True)
     p.add_argument('--output', required=True)
+    p = sub.add_parser('align-structure')
+    p.add_argument('--input', required=True, help='Complete six-face lighting candidates')
+    p.add_argument('--spec', required=True)
+    p.add_argument('--process', required=True)
     p = sub.add_parser('publish')
     p.add_argument('--work', required=True)
     p.add_argument('--plan', required=True)
+    p.add_argument('--structure-process')
+    p.add_argument('--structure-review')
     p.add_argument('--output', required=True)
     a = parser.parse_args()
     if a.command == 'intake':
-        result = intake(a.input, a.work, a.skus, a.single_name)
+        result = intake(a.input, a.work, a.skus, a.single_name, a.delivery_goal, a.goal_reason)
+    elif a.command == 'align-structure':
+        from phone_texture.structure_review import prepare
+        result = prepare(a.input, a.spec, a.process)
     elif a.command == 'checkpoint':
         result = checkpoint(a.work, a.geometry, a.geometry_report)
     elif a.command == 'lighting-scope':
@@ -323,8 +355,8 @@ def main():
         src = read(Path(a.work)/'geometry.json')[a.sku][a.face]['path']
         result = evidence_images(scope, src, a.candidate, a.output)
     else:
-        result = publish(a.work, a.plan, a.output)
-    print(json.dumps({'command': a.command, 'status': 'passed', 'groups': len(result.get('skus', result))}))
+        result = publish(a.work, a.plan, a.output, a.structure_process, a.structure_review)
+    print(json.dumps({'command': a.command, 'status': result.get('status', 'passed'), 'groups': len(result.get('skus', result))}))
 
 
 if __name__ == '__main__':

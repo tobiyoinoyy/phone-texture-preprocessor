@@ -94,3 +94,7 @@ python scripts/test_all.py
 > 使用 phone-six-view-process 处理这个六面图文件夹：裁切、摆正、按材质优化光照，按本次要求校准按钮和天线，检查轮廓与局部暗斑。六面成品与过程分开，并用一张图展示全部结果。
 
 旧光照仓库仅保留历史来源，后续改动在本库维护；来源版本记录于 [lighting-origins.json](docs/lighting-origins.json)。
+
+## 模型贴图发布检查（1.4）
+
+六面入口默认交付模型贴图，结构对齐是必需步骤。光照候选生成后执行 `workspace.py align-structure`，核对上下天线四边界、宽度、两端与按钮，再以 `--structure-process` 和 `--structure-review` 发布。缺步骤或使用过期结果会被拒绝；只有明确的照片任务可在 intake 使用 `--delivery-goal photos --goal-reason ...`。完整字段和命令见[结构发布门禁](skills/phone-six-view-process/references/structure-delivery.md)。图片检查通过不替代当前模型 UV 接缝检查。

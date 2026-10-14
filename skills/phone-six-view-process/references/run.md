@@ -42,6 +42,8 @@ python workspace.py checkpoint --work 本轮过程 --geometry 本轮过程/geome
 
 ## 发布清单
 
+模型贴图还必须执行[结构对齐与最终发布](structure-delivery.md)。以下清单验证光照输入，最终发布使用已检查的结构结果。`intake` 默认模型贴图；照片样图例外必须在 intake 显式给出 `--delivery-goal photos --goal-reason 用户的照片任务范围`，不能事后降级跳过检查。
+
 写 `本轮过程/delivery.json`，逐 SKU、逐面登记，六面均必填。例中仅展示两个面，其余同样登记：
 
 ```json
@@ -63,7 +65,8 @@ python workspace.py checkpoint --work 本轮过程 --geometry 本轮过程/geome
 `action` 为 `copy/aluminum/stainless`，copy 从登记的 geometry 按字节复制；修复面必须提供落盘结果、源坐标有效允许蒙版、保护蒙版、参数记录和说明。铝工具导出的 editable/protected 可直接使用；不锈钢需由高光、alpha、保护求最终允许蒙版。这份清单记录范围依据，发布器验证像素边界，不代替对材料、job 或视觉效果的判断。仍有未完成的必需光照处理时不要将 action 改为 copy 冒充成功。
 
 ```bash
-python workspace.py publish --work 本轮过程 --plan 本轮过程/delivery.json --output 六面成品
+python workspace.py publish --work 本轮过程 --plan 本轮过程/delivery.json \
+  --structure-process 独立结构过程 --structure-review 独立结构过程/review.json --output 六面成品
 ```
 
 输出目录必须新建且与过程、原图互不包含。所有 SKU 都检查合格才发布；失败保留过程供检查。`validation.json` 存源/基线/输出哈希、变化像素与检查结果；`overview.png` 是分面前后总览。用图像工具查看总览，再逐一检查完整按钮和明显损伤近景。不能仅凭脚本退出码交付。

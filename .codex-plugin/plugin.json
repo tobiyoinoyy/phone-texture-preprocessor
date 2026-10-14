@@ -1,6 +1,6 @@
 {
   "name": "phone-texture-preprocessor",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "手机六面贴图完整工作流：标准化、摆正、结构对齐、铝金属光照与不锈钢高光修复。",
   "author": {
     "name": "tobiyoinoyy"
@@ -13,6 +13,6 @@
     "developerName": "tobiyoinoyy",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": "处理手机六面贴图：先生成候选，核对六面四角、完整下缘与支架接触区；几何复核合格后才能发布、冻结光照基线。角度、保留轮廓和局部支架蒙版分别处理；按钮按指定 SKU、天线按各自背板和当前 UV 标定，过程与六面成品分开。 iPhone 17 系列可用正背面机身与天线标记映射侧面，按钮单独标定；用户只保护贴纸时执行 sticker_only，禁止额外冻结带，局部暗斑逐项复核。"
+    "defaultPrompt": "处理手机六面贴图：先生成候选，核对六面四角、完整下缘与支架接触区；几何复核合格后才能发布、冻结光照基线。角度、保留轮廓和局部支架蒙版分别处理；按钮按指定 SKU、天线按各自背板和当前 UV 标定，过程与六面成品分开。 iPhone 17 系列可用正背面机身与天线标记映射侧面，按钮单独标定；用户只保护贴纸时执行 sticker_only，禁止额外冻结带，局部暗斑逐项复核。 模型贴图默认 model_textures，光照候选之后必须 align-structure 并通过结构发布门禁；禁止只完成光照就发布模型贴图。"
   }
 }

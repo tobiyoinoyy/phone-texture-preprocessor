@@ -19,7 +19,7 @@ def setup(tmp):
     for f in w.FACES:
         Image.new('RGBA', (16, 32), (120, 100, 90, 255)).save(source/(f+'.png'))
     work = tmp/'process'
-    w.intake(source, work)
+    w.intake(source, work, delivery_goal="photos", goal_reason="Test user requests lighting-only photos")
     geometry = work/'geometry'/'SKU_01'
     geometry.mkdir(parents=True)
     for f in w.FACES:
