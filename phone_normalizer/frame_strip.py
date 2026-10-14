@@ -132,7 +132,7 @@ def extract_frame_strip(image: Image.Image, *, face='bottom', margin_px=0.5):
     }
 
 
-def normalize_frame_strip(image: Image.Image, *, face='bottom', deskew=None):
+def normalize_frame_strip(image: Image.Image, *, face='bottom', deskew=None, stage_sink=None):
     """Extract, deskew, tightly crop, then apply the named view orientation.
 
     All four frame views default to deskew. Pass deskew=False to reproduce
@@ -140,6 +140,11 @@ def normalize_frame_strip(image: Image.Image, *, face='bottom', deskew=None):
     are exact pixel permutations; only the small deskew rotation resamples.
     """
     result, info = extract_frame_strip(image, face=face)
+    if stage_sink:
+        stage_sink('source_matte', image.copy())
+        source_space = Image.new('RGBA', image.size)
+        source_space.paste(result, tuple(info['crop_xyxy'][:2]))
+        stage_sink('after_support', source_space)
     if deskew is None:
         deskew = True
     slopes=[info['top_rail_y_from_x'][0],info['bottom_rail_y_from_x'][0]]
@@ -155,6 +160,8 @@ def normalize_frame_strip(image: Image.Image, *, face='bottom', deskew=None):
     else:
         crop=[0,0,result.width,result.height]
     horizontal_size=list(result.size)
+    if stage_sink:
+        stage_sink('after_rotation', result.copy())
     turns={'right':-1,'left':1}.get(face,0)
     if turns:
         result=result.transpose(Image.Transpose.ROTATE_270 if turns==-1 else Image.Transpose.ROTATE_90)

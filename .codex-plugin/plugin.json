@@ -1,6 +1,6 @@
 {
   "name": "phone-texture-preprocessor",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "手机贴图预处理：图片标准化、四面边框摆正、按钮与天线结构对齐。",
   "author": {
     "name": "tobiyoinoyy"
@@ -9,10 +9,10 @@
   "interface": {
     "displayName": "手机贴图预处理工具",
     "shortDescription": "合并图片标准化、边框角度矫正与结构对齐。",
-    "longDescription": "统一入口完成六面标准化、四面边框摆正及按钮与天线对齐；按各 SKU 背板和模型 UV 标定接缝，成品与过程文件分开保存。",
+    "longDescription": "统一处理六面图片，支持正背面图片参考或模型 UV 的结构对齐；按材质优化光照，保护策略和局部效果分别验收。",
     "developerName": "tobiyoinoyy",
     "category": "Productivity",
     "capabilities": [],
-    "defaultPrompt": "处理手机六面贴图：按输入状态选择标准化或边框摆正，按钮按指定SKU对齐，天线按各自背板及当前模型UV标定；六面成品与过程资料分开保存。"
+    "defaultPrompt": "处理手机六面贴图：先生成候选，核对六面四角、完整下缘与支架接触区；几何复核合格后才能发布、冻结光照基线。角度、保留轮廓和局部支架蒙版分别处理；按钮按指定 SKU、天线按各自背板和当前 UV 标定，过程与六面成品分开。 iPhone 17 系列可用正背面机身与天线标记映射侧面，按钮单独标定；用户只保护贴纸时执行 sticker_only，禁止额外冻结带，局部暗斑逐项复核。"
   }
 }

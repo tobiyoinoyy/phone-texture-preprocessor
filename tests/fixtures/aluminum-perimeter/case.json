@@ -1,0 +1,106 @@
+{
+  "front": {
+    "source_sha256": "06ce8a65a8ed02d2d5e494a12464c736521ff769609b7978a20a2fe6b231b8d9",
+    "action": "aluminum",
+    "mode": "perimeter",
+    "reason": "正背面整圈金属去重黑边",
+    "reference_basis": "本机原始金属参考：front 顶边稳定铜色带，back 相机台下沿稳定金属；用户旧成品仅作效果参照。L范围front 52..78，back 58..82，固定本案例，不能套其他色款。",
+    "required_metal_mask": "front-required.png",
+    "zones": {
+      "top": {
+        "mask": "front-top.png",
+        "min_L": 52,
+        "max_L": 78
+      },
+      "bottom": {
+        "mask": "front-bottom.png",
+        "min_L": 52,
+        "max_L": 78
+      },
+      "left": {
+        "mask": "front-left.png",
+        "min_L": 52,
+        "max_L": 78
+      },
+      "right": {
+        "mask": "front-right.png",
+        "min_L": 52,
+        "max_L": 78
+      },
+      "top_left": {
+        "mask": "front-top_left.png",
+        "min_L": 52,
+        "max_L": 78
+      },
+      "top_right": {
+        "mask": "front-top_right.png",
+        "min_L": 52,
+        "max_L": 78
+      },
+      "bottom_left": {
+        "mask": "front-bottom_left.png",
+        "min_L": 52,
+        "max_L": 78
+      },
+      "bottom_right": {
+        "mask": "front-bottom_right.png",
+        "min_L": 52,
+        "max_L": 78
+      }
+    },
+    "protection_policy": "reviewed_regions",
+    "protection_basis": "Historical perimeter-only checkpoint; superseded by sticker-only/local-feature regression for current acceptance"
+  },
+  "back": {
+    "source_sha256": "526307f4a3fab88ec316853b17cf4814d08284986142e8135102b2dce9833e2e",
+    "action": "aluminum",
+    "mode": "perimeter",
+    "reason": "正背面整圈金属去重黑边",
+    "reference_basis": "本机原始金属参考：front 顶边稳定铜色带，back 相机台下沿稳定金属；用户旧成品仅作效果参照。L范围front 52..78，back 58..82，固定本案例，不能套其他色款。",
+    "required_metal_mask": "back-required.png",
+    "zones": {
+      "top": {
+        "mask": "back-top.png",
+        "min_L": 58,
+        "max_L": 82
+      },
+      "bottom": {
+        "mask": "back-bottom.png",
+        "min_L": 58,
+        "max_L": 82
+      },
+      "left": {
+        "mask": "back-left.png",
+        "min_L": 58,
+        "max_L": 82
+      },
+      "right": {
+        "mask": "back-right.png",
+        "min_L": 58,
+        "max_L": 82
+      },
+      "top_left": {
+        "mask": "back-top_left.png",
+        "min_L": 58,
+        "max_L": 82
+      },
+      "top_right": {
+        "mask": "back-top_right.png",
+        "min_L": 58,
+        "max_L": 82
+      },
+      "bottom_left": {
+        "mask": "back-bottom_left.png",
+        "min_L": 58,
+        "max_L": 82
+      },
+      "bottom_right": {
+        "mask": "back-bottom_right.png",
+        "min_L": 58,
+        "max_L": 82
+      }
+    },
+    "protection_policy": "reviewed_regions",
+    "protection_basis": "Historical perimeter-only checkpoint; superseded by sticker-only/local-feature regression for current acceptance"
+  }
+}

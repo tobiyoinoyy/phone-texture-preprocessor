@@ -90,6 +90,7 @@ def normalize_candidate(
     max_geometry_pixels: Any = DEFAULT_MAX_GEOMETRY_PIXELS,
     require_support_border: bool = False,
     preserve_canvas: bool = False,
+    stage_sink=None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Return a cropped RGBA candidate and JSON-compatible diagnostics.
 
@@ -122,6 +123,8 @@ def normalize_candidate(
         (int(source.shape[1]), int(source.shape[0])), config.max_geometry_pixels
     )
     work = source.copy()
+    if stage_sink:
+        stage_sink('source_matte', work.copy())
     alpha_sum_before_support = int(work[..., 3].sum(dtype=np.uint64))
     support = find_support_cut(work[..., 3], config) if remove_support else None
     work[..., 3] = clip_support(
@@ -136,6 +139,8 @@ def normalize_candidate(
         work[..., 3].sum(dtype=np.uint64)
     )
     work, initial_cleanup = _keep_connected_soft_alpha(work, geometry_threshold)
+    if stage_sink:
+        stage_sink('after_support', work.copy())
     angle = estimate_long_angle(work[..., 3], geometry_threshold)
     rotation = 0.0
     if deskew and angle is not None:
@@ -145,6 +150,8 @@ def normalize_candidate(
             rotation = candidate_rotation
     rotated = rotate_alpha_safe(work, rotation)
     rotated, rotated_cleanup = _keep_connected_soft_alpha(rotated, geometry_threshold)
+    if stage_sink:
+        stage_sink('after_rotation', rotated.copy())
 
     positioning = _largest(rotated[..., 3] >= crop_threshold)
     ys, xs = np.where(positioning)
@@ -157,6 +164,10 @@ def normalize_candidate(
     x0, y0, x1, y1 = box
     # Pure slicing is essential: do NOT apply the positioning mask to alpha.
     output = rotated[y0:y1, x0:x1].copy()
+    if stage_sink:
+        cropped_canvas = np.zeros_like(rotated)
+        cropped_canvas[y0:y1, x0:x1] = output
+        stage_sink('after_crop', cropped_canvas)
     full_alpha = rotated[..., 3]
     output_alpha = output[..., 3]
     removed_by_crop = int(np.count_nonzero(full_alpha)) - int(

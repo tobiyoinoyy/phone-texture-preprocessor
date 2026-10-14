@@ -45,31 +45,22 @@ def validate_points(points, height, label):
     return np.r_[0., p, height - 1.]
 
 
+def anchor_matrix(points, height, width, label):
+    a=np.asarray(points,dtype=float)
+    if a.ndim==1:a=np.repeat(a[:,None],width,axis=1)
+    if a.ndim!=2 or a.shape[1]!=width:
+        raise ValueError(f'{label}: anchor columns differ from texture width')
+    return np.stack([validate_points(a[:,x],height,f'{label} column {x}') for x in range(width)],axis=1)
+
+
 def warp_rows(image, source, target):
-    """Inverse piecewise mapping. Source can be anchors or anchors × columns."""
-    image = image.convert('RGBA')
-    h = image.height
-    source_array = np.asarray(source, dtype=float)
-    if source_array.ndim == 2:
-        if source_array.shape[1] != image.width:
-            raise ValueError('逐列定位点宽度与贴图不一致')
-        dst = validate_points(target, h, 'target')
-        maps = []
-        for x in range(image.width):
-            src = validate_points(source_array[:, x], h, f'source column {x}')
-            if len(src) != len(dst):
-                raise ValueError('源图与目标标记数量必须相同')
-            maps.append(np.interp(np.arange(h), dst, src))
-        rows = np.asarray(maps).T
-        return sample_rows(image, rows)
-    src = validate_points(source, h, 'source')
-    dst = validate_points(target, h, 'target')
-    if len(src) != len(dst):
-        raise ValueError('源图与 sku0 标记数量必须相同')
-    if np.array_equal(src, dst):
-        return image.copy()
-    rows = np.interp(np.arange(h), dst, src)
-    return sample_rows(image, np.broadcast_to(rows[:, None], (h, image.width)))
+    """Inverse mapping with independently reviewed front/back edge targets."""
+    image=image.convert('RGBA');h=image.height;w=image.width
+    src=anchor_matrix(source,h,w,'source');dst=anchor_matrix(target,h,w,'target')
+    if src.shape!=dst.shape:raise ValueError('源图与目标标记数量必须相同')
+    if np.array_equal(src,dst):return image.copy()
+    rows=np.stack([np.interp(np.arange(h),dst[:,x],src[:,x]) for x in range(w)],axis=1)
+    return sample_rows(image,rows)
 
 
 def sample_rows(image, rows):
@@ -200,14 +191,14 @@ def apply(args):
         if digest(Path(item['source'])) != item['sha256']:
             raise ValueError(f'{item["sku"]}/{item["name"]}: 原有贴图已变化，请重新准备批次')
     for side in SIDES:
-        validate_points(target_points(config, ref, side), h, f'{ref}/{side}')
+        anchor_matrix(target_points(config, ref, side), h, manifest['sizes'][side][0], f'{ref}/{side}')
     # Check the whole batch before emitting any images.
     for item in manifest['images']:
         name, side = item['sku'], item['side']
         if digest(work / item['file']) != item['sha256']:
             raise ValueError(f'{name}/{side}: 标准化图片已经变化，请重新标注')
         src = validate_points(config['points'][name][side], h, f'{name}/{side}')
-        dst = validate_points(target_points(config, name, side), h, 'reference')
+        dst = anchor_matrix(target_points(config, name, side), h, manifest['sizes'][side][0], 'reference')
         if len(src) != len(dst):
             raise ValueError(f'{name}/{side}: 标记数量与 sku0 不一致')
         anchors = source_anchors(config, name, side, manifest['sizes'][side][0])
@@ -227,13 +218,13 @@ def apply(args):
         dest.parent.mkdir(parents=True, exist_ok=True)
         result.save(dest)
         assert result.size == original.size
-        src = validate_points(source, h, 'source')
-        dst = validate_points(target, h, 'target')
+        src = anchor_matrix(source_anchors(config,name,side,original.width), h, original.width, 'source')
+        dst = anchor_matrix(target, h, original.width, 'target')
         report['images'].append({'sku': name, 'side': side, 'size': list(result.size),
             'source_y': source, 'target_y': target,
             'source_slopes': config.get('antenna_slopes', {}).get(name, {}).get(side),
             'max_shift_px': float(np.max(np.abs(src - dst))),
-            'segment_stretch': (np.diff(dst) / np.diff(src)).tolist(),
+            'segment_stretch': (np.diff(dst,axis=0) / np.diff(src,axis=0)).tolist(),
             'sha256': digest(dest)})
     report['companions'] = []
     for item in manifest.get('companions', []):
@@ -266,9 +257,11 @@ def make_review(work, output, manifest, config, side):
                 x = col * cell + 8 + j * (display_w + 18)
                 draw.text((x, 28), label, fill='white')
                 board.paste(im, (x, 55), im)
-                for y in target_points(config, name, side):
-                    yy = 55 + round(y * (display_h - 1) / (h - 1))
-                    draw.line((x, yy, x + display_w, yy), fill='#ff5e58')
+                for row in np.asarray(target_points(config, name, side)):
+                    ends=np.atleast_1d(row)
+                    y0=55+round(float(ends[0])*(display_h-1)/(h-1))
+                    y1=55+round(float(ends[-1])*(display_h-1)/(h-1))
+                    draw.line((x,y0,x+display_w,y1),fill='#ff5e58')
         board.save(output / f'review-{side}-{start // 8 + 1}.jpg', quality=94)
 
 

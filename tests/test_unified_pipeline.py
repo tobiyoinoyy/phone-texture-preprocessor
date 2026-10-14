@@ -28,7 +28,8 @@ def sources(root):
 class UnifiedTests(unittest.TestCase):
     def test_reviewed_geometry_preserves_source_pixels_and_side_orientation(self):
         pixels=np.random.default_rng(5).integers(0,256,(60,400,4),dtype=np.uint8)
-        pixels[:,:,3]=255
+        pixels[:,:,3]=0
+        pixels[10:50,10:390,3]=255
         result, info=guided_frame(Image.fromarray(pixels),'left',
                                   {'crop_xyxy':[10,10,390,50],'rotation_ccw_degrees':0})
         np.testing.assert_array_equal(np.array(result),np.rot90(pixels[10:50,10:390]))
@@ -49,6 +50,10 @@ class UnifiedTests(unittest.TestCase):
             source = sources(root / 'input')
             hashes = {p.name: digest(p) for p in (source / 'SKU_01').iterdir()}
             process_batch(source, root / 'output', root / 'process', mode='deskew', faces=['top','bottom'])
+            self.assertFalse((root / 'output').exists())
+            from geometry_helpers import review_fixture
+            from phone_texture.geometry_review import approve
+            approve(root/'process',review_fixture(root/'process'),root/'output')
             self.assertEqual(sorted(p.name for p in (root / 'output').iterdir()), ['SKU_01'])
             for face in ('left','right','front','back'):
                 self.assertEqual(hashes[face+'.png'], digest(root / 'output/SKU_01' / (face+'.png')))

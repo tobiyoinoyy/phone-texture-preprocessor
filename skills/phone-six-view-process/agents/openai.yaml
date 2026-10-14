@@ -1,0 +1,4 @@
+interface:
+  display_name: "手机六面质检图处理"
+  short_description: "统一处理六面质检照片：抠图精裁、边框摆正、按材质优化光照并验证交付"
+  default_prompt: "用 $phone-six-view-process 处理这个文件夹的六面质检图，保留原色和瑕疵，成品与过程分开保存。"

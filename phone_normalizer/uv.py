@@ -42,6 +42,7 @@ def normalize_face(
     profile: Optional[dict] = None,
     max_anisotropy: float = 0.05,
     diagnostic_sink: Optional[Callable[[Image.Image], None]] = None,
+    stage_sink=None,
 ) -> tuple[Image.Image, dict]:
     """Process a named face, retaining source RGB through segmentation.
 
@@ -70,6 +71,7 @@ def normalize_face(
         max_geometry_pixels=config.max_geometry_pixels,
         require_support_border=config.require_support_border,
         preserve_canvas=profile is not None,
+        stage_sink=stage_sink,
     )
     result = Image.fromarray(candidate)
     if profile is not None:

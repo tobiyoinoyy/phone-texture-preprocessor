@@ -11,7 +11,7 @@ import math
 import shutil
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 from texture_alignment import align_textures as alignment
 
@@ -125,24 +125,12 @@ def deskew_image(image, face):
 
 
 def guided_frame(matte, face, guide):
-    """Apply reviewed source-space geometry without a second automatic rail fit."""
-    from scripts.geometry_postprocess import rotate_alpha_safe
-    result = matte.crop(tuple(guide['crop_xyxy'])).convert('RGBA')
-    angle = guide['rotation_ccw_degrees']
-    if angle:
-        result = Image.fromarray(rotate_alpha_safe(np.asarray(result), angle))
-    box = result.getchannel('A').getbbox()
-    if box is None:
-        raise ValueError('标定区域内没有可见像素')
-    result = result.crop(box)
-    if face in ('left', 'right'):
-        result = result.transpose(Image.Transpose.ROTATE_90 if face == 'left' else Image.Transpose.ROTATE_270)
-    return result, {'method': 'reviewed_frame_geometry', 'reviewed_source_crop': guide,
-                    'output_size': list(result.size), 'resampling_passes': int(bool(angle)),
-                    'rgb_painted': False}
+    from .geometry_review import guided_geometry
+    return guided_geometry(matte, face, guide)
 
 
 def process_batch(input_dir, output_dir, process_dir, *, mode, faces=FRAMES, device='auto', backend_instance=None, frame_guides=None):
+    from .geometry_review import guided_geometry, make_evidence, review_reasons
     source, output, work = separate_paths(input_dir, output_dir, process_dir)
     fresh(output)
     fresh(work)
@@ -152,20 +140,21 @@ def process_batch(input_dir, output_dir, process_dir, *, mode, faces=FRAMES, dev
         if sku not in records:
             raise ValueError(f'边框裁切标定包含未知 SKU：{sku}')
         for face, guide in entries.items():
-            if face not in FRAMES or guide['source_sha256'] != alignment.digest(records[sku][face]):
+            if face not in FACES or guide['source_sha256'] != alignment.digest(records[sku][face]):
                 raise ValueError(f'{sku}/{face} 原图与裁切标定不一致')
             with Image.open(records[sku][face]) as image:
-                x0,y0,x1,y1 = guide['crop_xyxy']
+                image = ImageOps.exif_transpose(image)
+                x0,y0,x1,y1 = guide.get('crop_xyxy', [0,0,image.width,image.height])
                 if not all(type(v) is int for v in (x0,y0,x1,y1)) or not (0 <= x0 < x1 <= image.width and 0 <= y0 < y1 <= image.height):
                     raise ValueError(f'{sku}/{face} 裁切坐标无效')
             angle = guide.get('rotation_ccw_degrees')
-            if not isinstance(angle, (int,float)) or not math.isfinite(angle) or abs(angle) > 4:
+            if isinstance(angle, bool) or not isinstance(angle, (int,float)) or not math.isfinite(angle) or abs(angle) > 4:
                 raise ValueError(f'{sku}/{face} 需要经核对的摆正角度（不超过 4 度）')
     if mode not in ('standardize', 'deskew') or not faces or set(faces) - set(FRAMES):
         raise ValueError('无效处理模式或边框面名称')
     work.mkdir(parents=True)
     staged = work / 'staged'
-    report = {'mode': mode, 'success': False, 'uv_validation': 'requires_current_blender_scene', 'images': []}
+    report = {'mode': mode, 'success': False, 'geometry_status':'needs_review', 'candidates_complete':False, 'uv_validation': 'requires_current_blender_scene', 'images': []}
     context = nullcontext(None)
     if mode == 'standardize':
         from phone_normalizer.api import Normalizer, NormalizerConfig
@@ -180,38 +169,53 @@ def process_batch(input_dir, output_dir, process_dir, *, mode, faces=FRAMES, dev
                 for face, path in files.items():
                     print(f'{mode}: {sku}/{face}', flush=True)
                     info = {'sku': sku, 'face': face, 'source': str(path), 'source_sha256': alignment.digest(path)}
+                    stages = {}
+                    def capture(name, value):
+                        stages[name] = value.copy() if isinstance(value, Image.Image) else Image.fromarray(value)
                     if mode == 'deskew' and face not in faces:
                         dest = folder / path.name
                         shutil.copy2(path, dest)
                         info['operation'] = 'byte_exact_copy'
+                        result = Image.open(path).convert('RGBA')
+                        stages = {'source_matte':result, 'after_support':result, 'after_rotation':result}
                     else:
                         dest = folder / f'{face}.png'
                         with Image.open(path) as opened:
                             if mode == 'deskew':
                                 result, geometry = deskew_image(opened, face)
-                            elif face in FRAMES:
+                                stages = {'source_matte':opened.convert('RGBA'), 'after_support':opened.convert('RGBA'), 'after_rotation':result}
+                            elif face in FRAMES or guides.get(sku, {}).get(face):
                                 matte, _ = normalizer.normalize(opened)
                                 guide = guides.get(sku, {}).get(face)
                                 if guide:
-                                    result, geometry = guided_frame(matte, face, guide)
+                                    result, geometry = guided_geometry(matte, face, guide, capture)
                                 else:
-                                    result, geometry = normalize_frame_strip(matte, face=face, deskew=True)
+                                    result, geometry = normalize_frame_strip(matte, face=face, deskew=True, stage_sink=capture)
                             else:
                                 result, geometry = normalize_face(opened, face, backend=normalizer.backend,
-                                    config=NormalizerConfig(crop_threshold=128, device=device))
+                                    config=NormalizerConfig(crop_threshold=128, device=device), stage_sink=capture)
                         result.save(dest)
                         info['geometry'] = geometry
                     info['output_sha256'] = alignment.digest(dest)
+                    info['review_reasons'] = review_reasons(info.get('geometry', {}))
+                    info['geometry_evidence'] = make_evidence(path, result, stages, work/'geometry-review'/sku/face)
                     report['images'].append(info)
         overview(records, batch_files(staged), work / 'overview.png')
-        publish(staged, output)
-        report['success'] = True
-        report['output'] = str(output)
+        report['candidates_complete'] = True
+        report['requested_output'] = str(output)
+        report['review_instructions'] = 'Inspect source overlays, all corners and full contact bands; approve-geometry before publication'
     except Exception as exc:
         report['error'] = f'{type(exc).__name__}: {exc}'
         raise
     finally:
         write_json(work / 'report.json', report)
+    from .geometry_review import CHECKS, digest
+    write_json(work / 'review-template.json', {
+        'report_sha256': digest(work / 'report.json'), 'reviewer': '',
+        'items': {entry['sku']+'/'+entry['face']: {
+            **dict.fromkeys(CHECKS, False), 'notes':'', 'boundary_assertions':{}
+        } for entry in report['images']}
+    })
     return report
 
 
@@ -233,11 +237,32 @@ def validate_calibration(work, config):
         if Path(item['name']).stem.lower() == 'back':
             if references.get(str(Path(item['source']).resolve())) != item['sha256']:
                 raise ValueError(f'{item["sku"]} 缺少对应背板的标定哈希')
-    scene = Path(config.get('scene_record', '')).expanduser().resolve()
-    if not scene.is_file() or references.get(str(scene)) != alignment.digest(scene):
-        raise ValueError('需要 scene_record：当前 Blender 场景标定记录及其 reference_files 哈希')
-    captured = json.loads(scene.read_text())
-    require_match(captured, captured)
+    basis=config.get('alignment_basis','model_uv')
+    if basis=='front_back_images':
+        from texture_alignment.image_reference_targets import build_targets
+        import numpy as np
+        for item in manifest['companions']:
+            if Path(item['name']).stem.lower() in ('front','back'):
+                if references.get(str(Path(item['source']).resolve())) != item['sha256']:
+                    raise ValueError('Image-space alignment requires both front/back source hashes')
+        for item in manifest['images']:
+            name,side=item['sku'],item['side']
+            guide=config['image_reference_guides'][name][side]
+            for face in ('front','back'):
+                actual=next(c for c in manifest['companions'] if c['sku']==name and Path(c['name']).stem.lower()==face)
+                if str(Path(guide[face]['path']).resolve())!=str(Path(actual['source']).resolve()) or guide[face]['sha256']!=actual['sha256']:
+                    raise ValueError('Guide references another SKU/front/back image')
+            target=build_targets(guide,manifest['height'],manifest['sizes'][side][0])
+            if not np.array_equal(np.asarray(target),np.asarray(alignment.target_points(config,name,side))):
+                raise ValueError('Targets differ from front/back landmark mapping')
+    elif basis=='model_uv':
+        scene = Path(config.get('scene_record', '')).expanduser().resolve()
+        if not scene.is_file() or references.get(str(scene)) != alignment.digest(scene):
+            raise ValueError('需要 scene_record：当前 Blender 场景标定记录及其 reference_files 哈希')
+        captured = json.loads(scene.read_text())
+        require_match(captured, captured)
+    else:
+        raise ValueError('Unknown alignment basis')
     for item in manifest['images']:
         alignment.target_points(config, item['sku'], item['side'])
     return manifest
@@ -265,7 +290,8 @@ def apply(work_dir, landmarks, output_dir, process_dir):
         if path.is_file():
             shutil.move(str(path), process / path.name)
     report = json.loads((process / 'alignment-report.json').read_text())
-    report['uv_validation'] = 'requires_current_blender_scene'
+    report['alignment_basis'] = config.get('alignment_basis','model_uv')
+    report['uv_validation'] = 'not_checked_image_space_only' if report['alignment_basis']=='front_back_images' else 'requires_current_blender_scene'
     write_json(process / 'alignment-report.json', report)
     publish(staged, output)
     return report

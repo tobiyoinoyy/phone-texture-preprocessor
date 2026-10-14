@@ -4,7 +4,7 @@
 
 - **原图标准化**：BiRefNet_dynamic 抠图、去支架、精裁；四个边框面默认摆正。
 - **边框摆正**：已裁好透明图只做原像素刚性旋转，其他面原样保留。
-- **结构对齐**：按钮以指定 SKU 为基准；上下天线以每个 SKU 的背板和实际模型 UV 接缝标定。沿用逐列天线倾斜修正和透明边缘插值。
+- **结构对齐**：按钮以指定 SKU 为基准；上下天线可按每个 SKU 正背面图片标定，或按实际模型 UV 接缝换算。沿用逐列天线倾斜修正和透明边缘插值。
 
 每步都能单独使用。原图标准化已经摆正时，直接进入结构标注，不重复旋转。铝金属光照优化和不锈钢高光修复仍是独立 Skill。
 
@@ -38,7 +38,7 @@ phone-texture --help
 phone-texture standardize 原图 --output 已标准化 --process 过程/标准化
 ```
 
-相机凸起、支架遮挡使自动边缘判断失败时，流程会停止。可在查看原图后提供 `--frame-guides 裁切标定.json`，为对应 SKU/边框面指定 `source_sha256`、原图坐标 `crop_xyxy: [左, 上, 右, 下]` 和 `rotation_ccw_degrees`。程序按经核对的范围裁切、按角度旋转，不再重复猜测边缘；原图哈希改变即拒绝复用。标定文件格式为 `{ "SKU_01": { "top": { ... } } }`，不要把某批坐标当作所有机型的默认值。
+候选生成后先按[几何复核流程](docs/geometry-review.md)检查六面四角、完整下缘和支架接触区，再用 `approve-geometry` 发布。`standardize` / `deskew` 不直接创建正式成品。自动检测失败时使用 `--geometry-guides` 提供源坐标轮廓、局部支架蒙版、角度及哈希；旧矩形不能承担去支架作用，`reviewed` 标记不能跳过检查。
 
 如果已有透明贴图，只修选中的面；未选择的面逐字节保留：
 
@@ -60,6 +60,10 @@ phone-texture apply 过程/结构标注 --landmarks 已标定.json --output 最�
 
 检查 `过程/结构对齐/overview.png`，所有 left 排在一起、所有 right 排在一起。天线上下边界及宽度还需放回当前 Blender 场景核对；总览和公式校验不能代替实际接缝验收。
 
+## 六面照片含光照的一体化 Skill
+
+使用 `$phone-six-view-process 处理这个六面图文件夹`，由 [统一工作流 Skill](skills/phone-six-view-process/SKILL.md) 调用几何工具与对应光照 Skill。支持单个六面文件夹和批量 SKU，包含输入快照、光照基线、保护范围验证及六面发布。铝金属和不锈钢算法保持独立维护；依赖与运行见 [说明](skills/phone-six-view-process/references/run.md)。
+
 ## Codex 入口
 
 仓库包含 `.codex-plugin/plugin.json` 和 `skills/phone-texture-preprocessor/SKILL.md`，可作为插件使用。原标准化 Python API 和 `phone-normalizer`、`phone-normalizer-uv` 命令保留兼容；交付批次请用新的 `phone-texture` 入口，确保过程文件分开。
@@ -71,4 +75,6 @@ pip install -e '.[test]'
 python -m pytest tests -q
 ```
 
-代码来源及本批验证见 [整合记录](docs/integration.md)。真实业务图片、模型、标定文件和模型权重不随仓库提交。
+代码来源及本批验证见 [整合记录](docs/integration.md)。真实业务图片、模型、全量业务标定和模型权重不随仓库提交；本次回归只保存三张原图的指纹与边界检查标注。
+
+正背面图片参考使用 `alignment_basis: front_back_images`，无需先提供模型，步骤见[结构标定](docs/calibration.md)。只保护贴纸使用 `sticker_only`；局部暗斑纳入独立暗部检查，见[光照验收](skills/phone-six-view-process/references/perimeter-review.md)。
