@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phone-texture-preprocessor"
-version = "1.2.0"
+version = "1.3.0"
 description = "Phone six-view standardization, frame deskew and UV-aware structure alignment"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -26,3 +26,6 @@ texture_alignment = ["annotator.html"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["phone_texture*", "phone_normalizer*", "texture_alignment*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

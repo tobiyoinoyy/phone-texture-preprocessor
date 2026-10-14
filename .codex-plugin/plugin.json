@@ -1,14 +1,14 @@
 {
   "name": "phone-texture-preprocessor",
-  "version": "1.2.0",
-  "description": "手机贴图预处理：图片标准化、四面边框摆正、按钮与天线结构对齐。",
+  "version": "1.3.0",
+  "description": "手机六面贴图完整工作流：标准化、摆正、结构对齐、铝金属光照与不锈钢高光修复。",
   "author": {
     "name": "tobiyoinoyy"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "手机贴图预处理工具",
-    "shortDescription": "合并图片标准化、边框角度矫正与结构对齐。",
+    "shortDescription": "单库提供六面图预处理、光照优化与验收。",
     "longDescription": "统一处理六面图片，支持正背面图片参考或模型 UV 的结构对齐；按材质优化光照，保护策略和局部效果分别验收。",
     "developerName": "tobiyoinoyy",
     "category": "Productivity",

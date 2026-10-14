@@ -1,0 +1,4 @@
+interface:
+  display_name: "质检图优化for不锈钢边框"
+  short_description: "仅修复明确高光区域，其余原像素、尺寸、透明边缘与贴纸保持不变"
+  default_prompt: "使用 $phone-six-view-restore（质检图优化for不锈钢边框），仅去除手机六面原图中的明确高光，高光区域外保留原像素，保持原尺寸、透明边缘与贴纸不变。"

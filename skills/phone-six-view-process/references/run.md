@@ -1,17 +1,20 @@
 # 安装与运行
 
-## 依赖定位
+## 单仓库安装与定位
 
-当前工作流不内嵌或复制上游算法。先解析本 Skill 符号链接，向上两级的仓库即 `phone-texture-preprocessor`；若单独复制了 Skill，则定位另外安装的该仓库。查找当前 agent 的技能目录，读取铝金属/不锈钢对应 SKILL.md。禁止在共享版本中写死个人主目录。
+完整代码只需克隆 `https://github.com/tobiyoinoyy/phone-texture-preprocessor`。几何工具与两个光照 Skill 均在此仓库，运行时不读取旧的独立仓库。
 
-仓库来源：
-- https://github.com/tobiyoinoyy/phone-texture-preprocessor
-- https://github.com/tobiyoinoyy/phone-aluminum-frame-restore
-- https://github.com/tobiyoinoyy/phone-six-view-restore
+解析本 Skill 的符号链接后，向上两级即仓库根目录。直接读取相邻的 `../phone-aluminum-frame-restore/SKILL.md` 或 `../phone-six-view-restore/SKILL.md`，脚本路径均相对于对应 Skill 目录。不要优先寻找个人技能目录里的旧副本。单独复制入口 SKILL.md 不包含其算法，应保留整个仓库。
 
-这些仓库需要访问权限；其他人可获得仓库读取权限或本地完整工具包，只有一份 SKILL.md 不包含模型和算法。拿不到依赖时列出缺项，不假装已安装。用当前 agent 的 Skill 安装方式注册本目录；Codex 可将本目录复制或链接到 `~/.codex/skills/phone-six-view-process`，几何仓库及两个光照 Skill 保持完整。
+在仓库根目录运行：
 
-在几何仓库按其 README 安装：`python3 -m venv .venv`，然后 `.venv/bin/python -m pip install -e '.[cutout]'`。首次抠图下载 BiRefNet_dynamic 权重；先检查网络、模型缓存和可用设备。`phone-texture --help` 和三个 Skill 文件都可读取才算依赖就绪。不锈钢实际生成另需 agent 内置图像编辑工具。铝默认流程只用确定性算法。
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[cutout]'
+.venv/bin/python scripts/install_skills.py
+```
+
+安装器将仓库内四个 Skill 链接到 Codex 技能目录；已有同名旧版时提示冲突，显式 `--replace` 会先备份再换成新链接。其他 agent 可直接读取仓库内统一入口。首次抠图下载 BiRefNet_dynamic 权重；不锈钢实际生成需要 agent 的图像编辑工具。铝材默认流程使用本库的确定性脚本。Python 依赖、模型权重和运行环境按安装说明准备，无需再克隆其他工具仓库。
 
 ## 运行约定
 

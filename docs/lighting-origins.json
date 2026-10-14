@@ -1,0 +1,10 @@
+{
+  "phone-aluminum-frame-restore": {
+    "repository": "https://github.com/tobiyoinoyy/phone-aluminum-frame-restore.git",
+    "commit": "72404e96653354ad5d4f04c284a58b37be77d547"
+  },
+  "phone-six-view-restore": {
+    "repository": "https://github.com/tobiyoinoyy/phone-six-view-restore.git",
+    "commit": "f9af51c309a567ebbe1aae769f49ea3223cee492"
+  }
+}

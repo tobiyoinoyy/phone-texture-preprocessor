@@ -6,18 +6,21 @@
 - **边框摆正**：已裁好透明图只做原像素刚性旋转，其他面原样保留。
 - **结构对齐**：按钮以指定 SKU 为基准；上下天线可按每个 SKU 正背面图片标定，或按实际模型 UV 接缝换算。沿用逐列天线倾斜修正和透明边缘插值。
 
-每步都能单独使用。原图标准化已经摆正时，直接进入结构标注，不重复旋转。铝金属光照优化和不锈钢高光修复仍是独立 Skill。
+每步都能单独使用。原图标准化已经摆正时，直接进入结构标注，不重复旋转。铝金属光照优化和不锈钢高光修复也包含在本仓库，由统一 Skill 按材质调用。
 
 ## 安装
 
-Python 3.9 以上，在本仓库运行：
+Python 3.9 以上，只需一个仓库：
 
 ```bash
+git clone https://github.com/tobiyoinoyy/phone-texture-preprocessor.git
+cd phone-texture-preprocessor
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e '.[cutout]'
 phone-texture --help
+python scripts/install_skills.py
 ```
 
 只处理已裁图可用 `pip install -e .`，不需要下载抠图模型。首次抠图会获取 `ZhengPeng7/BiRefNet_dynamic` 模型权重。也可用 `python -m phone_texture` 运行全部命令。
@@ -62,7 +65,7 @@ phone-texture apply 过程/结构标注 --landmarks 已标定.json --output 最�
 
 ## 六面照片含光照的一体化 Skill
 
-使用 `$phone-six-view-process 处理这个六面图文件夹`，由 [统一工作流 Skill](skills/phone-six-view-process/SKILL.md) 调用几何工具与对应光照 Skill。支持单个六面文件夹和批量 SKU，包含输入快照、光照基线、保护范围验证及六面发布。铝金属和不锈钢算法保持独立维护；依赖与运行见 [说明](skills/phone-six-view-process/references/run.md)。
+使用 `$phone-six-view-process 处理这个六面图文件夹`，由 [统一工作流 Skill](skills/phone-six-view-process/SKILL.md) 调用几何工具与对应光照 Skill。支持单个六面文件夹和批量 SKU，包含输入快照、光照基线、保护范围验证及六面发布。几何、铝金属、不锈钢四个 Skill 的说明、脚本和测试均在 `skills/` 内；安装与运行见 [说明](skills/phone-six-view-process/references/run.md)。
 
 ## Codex 入口
 
@@ -72,9 +75,22 @@ phone-texture apply 过程/结构标注 --landmarks 已标定.json --output 最�
 
 ```bash
 pip install -e '.[test]'
-python -m pytest tests -q
+python scripts/test_all.py
 ```
 
 代码来源及本批验证见 [整合记录](docs/integration.md)。真实业务图片、模型、全量业务标定和模型权重不随仓库提交；本次回归只保存三张原图的指纹与边界检查标注。
 
 正背面图片参考使用 `alignment_basis: front_back_images`，无需先提供模型，步骤见[结构标定](docs/calibration.md)。只保护贴纸使用 `sticker_only`；局部暗斑纳入独立暗部检查，见[光照验收](skills/phone-six-view-process/references/perimeter-review.md)。
+
+## 单库内容
+
+- `skills/phone-six-view-process`：六面处理统一入口与验收发布。
+- `skills/phone-texture-preprocessor`：抠图、精裁、摆正、结构对齐。
+- `skills/phone-aluminum-frame-restore`：铝金属光照处理。
+- `skills/phone-six-view-restore`：不锈钢高光修复。
+
+安装器默认使用 `$CODEX_HOME/skills`，未设置时使用 `~/.codex/skills`。已有旧版可运行 `python scripts/install_skills.py --replace`，安装器将旧目录或链接留作带时间戳的备份。安装后向 agent 发送：
+
+> 使用 phone-six-view-process 处理这个六面图文件夹：裁切、摆正、按材质优化光照，按本次要求校准按钮和天线，检查轮廓与局部暗斑。六面成品与过程分开，并用一张图展示全部结果。
+
+旧光照仓库仅保留历史来源，后续改动在本库维护；来源版本记录于 [lighting-origins.json](docs/lighting-origins.json)。
