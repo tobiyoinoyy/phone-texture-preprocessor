@@ -1,0 +1,197 @@
+{
+  "purpose": "Regression-only raw-photo witnesses; never runtime inputs",
+  "camera": "Raised camera island clear of the main top body",
+  "body": "Visible main top frame interior on original photographs",
+  "cases": {
+    "SKU_01": {
+      "source_sha256": "8e648ea4c604bf4d72fbce478d9fbfb091e3eb7ebf1da887fee84fb25c4d5f6b",
+      "camera_rectangles": [
+        [
+          360,
+          667,
+          1060,
+          671
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_02": {
+      "source_sha256": "1e52fbdb03bb67522cd461caddc3b106359dda898e5178582f0e8166a39fa51a",
+      "camera_rectangles": [
+        [
+          360,
+          663,
+          1060,
+          667
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_03": {
+      "source_sha256": "738e40ecd58a7337ca98e0b1211959f35e65a5c7e2c082ef24a134add4fc419e",
+      "camera_rectangles": [
+        [
+          360,
+          650,
+          1060,
+          654
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_04": {
+      "source_sha256": "fadd343ca4351cf78ff34384735a578431df4b9b26b79d47abc8c763c9a20d51",
+      "camera_rectangles": [
+        [
+          360,
+          654,
+          1060,
+          658
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_05": {
+      "source_sha256": "bc2e65167d355d05fbe17adecb9c14edb17f58e4f3108cbb973023a410a145c3",
+      "camera_rectangles": [
+        [
+          360,
+          641,
+          1060,
+          645
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_06": {
+      "source_sha256": "eb0de65bf9fc82629257c7f789e7a3ab5fd017001aaebd57ad36c684c03d29b8",
+      "camera_rectangles": [
+        [
+          360,
+          665,
+          1060,
+          669
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_07": {
+      "source_sha256": "9014c86b00817da1e550d92022d167d74ac6c5cfae5d34abb69bbcfb8a664c8f",
+      "camera_rectangles": [
+        [
+          360,
+          651,
+          1060,
+          655
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_08": {
+      "source_sha256": "7e790d93eb061e355eb2707bcaf8ea1b1b0aeb15c5847313245bd74ef32ec407",
+      "camera_rectangles": [
+        [
+          360,
+          675,
+          1060,
+          679
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_09": {
+      "source_sha256": "13e5fdb3d2c4e5d70c49b4ee23eccd40e8eccbee7a89bf29f7a467c934457ee4",
+      "camera_rectangles": [
+        [
+          360,
+          678,
+          1060,
+          682
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    },
+    "SKU_10": {
+      "source_sha256": "9d213d0fe598be9fa5396992ac7f203720787a4c4391fbb7a56902075f972144",
+      "camera_rectangles": [
+        [
+          360,
+          657,
+          1060,
+          661
+        ]
+      ],
+      "body_rectangles": [
+        [
+          250,
+          740,
+          1150,
+          760
+        ]
+      ]
+    }
+  }
+}

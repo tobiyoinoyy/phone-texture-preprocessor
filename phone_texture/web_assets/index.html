@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="app-token" content="__TOKEN__"><title>六面工坊 · 手机贴图处理</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><a class="brand" href="/" aria-label="六面工坊首页"><span class="brand-mark">六</span><span>六面工坊 <small>手机贴图处理</small></span></a><div class="connection"><i id="connectionDot"></i><span id="connectionText">本地运行</span><button id="shutdown" class="quiet-button">退出服务</button></div></header>
+<main>
+<section class="heading"><h1>批量处理</h1><span class="profile">iPhone 17 · 铝金属</span></section>
+<div class="workspace">
+<aside>
+<section class="panel setup"><h2>处理设置</h2>
+<div class="setting-row"><label for="model">型号</label><select id="model"><option value="">选择型号</option value="iphone17pro">iPhone 17 Pro</option><option value="iphone17promax">iPhone 17 Pro Max</option></select></div>
+<button id="pickInput" class="button secondary full choose-folder" aria-label="选择原图文件夹">选择原图文件夹</button>
+<div class="path-entry"><input id="source" aria-label="原图文件夹" placeholder="或粘贴路径" autocomplete="off"><button id="scan" class="icon-button" title="重新读取" aria-label="重新读取">↻</button></div>
+<div class="concurrency-setting"><div class="setting-row"><label for="concurrency">并发数</label><output id="concurrencyValue" for="concurrency">5</output></div><input id="concurrency" type="range" min="1" max="8" step="1" value="5" aria-valuetext="5 并发"><div class="range-labels"><span>1</span><span>5 推荐</span><span>8</span></div></div>
+<div class="output-setting"><button id="pickOutput" class="button secondary full">选择导出文件夹</button><div class="path-entry"><input id="output" aria-label="导出文件夹" placeholder="默认保存位置" autocomplete="off"></div></div>
+<button id="start" class="button primary full" disabled>开始处理</button>
+<div class="machine-inline"><span id="memoryBadge">正常</span><span>可用 <span id="available">—</span><span id="memoryTotal" hidden></span></span></div>
+</section>
+<details class="help compact-help"><summary>使用说明</summary><div class="help-content"><p>每台一个文件夹，六张原图可自动识别命名：</p><p class="face-names">front · back · left · right · top · bottom</p><p>可选择单台或多台的父文件夹。</p><p>原图保留，每批另存。关闭网页可继续处理。</p><p>适用已验证规范的 iPhone 17 铝材原图。完成后检查图片及模型接缝。</p></div></details>
+</aside>
+<div class="content">
+<section id="intake" class="panel intake"><div class="section-title"><h2>待处理</h2><span id="scanCount" class="muted push">尚未选择</span></div>
+<div id="emptyInput" class="empty"><div class="six-tiles" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div><p>选择原图文件夹</p></div>
+<div id="scanContent" hidden><div id="namingBanner" class="naming-banner" hidden><span id="namingSummary"></span><button id="previewNames" class="button secondary">是否一键命名</button></div><div class="selection-bar"><label><input id="selectAll" type="checkbox"> 全选</label><span id="selectionCount"></span></div><div class="table-scroll"><table><thead><tr><th>SKU</th><th>图片</th></tr></thead><tbody id="scanRows"></tbody></table></div><p class="hint" id="scanNote"></p></div></section>
+<section id="jobPanel" class="panel" hidden><div class="section-title"><h2 id="jobTitle">处理进度</h2><span id="jobBadge" class="badge push"></span></div><div class="job-meta"><span id="jobId"></span><span id="jobConcurrency"></span></div><p id="jobMessage" class="job-message"></p><div class="stats"><div><strong id="doneCount">0 / 0</strong><span>已完成</span></div><div><strong id="elapsed">0 秒</strong><span>用时</span></div><div id="failedStat" hidden><strong id="failedCount">0</strong><span>失败</span></div></div><progress id="progress" value="0" max="100"></progress><details id="taskDetails" class="task-details"><summary>任务明细</summary><div id="taskRows" class="task-list"></div></details><div class="actions"><button id="stop" class="button danger">停止</button><button id="retry" class="button secondary" hidden>重试未完成</button><button id="openFolder" class="button secondary">打开文件夹</button><a id="log" class="text-link" target="_blank" rel="noopener">日志 ↗</a></div></section>
+<section id="resultPanel" class="panel" hidden><div class="section-title"><h2>结果预览</h2><span class="badge push">待验收</span></div><div class="result-toolbar"><div class="tabs" id="faceTabs" aria-label="按方向查看"></div><div class="actions"><a class="button secondary" id="overview" target="_blank">总览</a><a class="button primary" id="download">下载图片</a></div></div><div id="gallery" class="gallery"></div></section>
+<details class="panel history"><summary>历史批次</summary><div id="history"><p class="hint">暂无记录</p></div></details>
+</div></div>
+
+</main>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<dialog id="viewer"><div class="viewer-heading"><h2 id="viewerTitle"></h2><button id="closeViewer" class="icon-button" aria-label="关闭预览">×</button></div><div class="viewer-tools"><div class="tabs"><button id="showResult" class="selected">处理后</button><button id="showSource">原图</button></div><div class="tabs"><button id="fit" class="selected">适应窗口</button><button id="actual">100%</button></div><button id="background" class="button secondary">深 / 浅背景</button><a id="downloadImage" class="text-link">下载 PNG</a></div><div id="imageStage" class="image-stage"><img id="viewerImage" alt="六面图片放大预览"></div></dialog>
+
+<dialog id="namingDialog"><div class="viewer-heading"><h2>确认图片方向</h2><button id="closeNames" class="icon-button" aria-label="关闭命名预览">×</button></div><p class="hint">生成命名副本，原图保留。</p><div id="namingPreview"></div><div class="folder-footer"><span id="namingStatus" class="hint" role="status"></span><button id="applyNames" class="button primary">一键命名</button></div></dialog>
+</body></html>

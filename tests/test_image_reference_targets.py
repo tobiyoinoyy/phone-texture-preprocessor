@@ -14,17 +14,26 @@ def guide(tmp):
                 side_body_y=[0,100],front_at='left',button_rows=[30,40],button_basis='Reviewed button template')
 
 
+def test_default_uses_only_own_back_and_keeps_antennas_level(tmp_path):
+    g = guide(tmp_path)
+    g.pop('front'); g.pop('front_at')
+    a = np.array(build_targets(g, 101, 5))
+    assert np.allclose(a[0], 12) and np.allclose(a[1], 14)
+    assert np.allclose(a[-2], 88) and np.allclose(a[-1], 90)
+    assert np.all(a[2] == 30) and np.all(a[3] == 40)
+
+
 def test_both_edges_follow_own_reference_and_buttons_stay_horizontal(tmp_path):
-    g=guide(tmp_path);a=np.array(build_targets(g,101,5))
+    g=guide(tmp_path);a=np.array(build_targets(g,101,5,basis="front_back_images"))
     assert np.allclose(a[0],[10,10.5,11,11.5,12])
     assert np.allclose(a[1,[0,-1]],[12,14])
     assert np.all(a[2]==30) and np.all(a[3]==40)
     assert np.allclose(a[-2,[0,-1]],[90,88])
-    g['front_at']='right';assert np.array_equal(build_targets(g,101,5),a[:,::-1])
+    g['front_at']='right';assert np.array_equal(build_targets(g,101,5,basis="front_back_images"),a[:,::-1])
 
 
 def test_warp_matches_both_texture_edges_without_color_generation(tmp_path):
-    g=guide(tmp_path);target=build_targets(g,101,5)
+    g=guide(tmp_path);target=build_targets(g,101,5,basis="front_back_images")
     source=[15,18,30,40,85,89]
     a=np.zeros((101,5,4),np.uint8);a[...,3]=255
     for y in range(101):a[y,:,:3]=[y,y+1,y+2]
@@ -41,7 +50,7 @@ def test_bad_reference_rejected(tmp_path,fault):
     elif fault=='crossing':g['button_rows']=[11]
     elif fault=='bounds':g['back']['body_y']=[0,500]
     else:g.pop('button_basis')
-    with pytest.raises(ValueError):build_targets(g,101,5)
+    with pytest.raises(ValueError):build_targets(g,101,5,basis="front_back_images")
 
 
 def test_image_reference_pipeline_applies_without_scene_record(tmp_path):
@@ -62,7 +71,7 @@ def test_image_reference_pipeline_applies_without_scene_record(tmp_path):
     for side in ('left','right'):
         own=copy.deepcopy(g);own['front_at']='left' if side=='left' else 'right'
         config['image_reference_guides']['SKU_01'][side]=own
-        config['targets_by_sku']['SKU_01'][side]=build_targets(own,64,10)
+        config['targets_by_sku']['SKU_01'][side]=build_targets(own,64,10,basis="front_back_images")
     p=tmp_path/'landmarks.json';p.write_text(json.dumps(config))
     report=pipeline.apply(work,p,tmp_path/'output',tmp_path/'records')
     assert report['uv_validation']=='not_checked_image_space_only'

@@ -409,3 +409,61 @@ class ContourFieldTests(unittest.TestCase):
         self.assertTrue(reliable[editable].all())
         with self.assertRaisesRegex(ValueError,'Unsupported'):
             MODULE.supported_contour_field(lab,np.zeros_like(fit),editable,alpha,[8,1.2])
+
+
+def test_disjoint_material_masks_use_their_own_source_reference(tmp_path):
+    yy,xx=np.indices((64,80));a=np.zeros((64,80,4),np.uint8);a[...,3]=255
+    ramp=(.65+.3*yy/63)[...,None]
+    a[...,:3]=np.rint(np.where((xx<40)[...,None],[210,110,60],[55,105,205])*ramp)
+    source=tmp_path/'source.png';Image.fromarray(a).save(source)
+    masks=[]
+    for name,m in [('copper',xx<40),('blue',xx>=40)]:
+        p=tmp_path/(name+'.png');Image.fromarray(m.astype('uint8')*255).save(p);masks.append(p)
+    item=dict(source=str(source),domains=[dict(name=name,mask=str(p),reference_boxes=[box],sigma=[5,5],strength=[1,1,1],feather=0,correction_smooth=1)
+        for name,p,box in [('copper',masks[0],[10,45,30,55]),('blue',masks[1],[50,45,70,55])]])
+    result,allowed,protected,report=MODULE.process_view(item,np.array([60,30,30]),dict(color_mode='shared_color'))
+    assert allowed.all() and not protected.any()
+    assert np.median(result[:,:40,0].astype(float)-result[:,:40,2])>80
+    assert np.median(result[:,40:,2].astype(float)-result[:,40:,0])>80
+    assert np.array_equal(result[...,3],a[...,3])
+    assert report['domains'][0]['source_reference_lab']!=report['domains'][1]['source_reference_lab']
+    Image.new('L',(5,5),255).save(masks[0])
+    import pytest
+    with pytest.raises(ValueError,match='domain mask dimensions'):
+        MODULE.process_view(item,np.array([60,30,30]),dict(color_mode='shared_color'))
+
+
+def test_contour_normal_reference_separates_polished_facets_from_tangent_shading():
+    from scipy.ndimage import distance_transform_edt
+    alpha=np.full((140,90),255,np.uint8)
+    depth=distance_transform_edt(np.pad(alpha>=128,1))[1:-1,1:-1]
+    fit=depth<=12;lab=np.zeros((140,90,3));yy,xx=np.indices(depth.shape)
+    normal=np.where(depth<5,75.,40.);lab[...,0]=normal+8*np.sin(yy/140*np.pi*2);lab[...,1:]=[12,22]
+    field,proof=MODULE.contour_depth_reference(lab,fit,alpha)
+    assert np.median(field[fit&(depth<4)])>np.median(field[fit&(depth>8)])+25
+    assert np.max(field)-np.min(field)<45
+    assert len(proof['depths'])>=10
+    import pytest
+    with pytest.raises(ValueError,match='Too few'):MODULE.contour_depth_reference(lab,np.zeros_like(fit),alpha)
+
+
+def test_rim_profile_correction_reduces_shading_without_flattening_facets(tmp_path):
+    from scipy.ndimage import distance_transform_edt
+    h,w=160,100;alpha=np.full((h,w),255,np.uint8)
+    depth=distance_transform_edt(np.pad(alpha>=128,1))[1:-1,1:-1]
+    yy,xx=np.indices((h,w));material=depth<=12
+    lab=np.zeros((h,w,3));lab[:]=[20,12,22]
+    lab[...,0]=np.where(depth<5,75.,42.)+(yy/(h-1)-.5)*20
+    source=np.dstack([MODULE.lab_to_rgb(lab),alpha]);src=tmp_path/'source.png';Image.fromarray(source).save(src)
+    mask=tmp_path/'metal.png';Image.fromarray(material.astype('uint8')*255).save(mask)
+    item=dict(source=str(src),domains=[dict(mask=str(mask),field='contour',reference_profile='contour_depth',
+        contour_inset_depth=3,sigma=[14,2],reference_boxes=[[2,70,5,82]],strength=[.8,0,0],feather=0,correction_smooth=1)])
+    output,allowed,protected,report=MODULE.process_view(item,np.array([60,12,22]),dict(color_mode='source_lightness'))
+    before=MODULE.rgb_to_lab(source[...,:3]);after=MODULE.rgb_to_lab(output[...,:3])
+    b=float(np.median(before[115:130,2:5,0])-np.median(before[30:45,2:5,0]))
+    a=float(np.median(after[115:130,2:5,0])-np.median(after[30:45,2:5,0]))
+    assert abs(a)<abs(b)*.55
+    assert np.median(after[50:110,1:4,0])>np.median(after[50:110,8:11,0])+25
+    assert np.array_equal(output[...,3],source[...,3])
+    assert np.array_equal(output[~material],source[~material])
+    assert report['domains'][0]['source_normal_profile'] is not None

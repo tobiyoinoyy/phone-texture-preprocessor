@@ -1,15 +1,12 @@
 #!/bin/bash
 # 双击打开窗口，或把图片/文件夹直接拖到这个文件上。
-# Keep this launcher dependency-light: the Python GUI/batch code lives in
-# scripts/ provide BiRefNet_dynamic inference and geometry processing.
+# phone_texture/ shares the complete workflow with the CLI and Skills.
 
 set -u
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$PROJECT_DIR/.venv"
 PYTHON="$VENV_DIR/bin/python"
-REQUIREMENTS="$PROJECT_DIR/requirements.txt"
-RESULTS_DIR="$PROJECT_DIR/outputs/结果"
 
 # BiRefNet_dynamic is deliberately run at a bounded input size by the Python
 # pipeline.  This allocator guard is an additional macOS safety net: MPS uses
@@ -61,7 +58,7 @@ install_dependencies() {
   else
     say "尚未安装 BiRefNet 依赖。请在可交互终端运行此文件，或执行："
     say "  python3 -m venv \"$VENV_DIR\""
-    say "  \"$VENV_DIR/bin/python\" -m pip install -r \"$REQUIREMENTS\""
+    say "  \"$VENV_DIR/bin/python\" -m pip install -e \"$PROJECT_DIR[cutout]\""
     return 1
   fi
 
@@ -81,7 +78,7 @@ install_dependencies() {
     return 1
   fi
   say "正在安装依赖，首次下载可能需要一些时间…"
-  if ! PIP_DISABLE_PIP_VERSION_CHECK=1 "$PYTHON" -m pip install -r "$REQUIREMENTS"; then
+  if ! PIP_DISABLE_PIP_VERSION_CHECK=1 "$PYTHON" -m pip install -e "$PROJECT_DIR[cutout]"; then
     say "依赖安装失败。请检查网络后重试；源文件和项目代码没有被修改。"
     return 1
   fi
@@ -90,7 +87,7 @@ install_dependencies() {
 }
 
 dependencies_ready=0
-if [[ -x "$PYTHON" ]] && "$PYTHON" -c 'import PIL, numpy, torch, torchvision, transformers, accelerate, timm, kornia, einops, cv2' >/dev/null 2>&1; then
+if [[ -x "$PYTHON" ]] && "$PYTHON" -c 'import PIL, numpy, scipy, torch, torchvision, transformers, accelerate, timm, kornia, einops, cv2' >/dev/null 2>&1; then
   dependencies_ready=1
 fi
 
@@ -101,38 +98,11 @@ if [[ "$dependencies_ready" -ne 1 ]]; then
   fi
 fi
 
-launch_gui_or_fallback() {
-  # The Tk window is the primary macOS experience: it remains visible during
-  # model loading and every image, including a live count and a stop button.
-  # Some Python distributions omit Tk; retain a useful fallback for those
-  # machines rather than failing silently.
-  if "$PYTHON" -c 'import tkinter' >/dev/null 2>&1; then
-    say "打开处理窗口（可实时查看进度和状态）…"
-    "$PYTHON" "$PROJECT_DIR/scripts/phone_normalizer_gui.py" "$@"
-    return $?
-  fi
-
-  if [[ "$#" -eq 0 ]] && command -v osascript >/dev/null 2>&1; then
-    say "当前 Python 没有 Tk，改用 macOS 选择窗口…"
-    osascript "$PROJECT_DIR/scripts/phone_normalizer_macos.applescript" \
-      "$PYTHON" "$PROJECT_DIR/scripts/batch_normalize.py" "$RESULTS_DIR"
-    return $?
-  fi
-
-  say "当前 Python 没有 Tk，改用终端批处理；终端会显示逐张进度。"
-  "$PYTHON" "$PROJECT_DIR/scripts/batch_normalize.py" \
-    --output-dir "$RESULTS_DIR" \
-    "$@"
-}
-
-if [[ "$#" -eq 0 ]]; then
-  launch_gui_or_fallback
-  status=$?
-else
-  say "打开处理窗口并载入拖入的图片（默认模型：BiRefNet_dynamic）…"
-  launch_gui_or_fallback "$@"
-  status=$?
-fi
-
+# Finder may start outside the repository. Resolve imports and installation from
+# the same checkout that owns all four Skills.
+cd "$PROJECT_DIR" || exit 1
+say "打开六面处理窗口：几何、材质光照、本机背面对齐与验收发布…"
+"$PYTHON" -m phone_texture gui "$@"
+status=$?
 pause_before_exit
 exit "$status"

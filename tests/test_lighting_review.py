@@ -197,3 +197,17 @@ def test_regional_publication_checks_effect_and_visual_review(tmp_path,fault):
     else:
         with pytest.raises(ValueError,match='Local feature'):w.publish(work,work/'plan.json',tmp_path/'out')
         assert not (tmp_path/'out').exists()
+
+
+def test_added_seam_check_rejects_artificial_step_but_retains_source_detail(tmp_path):
+    work,spec=fixture(tmp_path)
+    spec.update(mode='regional',local_checks={'rear_join':dict(mask=str(work/'metal.png'),min_L=0,max_L=100,max_added_step_L=1.25,step_axis=0)})
+    source=r.pixels(work/'source.png');source[16:,:,:3]=100
+    Image.fromarray(source).save(work/'source.png');spec['source_sha256']=r.digest(work/'source.png')
+    allowed=np.ones(source.shape[:2],bool)
+    # A real photographic edge is subtracted before testing added correction.
+    result=r.measure_local(spec,work/'source.png',work/'source.png',allowed,~allowed)
+    assert result['rear_join']['max_added_step_L']==0
+    bad=source.copy();bad[16:,:,:3]+=40;Image.fromarray(bad).save(work/'step.png')
+    with pytest.raises(ValueError,match='discontinuity'):
+        r.measure_local(spec,work/'source.png',work/'step.png',allowed,~allowed)

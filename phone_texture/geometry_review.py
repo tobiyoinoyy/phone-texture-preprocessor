@@ -32,7 +32,7 @@ def read_mask(spec, size):
         return np.array(im)
 
 
-def guided_geometry(matte, face, guide, stage_sink=None):
+def guided_geometry(matte, face, guide, stage_sink=None, source_image=None):
     """Mask in SOURCE coordinates, rotate once, trim only transparent canvas.
 
     crop_xyxy is an enclosing work area, never an alternative to a support mask.
@@ -68,6 +68,11 @@ def guided_geometry(matte, face, guide, stage_sink=None):
         retained |= keep > 0
     if np.any(outside & retained):
         raise ValueError('Enclosing crop intersects retained phone contour; use a local support mask, not a crop line')
+    top_proof = None
+    if face == 'top':
+        from .top_frame import calibrate_top, verify_top_mask
+        top, bottom, top_proof = calibrate_top(src, np.array(source_image.convert('RGB')) if source_image is not None else None)
+        top_proof['automatic_checks'] = verify_top_mask(src, work, top, bottom, top_proof)
     angle = guide['rotation_ccw_degrees']
     if isinstance(angle,bool) or not np.isfinite(angle) or abs(angle)>4:
         raise ValueError('Reviewed rotation must be finite and within 4 degrees')
@@ -79,11 +84,14 @@ def guided_geometry(matte, face, guide, stage_sink=None):
     if box is None:
         raise ValueError('Empty retained phone contour')
     result = rotated.crop(box)
+    if face == 'top':
+        from .top_frame import verify_top_transform
+        top_proof['transform_checks'] = verify_top_transform(src, rotated, result, top, bottom, angle, box)
     if stage_sink:
         stage_sink('after_crop', rotated)
     if face in ('left','right'):
         result = result.transpose(Image.Transpose.ROTATE_90 if face=='left' else Image.Transpose.ROTATE_270)
-    return result, {'method':'source_mask_geometry_v2', 'source_size':[w,h],
+    return result, {'top_body_calibration':top_proof, 'method':'source_mask_geometry_v2', 'source_size':[w,h],
         'reviewed_source_crop':guide, 'canvas_trim_xyxy':list(box), 'rotation_ccw_degrees':angle,
         'output_size':list(result.size), 'resampling_passes':int(bool(angle)), 'rgb_painted':False,
         'review_reasons':['manual_geometry', 'complete_outline_requires_review'],
@@ -189,6 +197,14 @@ def verify_report(report_path, records=None):
             raise ValueError('Geometry report must cover exactly all six faces')
     for entry in entries:
         key=entry['sku']+'/'+entry['face']
+        if entry['face']=='top' and report.get('mode') in ('standardize','original_only_automatic'):
+            geometry=entry.get('geometry',{})
+            top=geometry.get('top_body_calibration') or geometry
+            if (top.get('method')!='top_body_exposed_corners_v1' or
+                    top.get('camera_policy')!='exclude_entire_camera_island_and_lenses' or
+                    top.get('automatic_checks',{}).get('status')!='passed' or
+                    top.get('transform_checks',{}).get('status')!='passed'):
+                raise ValueError('TOP_CALIBRATION_STALE: original top requires camera-free body calibration')
         checked=review['items'].get(key,{})
         if not checked.get('notes') or any(checked.get(k) is not True for k in CHECKS):
             raise ValueError('Incomplete geometry review: '+key)

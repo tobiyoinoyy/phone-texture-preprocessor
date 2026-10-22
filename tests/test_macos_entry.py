@@ -35,9 +35,7 @@ def main() -> None:
         "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
         "PYTORCH_MPS_LOW_WATERMARK_RATIO",
         "PYTORCH_ENABLE_MPS_FALLBACK",
-        "phone_normalizer_gui.py",
-        "batch_normalize.py",
-        "--output-dir",
+        "-m phone_texture gui",
     ):
         assert marker in launcher, f"launcher lost required marker: {marker}"
 

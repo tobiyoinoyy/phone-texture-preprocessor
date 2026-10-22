@@ -80,10 +80,10 @@ class FrameStripTests(unittest.TestCase):
             self.assertEqual(before,p.read_bytes())
             with self.assertRaises(FileExistsError):process_frames([p],root/'out',backend_instance=Backend())
 
-    def test_top_bottom_are_deskewed_by_default(self):
+    def test_bottom_is_deskewed_by_default(self):
         from scripts.geometry_postprocess import estimate_long_angle
         source=sample().rotate(1.5,resample=Image.Resampling.BICUBIC,expand=True)
-        for face in ('top','bottom'):
+        for face in ('bottom',):
             result,info=normalize_frame_strip(source,face=face)
             self.assertLess(abs(estimate_long_angle(np.asarray(result)[...,3],128)),.2)
             self.assertEqual(info['resampling_passes'],1)

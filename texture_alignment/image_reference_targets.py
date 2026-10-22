@@ -26,14 +26,18 @@ def rows_from_view(view, height, body_y):
     return target[0]+(rows-ends[0])/(ends[1]-ends[0])*(target[1]-target[0])
 
 
-def build_targets(guide, height, width):
-    if width<2 or guide.get('front_at') not in ('left','right'):
-        raise ValueError('Explicit side orientation required')
-    f=rows_from_view(guide['front'],height,guide['side_body_y'])
+def build_targets(guide, height, width, *, basis="back_image"):
+    if width < 2 or basis not in ('back_image', 'front_back_images'):
+        raise ValueError('Invalid width or alignment basis')
     b=rows_from_view(guide['back'],height,guide['side_body_y'])
-    t=np.linspace(0,1,width)
-    if guide['front_at']=='right':t=1-t
-    antenna=f[:,None]*(1-t)+b[:,None]*t
+    antenna=np.repeat(b[:,None],width,axis=1)
+    if basis == 'front_back_images':
+        if guide.get('front_at') not in ('left','right'):
+            raise ValueError('Explicit side orientation required')
+        f=rows_from_view(guide['front'],height,guide['side_body_y'])
+        t=np.linspace(0,1,width)
+        if guide['front_at']=='right':t=1-t
+        antenna=f[:,None]*(1-t)+b[:,None]*t
     buttons=np.asarray(guide.get('button_rows',[]),float)
     if buttons.ndim!=1 or not np.isfinite(buttons).all():raise ValueError('Invalid independent button anchors')
     if buttons.size and not guide.get('button_basis'):

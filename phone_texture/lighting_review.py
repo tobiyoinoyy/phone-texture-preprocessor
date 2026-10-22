@@ -181,6 +181,29 @@ def measure_local(spec, source, output, allowed, protected):
         if not bounds[1] <= value <= bounds[2]:
             raise ValueError(f'Local feature effect failed: {name}: L={value:.2f}')
         reports[name] = {'after_percentile_L':value,'percentile':q,'witness_sha256':digest(zone['mask'])}
+        if 'max_added_step_L' in zone:
+            limit=float(zone['max_added_step_L'])
+            axis=zone.get('step_axis',0)
+            if axis not in (0,1) or not np.isfinite(limit) or not 0<limit<=5:
+                raise ValueError('Invalid material continuity limit')
+            # Measure the added correction, so genuine source seams, damage
+            # and texture are not mistaken for processing discontinuities.
+            delta=after_L-lightness(a[...,:3])
+            pairs=(m[1:]&m[:-1]) if axis==0 else (m[:,1:]&m[:,:-1])
+            if pairs.sum()<20:raise ValueError('Too few same-material continuity pairs')
+            differences=np.abs(np.diff(delta,axis=axis))
+            # A horizontal/vertical seam is a coherent step, not isolated
+            # texture/gamut quantization noise. Inspect every sampled line,
+            # separately in the left, center and right source-bound witnesses.
+            line_pairs=pairs if axis==0 else pairs.T
+            line_differences=differences if axis==0 else differences.T
+            lines=[float(np.percentile(values[valid],75)) for values,valid in zip(line_differences,line_pairs) if valid.sum()>=10]
+            if not lines:raise ValueError('Too few material continuity samples per line')
+            step=max(lines)
+            if step>limit:
+                raise ValueError(f'Lighting correction discontinuity at {name}: {step:.2f} L')
+            reports[name].update(max_added_step_L=step,limit_L=limit,pair_count=int(pairs.sum()),line_percentile=75,raw_max_pixel_step_L=float(differences[pairs].max()))
+
     return reports
 
 

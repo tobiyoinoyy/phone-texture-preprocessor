@@ -134,8 +134,33 @@ def run(job_path):
             fields[side['name']]+=field;bands[side['name']]|=mask
         before=np.linalg.norm(samples[0]-samples[1],axis=-1)[metric_valid]
         if not len(before):raise ValueError('Seam contains no jointly editable samples')
+        if metric_valid.mean() < job.get('minimum_joint_coverage',0):
+            raise ValueError('UV seam lacks required jointly editable material coverage')
         info.append({'pair':chain['names'],'edge_ids':chain['edges'],'before_mean_deltaE76':float(before.mean()),'before_p95_deltaE76':float(np.quantile(before,.95)),
-                     'metric_samples':int(metric_valid.sum()),'width_pixels':{s['name']:job.get('width_units',.20)*s['px_per_unit']for s in chain['sides']}})
+                     'metric_samples':int(metric_valid.sum()),'total_samples':len(ss),
+                     'joint_coverage':float(metric_valid.mean()),'width_pixels':{s['name']:job.get('width_units',.20)*s['px_per_unit']for s in chain['sides']}})
+    # Evaluate the finite sampling footprint, not only the ideal seam line.
+    # Accumulate bounded residual fields against the original pixels; do not
+    # blur/reprocess already quantized outputs or alter the detail residual.
+    refinements=job.get('sampling_refinements',0)
+    if type(refinements) is not int or not 0<=refinements<=3:
+        raise ValueError('sampling_refinements must be an integer from 0 to 3')
+    for _ in range(refinements):
+        predicted={}
+        for name,src in originals.items():
+            lab=rgb_to_lab(lab_to_rgb(labs[name]+fields[name]*weights[name][...,None]))
+            fit=allows[name]&(src[...,3]>=240)
+            den=gaussian(fit.astype(float),job.get('sigma',3))
+            predicted[name]=gaussian(lab*fit[...,None],job.get('sigma',3))/np.maximum(den[...,None],1e-8)
+        for chain in paired:
+            arc=chain['arc'];ss=np.linspace(0,arc[-1],192)
+            samples=[sample(predicted[s['name']],resample_side(s,arc,ss)[0]) for s in chain['sides']]
+            target=(samples[0]+samples[1])/2
+            for k,side in enumerate(chain['sides']):
+                residual=np.clip(target-samples[k],-2.,2.)
+                field,_=apply_band(originals[side['name']].shape[:2],side,arc,ss,residual,
+                    np.zeros_like(residual),job.get('width_units',.20),job.get('guard_pixels',6))
+                fields[side['name']]+=field
     output.mkdir(parents=True,exist_ok=True);records.mkdir(parents=True,exist_ok=True)
     checks={};outputs={}
     for n,src in originals.items():
@@ -165,6 +190,8 @@ def run(job_path):
     report={'seams':info,'checks':checks,'validation_scope':'actual paired mesh UV samples; render separately'}
     (records/'validation.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
     (records/'job.json').write_text(json.dumps(job,ensure_ascii=False,indent=2))
+    if any(s['after_p95_deltaE76'] > job.get('maximum_p95_deltaE76',float('inf')) for s in info):
+        raise ValueError('UV seam color difference exceeds the delivery limit')
     print(json.dumps(report,ensure_ascii=False,indent=2))
     return report
 

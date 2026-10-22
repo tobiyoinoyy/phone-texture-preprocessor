@@ -154,7 +154,9 @@ def verify(before, after, spec):
                     raise ValueError(f'Antenna position/width mismatch: {sku}/{side}/{name}')
                 checks[name] = dict(measured_rows=measured.tolist(), target_rows=desired.tolist(), error_px=error.tolist(), width_error_px=width.tolist())
             result[sku][side] = dict(input_sha256=digest(files[side]), output_sha256=digest(after[sku][side]),
-                                     checks=checks, button_pixels_unchanged=True)
+                                     checks=checks, button_pixels_unchanged=True,
+                                     alignment_basis=cfg.get('basis', 'back_image'),
+                                     back_reference_sha256=digest(files['back']))
     return result
 
 

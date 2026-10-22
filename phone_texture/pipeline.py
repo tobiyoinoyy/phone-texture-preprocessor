@@ -124,9 +124,9 @@ def deskew_image(image, face):
     return result, info
 
 
-def guided_frame(matte, face, guide):
+def guided_frame(matte, face, guide, source_image=None):
     from .geometry_review import guided_geometry
-    return guided_geometry(matte, face, guide)
+    return guided_geometry(matte, face, guide, source_image=source_image)
 
 
 def process_batch(input_dir, output_dir, process_dir, *, mode, faces=FRAMES, device='auto', backend_instance=None, frame_guides=None):
@@ -150,7 +150,7 @@ def process_batch(input_dir, output_dir, process_dir, *, mode, faces=FRAMES, dev
             angle = guide.get('rotation_ccw_degrees')
             if isinstance(angle, bool) or not isinstance(angle, (int,float)) or not math.isfinite(angle) or abs(angle) > 4:
                 raise ValueError(f'{sku}/{face} 需要经核对的摆正角度（不超过 4 度）')
-    if mode not in ('standardize', 'deskew') or not faces or set(faces) - set(FRAMES):
+    if mode not in ('standardize', 'deskew', 'existing') or not faces or set(faces) - set(FRAMES):
         raise ValueError('无效处理模式或边框面名称')
     work.mkdir(parents=True)
     staged = work / 'staged'
@@ -172,7 +172,11 @@ def process_batch(input_dir, output_dir, process_dir, *, mode, faces=FRAMES, dev
                     stages = {}
                     def capture(name, value):
                         stages[name] = value.copy() if isinstance(value, Image.Image) else Image.fromarray(value)
-                    if mode == 'deskew' and face not in faces:
+                    if mode == 'existing' or (mode == 'deskew' and face not in faces):
+                        if mode == 'existing':
+                            with Image.open(path) as opened:
+                                if opened.format != 'PNG' or opened.mode != 'RGBA':
+                                    raise ValueError('已有几何图必须为 RGBA PNG')
                         dest = folder / path.name
                         shutil.copy2(path, dest)
                         info['operation'] = 'byte_exact_copy'
@@ -188,9 +192,9 @@ def process_batch(input_dir, output_dir, process_dir, *, mode, faces=FRAMES, dev
                                 matte, _ = normalizer.normalize(opened)
                                 guide = guides.get(sku, {}).get(face)
                                 if guide:
-                                    result, geometry = guided_geometry(matte, face, guide, capture)
+                                    result, geometry = guided_geometry(matte, face, guide, capture, source_image=ImageOps.exif_transpose(opened).convert('RGB'))
                                 else:
-                                    result, geometry = normalize_frame_strip(matte, face=face, deskew=True, stage_sink=capture)
+                                    result, geometry = normalize_frame_strip(matte, face=face, deskew=True, stage_sink=capture, source_image=ImageOps.exif_transpose(opened).convert('RGB'))
                             else:
                                 result, geometry = normalize_face(opened, face, backend=normalizer.backend,
                                     config=NormalizerConfig(crop_threshold=128, device=device), stage_sink=capture)
@@ -237,22 +241,23 @@ def validate_calibration(work, config):
         if Path(item['name']).stem.lower() == 'back':
             if references.get(str(Path(item['source']).resolve())) != item['sha256']:
                 raise ValueError(f'{item["sku"]} 缺少对应背板的标定哈希')
-    basis=config.get('alignment_basis','model_uv')
-    if basis=='front_back_images':
+    basis=config.get('alignment_basis', 'model_uv' if config.get('scene_record') else 'back_image')
+    if basis in ('back_image', 'front_back_images'):
         from texture_alignment.image_reference_targets import build_targets
         import numpy as np
+        reference_faces = ('front','back') if basis == 'front_back_images' else ('back',)
         for item in manifest['companions']:
-            if Path(item['name']).stem.lower() in ('front','back'):
+            if Path(item['name']).stem.lower() in reference_faces:
                 if references.get(str(Path(item['source']).resolve())) != item['sha256']:
-                    raise ValueError('Image-space alignment requires both front/back source hashes')
+                    raise ValueError('Image-space alignment requires current reference source hashes')
         for item in manifest['images']:
             name,side=item['sku'],item['side']
             guide=config['image_reference_guides'][name][side]
-            for face in ('front','back'):
+            for face in reference_faces:
                 actual=next(c for c in manifest['companions'] if c['sku']==name and Path(c['name']).stem.lower()==face)
                 if str(Path(guide[face]['path']).resolve())!=str(Path(actual['source']).resolve()) or guide[face]['sha256']!=actual['sha256']:
                     raise ValueError('Guide references another SKU/front/back image')
-            target=build_targets(guide,manifest['height'],manifest['sizes'][side][0])
+            target=build_targets(guide,manifest['height'],manifest['sizes'][side][0], basis=basis)
             if not np.array_equal(np.asarray(target),np.asarray(alignment.target_points(config,name,side))):
                 raise ValueError('Targets differ from front/back landmark mapping')
     elif basis=='model_uv':
@@ -290,8 +295,8 @@ def apply(work_dir, landmarks, output_dir, process_dir):
         if path.is_file():
             shutil.move(str(path), process / path.name)
     report = json.loads((process / 'alignment-report.json').read_text())
-    report['alignment_basis'] = config.get('alignment_basis','model_uv')
-    report['uv_validation'] = 'not_checked_image_space_only' if report['alignment_basis']=='front_back_images' else 'requires_current_blender_scene'
+    report['alignment_basis'] = config.get('alignment_basis', 'model_uv' if config.get('scene_record') else 'back_image')
+    report['uv_validation'] = 'not_checked_image_space_only' if report['alignment_basis'] in ('back_image', 'front_back_images') else 'requires_current_blender_scene'
     write_json(process / 'alignment-report.json', report)
     publish(staged, output)
     return report

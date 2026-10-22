@@ -166,6 +166,27 @@ class MatchUvSeamsCliTests(unittest.TestCase):
         self.assertEqual({p.name: sha256(p) for p in (self.root / 'photos').iterdir()}, previous)
         self.assert_sources_unchanged()
 
+    def test_sampling_refinement_preserves_source_detail_and_protected_pixels(self):
+        self.job['sampling_refinements'] = 2
+        self.test_preserves_pixels_and_detail_while_reducing_paired_seam()
+
+    def test_incomplete_seam_coverage_cannot_count_as_passed(self):
+        self.job['minimum_joint_coverage'] = .98
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('jointly editable material coverage', result.stderr)
+        self.assertFalse((self.root / 'photos').exists())
+        self.assert_sources_unchanged()
+
+    def test_color_gate_rejects_uncorrected_seam(self):
+        self.job['max_lab_shift'] = [0,0,0]
+        self.job['max_slope_effect'] = [0,0,0]
+        self.job['maximum_p95_deltaE76'] = 2
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('color difference exceeds', result.stderr)
+        self.assert_sources_unchanged()
+
     def test_source_destination_is_rejected_without_changes(self):
         self.job['output_dir'] = str(self.root)
         self.job['records_dir'] = str(self.root.parent / (self.root.name + '-unused-records'))

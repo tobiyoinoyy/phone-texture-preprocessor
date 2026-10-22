@@ -214,7 +214,7 @@ def target_color(job):
     return target, info
 
 
-def supported_contour_field(lab, fit, editable, alpha, sigma):
+def supported_contour_field(lab, fit, editable, alpha, sigma, inset_depth=5.):
     """Tangent/normal source sampling; include curved rims and alpha fringes.
 
     Requires SciPy (included by phone-texture-preprocessor). No nearest-neighbor
@@ -224,6 +224,8 @@ def supported_contour_field(lab, fit, editable, alpha, sigma):
     tangent, normal = np.asarray(sigma,dtype=float)
     if not np.isfinite([tangent,normal]).all() or tangent<=0 or normal<=0:
         raise ValueError('Contour sigma must be two finite positive values')
+    if not np.isfinite(inset_depth) or inset_depth<0:
+        raise ValueError('Contour inset depth must be finite and nonnegative')
     inside=alpha>=128
     dist=distance_transform_edt(np.pad(inside,1))[1:-1,1:-1]-distance_transform_edt(~inside)
     gy,gx=np.gradient(gaussian_filter(dist,3));norm=np.maximum(np.hypot(gx,gy),1e-8)
@@ -231,17 +233,40 @@ def supported_contour_field(lab, fit, editable, alpha, sigma):
     num=np.zeros((len(x),3));den=np.zeros(len(x));total=0.
     for t in np.linspace(-2.5*tangent,2.5*tangent,19):
         for n in np.linspace(-2*normal,2*normal,5):
-            inset=np.maximum(0,5-dist[y,x])
+            inset=np.maximum(0,inset_depth-dist[y,x])
             coordinates=[y+nx[y,x]*t+ny[y,x]*(n+inset),x-ny[y,x]*t+nx[y,x]*(n+inset)]
             weight=np.exp(-.5*(t/tangent)**2-.5*(n/normal)**2);total+=weight
             den+=weight*map_coordinates(fit.astype(float),coordinates,order=1,mode='constant',cval=0)
             for channel in range(3):
                 num[:,channel]+=weight*map_coordinates(lab[...,channel]*fit,coordinates,order=1,mode='constant',cval=0)
     strength=den/total
-    if (strength<.008).any():raise ValueError('Unsupported editable contour illumination')
+    if (strength<.008).any():
+        missing=strength<.008
+        raise ValueError(f'Unsupported editable contour illumination: {int(missing.sum())} pixels; bounds [{int(x[missing].min())}, {int(y[missing].min())}, {int(x[missing].max())}, {int(y[missing].max())}]')
     if not np.isfinite(num).all():raise ValueError('Non-finite contour illumination')
     low=np.zeros_like(lab);support=np.zeros(alpha.shape);low[y,x]=num/den[:,None];support[y,x]=strength
     return low,support,support>=.008
+
+
+def contour_depth_reference(lab, fit, alpha):
+    """Source-only normal profile for a rim with different polished facets.
+
+    Bright bevels and dark anodized bands cannot share one scalar target.
+    Estimate their continuous normal-depth response from this face, leaving
+    tangent illumination correction to the independently supported field.
+    """
+    from scipy.ndimage import distance_transform_edt, gaussian_filter1d
+    if np.count_nonzero(fit)<60:raise ValueError('Too few independently sampled rim depths')
+    depth=distance_transform_edt(np.pad(alpha>=128,1))[1:-1,1:-1]
+    bins=np.rint(depth).astype(int);max_bin=int(np.max(bins[fit]))
+    positions=[];values=[]
+    for i in range(max_bin+1):
+        samples=lab[...,0][fit&(bins==i)]
+        if len(samples)>=20:positions.append(i);values.append(float(np.percentile(samples,60)))
+    if len(positions)<3:raise ValueError('Too few independently sampled rim depths')
+    profile=np.interp(np.arange(max_bin+1),positions,values)
+    profile=gaussian_filter1d(profile,.75)
+    return np.interp(depth,np.arange(len(profile)),profile),dict(depths=positions,source_L60=values)
 
 
 def process_view(item, target, defaults):
@@ -287,7 +312,16 @@ def process_view(item, target, defaults):
     allowed_union = np.zeros((h,w), dtype=bool)
     domains = []
     for domain in item['domains']:
-        material = shapes_mask((w,h), domain['shapes']) & (src[...,3] > 0) & reviewed
+        material = (shapes_mask((w,h), domain['shapes']) if domain.get('shapes')
+                    else np.ones((h,w), dtype=bool))
+        if domain.get('mask'):
+            region = np.array(Image.open(domain['mask']).convert('L'))
+            if region.shape != (h,w):
+                raise ValueError('Material domain mask dimensions differ from source')
+            material &= region > 0
+        elif not domain.get('shapes'):
+            raise ValueError('Material domain requires reviewed shapes or a mask')
+        material &= (src[...,3] > 0) & reviewed
         allowed = material & ~protect
         if np.any(allowed_union & allowed):
             raise ValueError('Material domains must not overlap')
@@ -297,8 +331,17 @@ def process_view(item, target, defaults):
             raise ValueError('Insufficient reviewed material samples')
         sigma = domain.get('sigma', defaults.get('sigma', [18,18]))
         field = domain.get('field','gaussian')
+        profile_info=None;field_lab=lab
+        if domain.get('reference_profile'):
+            if domain['reference_profile']!='contour_depth' or mode!='source_lightness' or field!='contour':
+                raise ValueError('Rim normal profile requires source_lightness contour field')
+            profile,profile_info=contour_depth_reference(lab,fit,src[...,3])
+            # Fit tangent illumination relative to the measured normal profile.
+            # Averaging absolute L across bright/dark facets would attribute
+            # their real finish differences to lighting and create dark bands.
+            field_lab=lab.copy();field_lab[...,0]-=profile
         if field == 'contour':
-            low, support, reliable = supported_contour_field(lab, fit, allowed, src[...,3], sigma)
+            low, support, reliable = supported_contour_field(field_lab, fit, allowed, src[...,3], sigma,domain.get('contour_inset_depth',5.))
         elif field == 'gaussian':
             low, support, reliable = supported_field(lab, fit, allowed, sigma)
         else:
@@ -307,7 +350,14 @@ def process_view(item, target, defaults):
         if mode == 'source_lightness':
             strengths = strengths.copy()
             strengths[1:] = 0
-        shift = (target-low)*strengths
+        # Each material/component uses its own source samples: antennas and
+        # button metal cannot inherit the surrounding frame's colour target.
+        local_target = target
+        if domain.get('reference_boxes'):
+            local_target, _ = target_color({'views': [dict(source=str(path), reference_boxes=domain['reference_boxes'])]})
+        if profile_info is not None:
+            local_target=np.array(local_target,copy=True);local_target[0]=0.
+        shift = (local_target-low)*strengths
         limits = np.array(defaults.get('max_lab_shift', [48,24,24]))
         shift = np.clip(shift, -limits, limits)
         # Smooth all correction components, including across excluded features.
@@ -319,6 +369,8 @@ def process_view(item, target, defaults):
         out_lab += shift*weight[...,None]
         domains.append({'name':domain.get('name','metal'), 'editable_pixels':int(allowed.sum()),
                         'fit_pixels':int(fit.sum()),'field':field,'strength':strengths.tolist(),
+                        'source_reference_lab':np.asarray(target if profile_info else local_target).tolist(),
+                        'source_normal_profile':profile_info,
                         'minimum_editable_support':float(support[allowed].min()) if allowed.any() else None,
                         'unsupported_editable_pixels':0})
     if np.any(required & ~allowed_union):

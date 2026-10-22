@@ -81,6 +81,8 @@ def extract_frame_strip(image: Image.Image, *, face='bottom', margin_px=0.5):
     ValueError; do not substitute a guessed rectangle. margin_px is a small
     outward allowance, not an inward erosion of the photographed frame.
     """
+    if face == 'top':
+        raise ValueError('TOP_SOURCE_REQUIRED: use normalize_frame_strip with original source_image for camera-free calibration')
     if face not in ('top','bottom','left','right'):
         raise ValueError('Frame strip mode supports top, bottom, left and right')
     if not np.isfinite(margin_px) or not 0 <= margin_px <= 2:
@@ -132,13 +134,18 @@ def extract_frame_strip(image: Image.Image, *, face='bottom', margin_px=0.5):
     }
 
 
-def normalize_frame_strip(image: Image.Image, *, face='bottom', deskew=None, stage_sink=None):
+def normalize_frame_strip(image: Image.Image, *, face='bottom', deskew=None, stage_sink=None, source_image=None):
     """Extract, deskew, tightly crop, then apply the named view orientation.
 
     All four frame views default to deskew. Pass deskew=False to reproduce
     legacy extraction-only behavior. Quarter turns
     are exact pixel permutations; only the small deskew rotation resamples.
     """
+    if face == 'top':
+        if deskew is False:
+            raise ValueError('Top body calibration requires deskew; legacy extraction is not a validated top output')
+        from phone_texture.auto_geometry import frame_geometry
+        return frame_geometry(image, face, stage_sink, source_image)
     result, info = extract_frame_strip(image, face=face)
     if stage_sink:
         stage_sink('source_matte', image.copy())

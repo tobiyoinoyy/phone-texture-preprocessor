@@ -1,5 +1,7 @@
 # 结构对齐与最终发布
 
+默认以当前待处理 SKU 自己的背面为基准（`basis: back_image`），左右侧天线横向平直，按钮独立。完整调度和桌面使用见[统一运行流程](../../../docs/workflow.md)。
+
 ## 为什么不能跳过
 
 Pro Max 曾完成裁切与光照却漏掉结构对齐，上下天线相对背板偏移约 30 像素。光照校验的 alpha/像素范围合格不能证明位置正确。六面入口 `intake` 默认 `delivery_goal=model_textures`；`publish` 必须接收本次光照输出对应的结构过程与逐侧视觉复核。旧 intake 没有 delivery_goal 时也按模型贴图处理。
@@ -15,9 +17,9 @@ Pro Max 曾完成裁切与光照却漏掉结构对齐，上下天线相对背板
 5. `publish` 先验证几何和光照，再重新验证结构输入、像素重映射、两侧上下边界和宽度、两端/中央检测、按钮像素、其他四面、视觉记录，最后才复制结构结果到正式目录。
 
 ```bash
-python skills/phone-six-view-process/scripts/workspace.py align-structure \
+phone-texture align-structure \
   --input 本轮六面光照候选 --spec 本次结构标定.json --process 独立结构过程
-python skills/phone-six-view-process/scripts/workspace.py publish \
+phone-texture publish \
   --work 本轮过程 --plan 本轮过程/delivery.json \
   --structure-process 独立结构过程 --structure-review 独立结构过程/review.json \
   --output 六面成品

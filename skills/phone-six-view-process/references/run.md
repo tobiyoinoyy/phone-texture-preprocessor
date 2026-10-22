@@ -1,5 +1,7 @@
 # 安装与运行
 
+完整任务统一用 `phone-texture start/run/status` 或桌面入口，详见[完整运行流程](../../../docs/workflow.md)。下方保留相同程序的分阶段调用；旧 workspace.py 仅转发包内实现。
+
 ## 单仓库安装与定位
 
 完整代码只需克隆 `https://github.com/tobiyoinoyy/phone-texture-preprocessor`。几何工具与两个光照 Skill 均在此仓库，运行时不读取旧的独立仓库。
@@ -18,14 +20,14 @@ python3 -m venv .venv
 
 ## 运行约定
 
-下列变量只是示意，换为当前环境实际路径。用几何仓库 `.venv/bin/python` 运行本 Skill 的 `scripts/workspace.py`（需要 Pillow、NumPy）。
+下列路径只是示意，换为当前环境实际路径。统一用仓库环境的 `.venv/bin/phone-texture` 运行分阶段命令。
 
 ```bash
-python workspace.py intake --input 原图 --work 本轮过程 --skus SKU_01 SKU_02 SKU_07 SKU_10
+phone-texture intake --input 原图 --work 本轮过程 --skus SKU_01 SKU_02 SKU_07 SKU_10
 phone-texture standardize 本轮过程/input --output 本轮过程/geometry --process 本轮过程/geometry-records
 # 查看 geometry-records/geometry-review，填写 review-template.json 的逐面检查和独立像素检查区
 phone-texture approve-geometry 本轮过程/geometry-records --review 已复核.json --output 本轮过程/geometry
-python workspace.py checkpoint --work 本轮过程 --geometry 本轮过程/geometry --geometry-report 本轮过程/geometry-records/report.json
+phone-texture checkpoint --work 本轮过程 --geometry 本轮过程/geometry --geometry-report 本轮过程/geometry-records/report.json
 ```
 
 `intake` 同时支持单个六面文件夹；单台默认命名 SKU_01，可用 `--single-name` 更改。批次忽略根目录预览图，只选择所列 SKU。重复面、缺面、损坏图、输入/过程互相包含均拒绝。原始边框方向不同于预处理约定时，先保存精确 90° 旋转副本及变换记录，再以新副本哈希建立标定，不能改原图。
@@ -65,7 +67,7 @@ python workspace.py checkpoint --work 本轮过程 --geometry 本轮过程/geome
 `action` 为 `copy/aluminum/stainless`，copy 从登记的 geometry 按字节复制；修复面必须提供落盘结果、源坐标有效允许蒙版、保护蒙版、参数记录和说明。铝工具导出的 editable/protected 可直接使用；不锈钢需由高光、alpha、保护求最终允许蒙版。这份清单记录范围依据，发布器验证像素边界，不代替对材料、job 或视觉效果的判断。仍有未完成的必需光照处理时不要将 action 改为 copy 冒充成功。
 
 ```bash
-python workspace.py publish --work 本轮过程 --plan 本轮过程/delivery.json \
+phone-texture publish --work 本轮过程 --plan 本轮过程/delivery.json \
   --structure-process 独立结构过程 --structure-review 独立结构过程/review.json --output 六面成品
 ```
 

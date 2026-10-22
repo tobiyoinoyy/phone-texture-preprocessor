@@ -1,4 +1,32 @@
-# 手机贴图预处理工具
+# 六面工坊 0.1.0
+
+本地浏览器批量处理手机六面照片。选择机型、原图文件夹、导出文件夹和并发数，即可处理并预览六面透明贴图。支持 iPhone 17 Pro / Pro Max 本项目铝材标准拍摄照片，包含方向识别、一键命名副本、光照优化、按本机背面对齐天线及固定模型四角接缝校色。
+
+### 安装与启动（macOS）
+
+需要 Python 3.9 以上。首次安装联网下载依赖与抠图权重，后续图片处理在本机完成。
+
+```bash
+git clone --branch v0.1.0 https://github.com/tobiyoinoyy/phone-texture-preprocessor.git
+cd phone-texture-preprocessor
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[cutout,browser]'
+# 首次准备模型：同时缓存权重和模型实现，供浏览器后台离线加载。
+python -c "from scripts.segmentation import _load_birefnet_model; _load_birefnet_model('ZhengPeng7/BiRefNet_dynamic', 'cpu')"
+phone-texture web --home "$HOME/Documents/六面工坊"
+```
+
+也可下载 Release 源码包并解压，从创建虚拟环境一步开始。请保留完整源码目录，光照引擎也位于其中。
+
+可选：执行 `python scripts/package_browser.py "$HOME/Documents/六面工坊"` 创建本机双击启动器。它复用当前源码与环境，并非独立安装包。无需安装 Codex 或 Agent。
+
+[浏览器使用说明](docs/browser-app.md) · [0.1.0 更新记录](CHANGELOG.md)
+
+六面工坊使用独立产品版本 **0.1.0**；同库处理引擎与 Codex 插件版本为 **1.5.0**。发布包不包含原始照片、业务模型、运行记录或模型权重；包含运行所需的方向特征库、固定 UV 接缝配置及测试夹具。结果仍需检查裁切、材质与所用模型的匹配效果。
+
+## 处理引擎
 
 图片标准化、边框角度矫正、贴图结构对齐合并为一个入口：`phone-texture`。
 
@@ -7,6 +35,32 @@
 - **结构对齐**：按钮以指定 SKU 为基准；上下天线可按每个 SKU 正背面图片标定，或按实际模型 UV 接缝换算。沿用逐列天线倾斜修正和透明边缘插值。
 
 每步都能单独使用。原图标准化已经摆正时，直接进入结构标注，不重复旋转。铝金属光照优化和不锈钢高光修复也包含在本仓库，由统一 Skill 按材质调用。
+
+## 无 Agent 的原图自动处理
+
+本项目 iPhone 17 铝材采集规范使用 `phone-texture auto 原图目录 --model iphone17pro --jobs 2`，由程序完成六面分割、标定、材质与贴纸分析、光照、背面天线对齐和检查。无需 GPT/Agent 补点、画蒙版或填参数。顶面只保留边框本体，摄像头台阶与镜头必须排除；不支持的输入明确失败。结果交由用户验收，不能冒充任意照片或真实模型 UV 均已验证。详见 [程序边界与顶面规则](docs/top-body-calibration.md)。
+
+## 显式配置与签收入口（1.5）
+
+双击 `手机图片一键处理.command` 打开六面处理窗口，或使用同一套程序：
+
+```bash
+phone-texture start 原图目录 --work 本轮过程 --output 六面成品 --material aluminum
+phone-texture run 本轮过程
+phone-texture status 本轮过程
+```
+
+现在桌面、命令行和四个 Skill 统一调度几何、按材质光照、结构对齐及验收发布。默认每个待处理 SKU 使用自己的背面作为上下天线基准，按钮独立标定。缺少蒙版、标定或真实复核时保存待办，补齐后继续，不重复旋转或校色。
+
+完整参数、逐面光照任务及可选固定模型坐标门禁见 [统一运行流程](docs/workflow.md)。固定 UV 模型仍须先将新图片配准到参考坐标；图片自身背面对齐不能替代固定模型适配。下面各命令保留为同程序的子步骤。
+
+同库另提供正在验证的原图自动候选入口，面向已命名、采用本项目采集方向和质检贴纸样式的 iPhone 17 铝材照片：
+
+```bash
+phone-texture auto 原图目录 --model iphone17pro --jobs 2
+```
+
+它从当前原图新建轮廓、纸面/材料范围和结构标记，不读取历史 SKU 蒙版或标定。省略保存路径时自动创建独立目录。只有全部 SKU 完成六面计算与数值检查才生成整批候选；`processed_needs_visual_review` 明确表示仍需最终视觉验收，不能当作正式发布或模型 UV 已通过。适用范围和状态含义见[自动候选入口](docs/workflow.md#原图自动候选入口)。桌面及原 `start/run` 的正式复核发布流程保持原有门禁。
 
 ## 安装
 
@@ -98,3 +152,9 @@ python scripts/test_all.py
 ## 模型贴图发布检查（1.4）
 
 六面入口默认交付模型贴图，结构对齐是必需步骤。光照候选生成后执行 `workspace.py align-structure`，核对上下天线四边界、宽度、两端与按钮，再以 `--structure-process` 和 `--structure-review` 发布。缺步骤或使用过期结果会被拒绝；只有明确的照片任务可在 intake 使用 `--delivery-goal photos --goal-reason ...`。完整字段和命令见[结构发布门禁](skills/phone-six-view-process/references/structure-delivery.md)。图片检查通过不替代当前模型 UV 接缝检查。
+
+## 本地浏览器版
+
+运行 `.venv/bin/phone-texture web --home /工具与结果目录`，支持文件夹选择、批量勾选、1–8 并发、逐台进度、内存保护、停止与失败重试、六面预览和 ZIP 下载。调用相同的原图自动入口，保留原图；输出仍须视觉与模型适配验收。[使用与部署说明](docs/browser-app.md)。
+
+当前 Mac 可用 `.venv/bin/python scripts/package_browser.py /交付目录` 安装双击入口。它复用本仓库环境，默认结果保存在交付目录的「处理结果」。

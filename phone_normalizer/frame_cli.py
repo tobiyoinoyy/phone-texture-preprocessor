@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from .api import Normalizer, NormalizerConfig
 from .frame_strip import normalize_frame_strip
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 def process_frames(sources, output_dir, *, face='bottom', device='auto', backend_instance=None, deskew=True):
@@ -32,8 +32,9 @@ def process_frames(sources, output_dir, *, face='bottom', device='auto', backend
         with Normalizer(config,backend_instance=backend_instance) as normalizer:
             for p,name in zip(paths,names):
                 with Image.open(p) as im:
+                    source_image=ImageOps.exif_transpose(im).convert('RGB')
                     segmented,segmentation=normalizer.normalize(im)
-                result,geometry=normalize_frame_strip(segmented,face=face,deskew=deskew)
+                result,geometry=normalize_frame_strip(segmented,face=face,deskew=deskew,source_image=source_image)
                 folder=out/name;folder.mkdir()
                 target=folder/f'{face}.png'
                 with target.open('xb') as handle:result.save(handle,format='PNG')

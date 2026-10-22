@@ -30,7 +30,7 @@ def test_reviewed_rectangle_cannot_cut_round_corners():
 
 def test_local_support_cut_preserves_original_body_and_complete_rounding(tmp_path):
     im=rounded();guide=masks(tmp_path,im);stages={}
-    out,_=guided_geometry(im,'top',guide,lambda n,v:stages.update({n:v}))
+    out,_=guided_geometry(im,'bottom',guide,lambda n,v:stages.update({n:v}))
     orig=np.array(im);before=np.array(stages['after_support'])
     np.testing.assert_array_equal(orig[:70],before[:70])
     fg=np.zeros((100,120),np.uint8);fg[64:67,23:97]=255

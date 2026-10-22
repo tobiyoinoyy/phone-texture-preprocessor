@@ -1,6 +1,11 @@
 # 结构标定
 
-先选择 `alignment_basis`：`front_back_images` 为正背面图片参考，`model_uv` 为当前模型真实接缝（兼容默认模式）。
+顶面几何不得含摄像头台阶或镜头；所有新旧 top 标定先满足 [顶面本体标定](top-body-calibration.md)。机身尺寸也排除摄像头凸起。
+
+
+默认 `alignment_basis: back_image`，按每个待处理 SKU 自己的背面机身与天线四边界建立水平侧面目标，按钮独立标定；不跨 SKU 借用天线坐标。`build_targets(guide, height, width)` 默认只需要 back、side_body_y 及独立 button_rows/button_basis。
+
+可显式选择其他 `alignment_basis`：`front_back_images` 为正背面图片参考，`model_uv` 为当前模型真实接缝（显式模型模式；历史含 scene_record 的配置仍兼容）。
 
 ## 模型 UV 模式
 
@@ -32,7 +37,7 @@ reference_files: [{path: 背板或场景记录的绝对路径, sha256: 文件哈
 
 已有六面照片时可用图片参考生成左右贴图，无需先提供模型。先摆正正背面并分别量机身上下端，排除透明画布空白、贴纸纸尾与镜头凸起；每侧分别登记同一台机器正面、背面天线四条边界。不能仅以画布等高或把两图天线位置取平均代替标定。
 
-`texture_alignment.image_reference_targets.build_targets(guide, height, width)` 接收：
+`texture_alignment.image_reference_targets.build_targets(guide, height, width, basis="front_back_images")` 接收：
 
 ```text
 front/back: {path, sha256, body_y: [机身顶,机身底], antenna_rows: [上天线上界,上天线下界,下天线上界,下天线下界]}

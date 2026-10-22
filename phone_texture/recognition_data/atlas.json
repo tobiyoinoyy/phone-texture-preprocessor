@@ -1,0 +1,236 @@
+{
+  "profile": "iphone17-studio-views-v1",
+  "references": [
+    {
+      "id": "SKU_01_front",
+      "group": "SKU_01",
+      "face": "front",
+      "source_sha256": "2a80cdb451325b2a2b3d4820a2dc3707f33d677dc3b6bf4f2080edd0d7ae4985"
+    },
+    {
+      "id": "SKU_01_back",
+      "group": "SKU_01",
+      "face": "back",
+      "source_sha256": "6d0f2a3fea0874aa8b3b2efc301a5601912dad3182ec3ae288b447a823ac5a81"
+    },
+    {
+      "id": "SKU_01_left",
+      "group": "SKU_01",
+      "face": "left",
+      "source_sha256": "12a57927697b8f10b88918b40eac733f92110a7519de526c3b702b6012382bea"
+    },
+    {
+      "id": "SKU_01_right",
+      "group": "SKU_01",
+      "face": "right",
+      "source_sha256": "a9465bbbe3951fa2d7d20e9f395250ae5c781ce9e35b362fc7688a850a1f1b23"
+    },
+    {
+      "id": "SKU_01_top",
+      "group": "SKU_01",
+      "face": "top",
+      "source_sha256": "8e648ea4c604bf4d72fbce478d9fbfb091e3eb7ebf1da887fee84fb25c4d5f6b"
+    },
+    {
+      "id": "SKU_01_bottom",
+      "group": "SKU_01",
+      "face": "bottom",
+      "source_sha256": "bc1410f3ce3838106e2bce8522b4d82bc12b7fa3c83ed317b0872a1e565e4ecc"
+    },
+    {
+      "id": "SKU_02_front",
+      "group": "SKU_02",
+      "face": "front",
+      "source_sha256": "25b622cf26f4d5f459b9d434d6dcb8cd1d7004eeeefca0016212f0f3e252ce0e"
+    },
+    {
+      "id": "SKU_02_back",
+      "group": "SKU_02",
+      "face": "back",
+      "source_sha256": "72acc71390793bc398713c90f987e6ab895e2a773b3b44ff4c20b15fe0b913b5"
+    },
+    {
+      "id": "SKU_02_left",
+      "group": "SKU_02",
+      "face": "left",
+      "source_sha256": "82df5e31a85e4e36a7350d2d4513955e4f182293ad8fff57c475740f4f8696bc"
+    },
+    {
+      "id": "SKU_02_right",
+      "group": "SKU_02",
+      "face": "right",
+      "source_sha256": "87e50eb7a8ad46aaa93f8c201f07b62ab07804f4601e811773177a84fe3eed72"
+    },
+    {
+      "id": "SKU_02_top",
+      "group": "SKU_02",
+      "face": "top",
+      "source_sha256": "1e52fbdb03bb67522cd461caddc3b106359dda898e5178582f0e8166a39fa51a"
+    },
+    {
+      "id": "SKU_02_bottom",
+      "group": "SKU_02",
+      "face": "bottom",
+      "source_sha256": "c78311ea8c5f2033a34a5fb6256d500487f1981d5cb8c068bb9dcf65872240f1"
+    },
+    {
+      "id": "SKU_03_front",
+      "group": "SKU_03",
+      "face": "front",
+      "source_sha256": "6c658f389a548bf733653811c49d6b566e0e92b4d771abd16d3c09ae33429cff"
+    },
+    {
+      "id": "SKU_03_back",
+      "group": "SKU_03",
+      "face": "back",
+      "source_sha256": "0e25ec533c5f40e9c978f956857416d660a2c422141f0140e20b08fa2071aa2d"
+    },
+    {
+      "id": "SKU_03_left",
+      "group": "SKU_03",
+      "face": "left",
+      "source_sha256": "acec6c16cc6252906b21eb630b745f0f667d38147256242eb2581ce746c38f70"
+    },
+    {
+      "id": "SKU_03_right",
+      "group": "SKU_03",
+      "face": "right",
+      "source_sha256": "4b2cf277ee22561093e482a037b90648ca59e984a4cec1bd2770c5a359eac5e8"
+    },
+    {
+      "id": "SKU_03_top",
+      "group": "SKU_03",
+      "face": "top",
+      "source_sha256": "738e40ecd58a7337ca98e0b1211959f35e65a5c7e2c082ef24a134add4fc419e"
+    },
+    {
+      "id": "SKU_03_bottom",
+      "group": "SKU_03",
+      "face": "bottom",
+      "source_sha256": "0ccd1767eef8eef71914f9a34a08f5a8bff9c04ddef9910ec1f1de8340798999"
+    },
+    {
+      "id": "SKU_04_front",
+      "group": "SKU_04",
+      "face": "front",
+      "source_sha256": "fcb0d269e094d4693dd078c092db16eb0a90500a23b8546d0b131d57f5e5a908"
+    },
+    {
+      "id": "SKU_04_back",
+      "group": "SKU_04",
+      "face": "back",
+      "source_sha256": "2c7fba4007930c61b0ca85acda486ddd9d675c936725bacc7ea5867fbaa6da94"
+    },
+    {
+      "id": "SKU_04_left",
+      "group": "SKU_04",
+      "face": "left",
+      "source_sha256": "6bb5ce9e48fa60d4edbf6789ef63c56673ba9b60991695984710ee268e2961cf"
+    },
+    {
+      "id": "SKU_04_right",
+      "group": "SKU_04",
+      "face": "right",
+      "source_sha256": "937b6830ab2bd9be656c568a9f292e3dc83746b41158daf4770dd3e6d90a135c"
+    },
+    {
+      "id": "SKU_04_top",
+      "group": "SKU_04",
+      "face": "top",
+      "source_sha256": "fadd343ca4351cf78ff34384735a578431df4b9b26b79d47abc8c763c9a20d51"
+    },
+    {
+      "id": "SKU_04_bottom",
+      "group": "SKU_04",
+      "face": "bottom",
+      "source_sha256": "cb621a2900d6220ee6eb68c51d89d29c893ea1ea39ed0a9763b90646f33b6991"
+    },
+    {
+      "id": "SKU_05_front",
+      "group": "SKU_05",
+      "face": "front",
+      "source_sha256": "b2e5bd6af1e095ea5f4819c95bbbbb55fe92a2be397fc75a7d79147dc70e5b8d"
+    },
+    {
+      "id": "SKU_05_back",
+      "group": "SKU_05",
+      "face": "back",
+      "source_sha256": "022b52510b4cea31e0e96d7ebb90fdfae59cd651a46bc9d1efecc982ae3fc9b8"
+    },
+    {
+      "id": "SKU_05_left",
+      "group": "SKU_05",
+      "face": "left",
+      "source_sha256": "c5ef2ef35e5dd75e448fef9b6ea2c3f5dcb70b2d1d22a4584cb5016368dbc25f"
+    },
+    {
+      "id": "SKU_05_right",
+      "group": "SKU_05",
+      "face": "right",
+      "source_sha256": "caba3f5eea94c2724ca71e1aeed74c01cd8b7f1af37d593961bfd39a7e64d5ef"
+    },
+    {
+      "id": "SKU_05_top",
+      "group": "SKU_05",
+      "face": "top",
+      "source_sha256": "bc2e65167d355d05fbe17adecb9c14edb17f58e4f3108cbb973023a410a145c3"
+    },
+    {
+      "id": "SKU_05_bottom",
+      "group": "SKU_05",
+      "face": "bottom",
+      "source_sha256": "a687799af9bc98e995ae03f068cad1945554bcefc58b425ceb25caf384bbbce4"
+    },
+    {
+      "id": "SKU_06_front",
+      "group": "SKU_06",
+      "face": "front",
+      "source_sha256": "2de4b3e0df0c859a3d5a695af8755ea1a938c55a50c9dc5bfa4496a39f679fc2"
+    },
+    {
+      "id": "SKU_06_back",
+      "group": "SKU_06",
+      "face": "back",
+      "source_sha256": "95980883ad183cfa3a4f33f6438bfe317f2d6a0506ebdd535aeb3d2728ca459f"
+    },
+    {
+      "id": "SKU_06_left",
+      "group": "SKU_06",
+      "face": "left",
+      "source_sha256": "87ebdb53a9552e15a701d863e345fedcfc755a05a700fab16f47e66119871d32"
+    },
+    {
+      "id": "SKU_06_right",
+      "group": "SKU_06",
+      "face": "right",
+      "source_sha256": "daa00dcfb25360045c883e0c25792d2e718280985c3c1e2fe0d22b7022d64f41"
+    },
+    {
+      "id": "SKU_06_top",
+      "group": "SKU_06",
+      "face": "top",
+      "source_sha256": "eb0de65bf9fc82629257c7f789e7a3ab5fd017001aaebd57ad36c684c03d29b8"
+    },
+    {
+      "id": "SKU_06_bottom",
+      "group": "SKU_06",
+      "face": "bottom",
+      "source_sha256": "dcd6b33e849c4e56b0519cda1b538a99c0edecf9f4e811350b593ce676c12742"
+    }
+  ],
+  "scope": "Known iPhone 17 studio raw capture; not a universal classifier",
+  "held_out_groups": [
+    "SKU_07",
+    "SKU_08",
+    "SKU_09",
+    "SKU_10"
+  ],
+  "algorithm": "image-only coarse edges plus fine side hardware edges and mirror comparison",
+  "thresholds": {
+    "min_similarity": 0.9,
+    "min_margin": 0.025,
+    "min_side_similarity": 0.9,
+    "min_side_margin": 0.035,
+    "min_mirror_advantage": 0.015
+  }
+}
