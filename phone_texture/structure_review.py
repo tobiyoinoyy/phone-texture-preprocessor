@@ -65,13 +65,26 @@ def detect(path, x_range, windows, signs):
     return np.asarray(rows, float)
 
 
-def reference(files, ref, side_height, body):
+def measurement_path(current, binding):
+    if not binding:return current
+    path=Path(binding['path'])
+    if digest(path)!=binding['sha256']:raise ValueError('Frozen measurement source changed')
+    a,b=pixels(path),pixels(current)
+    if a.shape!=b.shape or not np.array_equal(a[...,3],b[...,3]):
+        raise ValueError('Measurement and lighting geometry differ')
+    return path
+
+
+def reference(files, ref, side_height, body, coordinate_mode='body_endpoints'):
     face = ref['face']
     if face not in ('front', 'back') or digest(files[face]) != ref['sha256']:
         raise ValueError('Reference must bind this SKU current front/back image')
     view = dict(ref, path=str(files[face]))
     target = rows_from_view(view, side_height, body)
-    measured = detect(files[face], ref['x_range'], ref['search_windows'], ref['signs'])
+    if coordinate_mode=='canvas_pixel_centers':
+        target=(np.asarray(ref['antenna_rows'],float)+.5)/Image.open(files[face]).height*side_height-.5
+    elif coordinate_mode!='body_endpoints':raise ValueError('Unknown image alignment coordinates')
+    measured = detect(measurement_path(files[face],ref.get('measurement_source')), ref['x_range'], ref['search_windows'], ref['signs'])
     if np.max(np.abs(measured-np.asarray(ref['antenna_rows']))) > TOLERANCE:
         raise ValueError('Front/back landmarks disagree with actual reference pixels')
     return target
@@ -81,6 +94,7 @@ def mapping(files, side, cfg):
     src = files[side]; a = pixels(src); h, w = a.shape[:2]
     if digest(src) != cfg['source_sha256']:
         raise ValueError('Side landmarks belong to another source')
+    measurement_path(src,cfg.get('measurement_source'))
     source = np.asarray(cfg['source_lines'], float)
     # anchor_matrix verifies ordered finite per-column coordinates.
     anchor_matrix(source, h, w, 'source')
@@ -92,14 +106,14 @@ def mapping(files, side, cfg):
     back = cfg['back']
     if back.get('face') != 'back':
         raise ValueError('Each side requires its own SKU back reference')
-    rows = reference(files, back, h, cfg['body_y'])
+    rows = reference(files, back, h, cfg['body_y'],cfg.get('coordinate_mode','body_endpoints'))
     target_rows = np.repeat(rows[:, None], w, axis=1)
     basis = cfg.get('basis', 'back_image')
     if basis == 'front_back_images':
         front = cfg['front']
         if front.get('face') != 'front' or cfg.get('front_at') not in ('left', 'right'):
             raise ValueError('Explicit front/back side orientation required')
-        f = reference(files, front, h, cfg['body_y'])
+        f = reference(files, front, h, cfg['body_y'],cfg.get('coordinate_mode','body_endpoints'))
         t = np.linspace(0, 1, w)
         if cfg['front_at'] == 'right':
             t = 1-t
@@ -138,6 +152,9 @@ def verify(before, after, spec):
             for lo, hi in buttons:
                 if not np.array_equal(a[lo:hi], b[lo:hi]):
                     raise ValueError('Structure remapping changed button/card tray pixels')
+            for lo,hi in cfg.get('outline_ranges',[]):
+                if not np.array_equal(a[lo:hi],b[lo:hi]):
+                    raise ValueError('Structure remapping changed a rounded endcap')
             measurements = cfg['measurements']
             if set(measurements) != {'left_end', 'center', 'right_end'}:
                 raise ValueError('Both endpoints and center need pixel checks')
@@ -156,6 +173,8 @@ def verify(before, after, spec):
             result[sku][side] = dict(input_sha256=digest(files[side]), output_sha256=digest(after[sku][side]),
                                      checks=checks, button_pixels_unchanged=True,
                                      alignment_basis=cfg.get('basis', 'back_image'),
+                                     coordinate_mode=cfg.get('coordinate_mode','body_endpoints'),
+                                     rounded_endcaps_unchanged=bool(cfg.get('outline_ranges')),
                                      back_reference_sha256=digest(files['back']))
     return result
 

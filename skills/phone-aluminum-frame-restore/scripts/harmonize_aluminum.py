@@ -269,6 +269,59 @@ def contour_depth_reference(lab, fit, alpha):
     return np.interp(depth,np.arange(len(profile)),profile),dict(depths=positions,source_L60=values)
 
 
+def blend_correction_boundary(shift, masks, config, source_lab=None):
+    """Join illumination fields across a declared same-metal internal seam.
+
+    Smooth only additive corrections, never RGB/texture. Outer alpha edges,
+    paper, glass and other unlisted materials do not become transition targets.
+    """
+    from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter, minimum_filter
+    names=config['domains'];anchor=config['boundary_domain'];sigma=float(config['sigma'])
+    if len(set(names))!=len(names) or anchor not in names or len(names)<2:
+        raise ValueError('Correction blend requires distinct adjacent material domains')
+    if not np.isfinite(sigma) or sigma<=0:
+        raise ValueError('Correction blend sigma must be finite and positive')
+    if any(name not in masks for name in names):
+        raise ValueError('Unknown correction blend domain')
+    union=np.logical_or.reduce([masks[name] for name in names])
+    primary=masks[anchor];other=union&~primary
+    seam=(primary&binary_dilation(other))|(other&binary_dilation(primary))
+    if not seam.any():raise ValueError('Correction blend has no shared internal boundary')
+    distance=distance_transform_edt(~seam)
+    t=np.clip(1-distance/(3*sigma),0,1);weight=t*t*(3-2*t)*union
+    support=gaussian_filter(union.astype(float),sigma)
+    smooth=np.stack([gaussian_filter(shift[...,c]*union,sigma)/np.maximum(support,1e-9)
+                     for c in range(3)],axis=-1)
+    result=shift+(smooth-shift)*weight[...,None]
+    gamut_adjusted=0
+    if source_lab is not None:
+        # Per-pixel gamut clipping can turn a smooth field into speckled steps
+        # near saturated highlights. Propagate conservative L limits through
+        # this same-metal field, not through source pixels or their texture.
+        visible=weight>0
+        safe,_=preserve_chroma_in_gamut(source_lab[union]+result[union],source_lab[union])
+        safe_shift=result.copy();safe_shift[union,0]=safe[:,0]-source_lab[union,0]
+        bounded=safe_shift[...,0].copy()
+        for sign in (1.,-1.):
+            magnitude=np.maximum(0,sign*safe_shift[...,0])
+            cap=np.where(union,magnitude,np.inf)
+            # A min-plus envelope only reduces correction magnitude and is
+            # at most 0.6 L/pixel in either axis; it never invents RGB detail.
+            for _ in range(int(np.ceil(float(magnitude[union].max())/.6))+1):
+                updated=np.where(union,np.minimum(cap,minimum_filter(cap,size=3,mode='constant',cval=np.inf)+.6),np.inf)
+                if np.array_equal(updated,cap):break
+                cap=updated
+            same_sign=visible&(sign*safe_shift[...,0]>0)
+            bounded[same_sign]=sign*cap[same_sign]
+        continuous=safe_shift[...,0]+(bounded-safe_shift[...,0])*weight
+        gamut_adjusted=int(np.count_nonzero(visible&(np.abs(continuous-result[...,0])>1e-6)))
+        result[visible,0]=continuous[visible]
+    return result,dict(domains=names,boundary_domain=anchor,sigma=sigma,
+                       transition_pixels=int(np.count_nonzero(weight)),
+                       gamut_continuity_pixels=gamut_adjusted,
+                       method='same_material_additive_field_only')
+
+
 def process_view(item, target, defaults):
     path = Path(item['source'])
     before_hash = digest(path)
@@ -310,7 +363,7 @@ def process_view(item, target, defaults):
     mode = color_mode(defaults)
     out_lab = lab.copy()
     allowed_union = np.zeros((h,w), dtype=bool)
-    domains = []
+    domains = []; domain_masks = {}
     for domain in item['domains']:
         material = (shapes_mask((w,h), domain['shapes']) if domain.get('shapes')
                     else np.ones((h,w), dtype=bool))
@@ -323,6 +376,7 @@ def process_view(item, target, defaults):
             raise ValueError('Material domain requires reviewed shapes or a mask')
         material &= (src[...,3] > 0) & reviewed
         allowed = material & ~protect
+        domain_masks[domain.get('name','metal')] = allowed
         if np.any(allowed_union & allowed):
             raise ValueError('Material domains must not overlap')
         allowed_union |= allowed
@@ -331,17 +385,26 @@ def process_view(item, target, defaults):
             raise ValueError('Insufficient reviewed material samples')
         sigma = domain.get('sigma', defaults.get('sigma', [18,18]))
         field = domain.get('field','gaussian')
+        contour_alpha=src[...,3]
+        if domain.get('contour_alpha_mask'):
+            if field!='contour':raise ValueError('Body contour coordinates require contour field')
+            contour_alpha=np.array(Image.open(domain['contour_alpha_mask']).convert('L'))
+            if contour_alpha.shape!=(h,w):raise ValueError('Body contour dimensions differ from source')
+            # Fit exclusion is not pixel protection: all original button
+            # pixels remain allowed and receive the continuous body lighting.
+            fit &= contour_alpha>=128
+            if fit.sum()<20:raise ValueError('Insufficient body-contour material samples')
         profile_info=None;field_lab=lab
         if domain.get('reference_profile'):
-            if domain['reference_profile']!='contour_depth' or mode!='source_lightness' or field!='contour':
+            if domain['reference_profile'] not in ('contour_depth','contour_depth_lift') or mode!='source_lightness' or field!='contour':
                 raise ValueError('Rim normal profile requires source_lightness contour field')
-            profile,profile_info=contour_depth_reference(lab,fit,src[...,3])
+            profile,profile_info=contour_depth_reference(lab,fit,contour_alpha)
             # Fit tangent illumination relative to the measured normal profile.
             # Averaging absolute L across bright/dark facets would attribute
             # their real finish differences to lighting and create dark bands.
             field_lab=lab.copy();field_lab[...,0]-=profile
         if field == 'contour':
-            low, support, reliable = supported_contour_field(field_lab, fit, allowed, src[...,3], sigma,domain.get('contour_inset_depth',5.))
+            low, support, reliable = supported_contour_field(field_lab, fit, allowed, contour_alpha, sigma,domain.get('contour_inset_depth',5.))
         elif field == 'gaussian':
             low, support, reliable = supported_field(lab, fit, allowed, sigma)
         else:
@@ -355,10 +418,21 @@ def process_view(item, target, defaults):
         local_target = target
         if domain.get('reference_boxes'):
             local_target, _ = target_color({'views': [dict(source=str(path), reference_boxes=domain['reference_boxes'])]})
+        source_reference=np.array(local_target,copy=True)
         if profile_info is not None:
             local_target=np.array(local_target,copy=True);local_target[0]=0.
         shift = (local_target-low)*strengths
-        limits = np.array(defaults.get('max_lab_shift', [48,24,24]))
+        if domain.get('reference_profile') == 'contour_depth_lift':
+            # The old depth profile retained a continuous photographic dark
+            # band. Lift its low-frequency L toward this source's measured
+            # metal reference, without replacing pixels or flattening texture.
+            lift=np.maximum(0.,source_reference[0]-profile)
+            shift[...,0]+=lift*strengths[0]
+            profile_info=dict(profile_info,lift_reference_L=float(source_reference[0]),
+                              maximum_source_profile_lift_L=float(lift[allowed].max()))
+        limits = np.asarray(domain.get('max_lab_shift', defaults.get('max_lab_shift', [48,24,24])),dtype=float)
+        if limits.shape!=(3,) or not np.isfinite(limits).all() or (limits<0).any():
+            raise ValueError('max_lab_shift must have three finite nonnegative values')
         shift = np.clip(shift, -limits, limits)
         # Smooth all correction components, including across excluded features.
         # Protected pixels themselves are reinstated exactly after conversion.
@@ -369,10 +443,16 @@ def process_view(item, target, defaults):
         out_lab += shift*weight[...,None]
         domains.append({'name':domain.get('name','metal'), 'editable_pixels':int(allowed.sum()),
                         'fit_pixels':int(fit.sum()),'field':field,'strength':strengths.tolist(),
-                        'source_reference_lab':np.asarray(target if profile_info else local_target).tolist(),
+                        'source_reference_lab':source_reference.tolist(),
                         'source_normal_profile':profile_info,
+                        'contour_coordinate_sha256':digest(domain['contour_alpha_mask']) if domain.get('contour_alpha_mask') else None,
                         'minimum_editable_support':float(support[allowed].min()) if allowed.any() else None,
                         'unsupported_editable_pixels':0})
+    blends=[]
+    for config in item.get('correction_blends',[]):
+        if mode!='source_lightness':raise ValueError('Correction blends require source_lightness')
+        shift,proof=blend_correction_boundary(out_lab-lab,domain_masks,config,lab)
+        out_lab=lab+shift;blends.append(proof)
     if np.any(required & ~allowed_union):
         raise ValueError('Required editable pixels missing from material domains or editable mask')
     gamut_limited = 0
@@ -397,7 +477,7 @@ def process_view(item, target, defaults):
         raise RuntimeError('Source changed during processing')
     return dst, allowed_union, protect, {'source':str(path),'source_sha256':before_hash,
         'size':[w,h], 'domains':domains, 'color_mode':mode,
-        'gamut_limited_pixels':gamut_limited,
+        'gamut_limited_pixels':gamut_limited,'correction_blends':blends,
         'required_editable_pixels':int(required.sum()),
         'required_editable_missing':0,
         'changed_pixels':int(np.any(dst != src,axis=-1).sum()),

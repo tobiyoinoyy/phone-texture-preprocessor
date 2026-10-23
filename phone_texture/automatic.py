@@ -19,11 +19,11 @@ import traceback
 import numpy as np
 from PIL import Image,ImageOps
 from . import pipeline,workspace as w,geometry_review as gr,structure_review as sr,lighting
-from .auto_geometry import frame_geometry,plate_geometry
+from .auto_geometry import frame_geometry,plate_geometry,trim_visible_canvas
 from .auto_material import paper_mask,propose_job,save_mask,lighting_scope
 from .auto_structure import propose
 
-PROFILE='iphone17-aluminum-studio-v4-inset-uv-seams'
+PROFILE='iphone17-aluminum-studio-v9-independent-landmarks-lower-plane'
 _INFERENCE_SLOTS=None
 
 
@@ -104,6 +104,10 @@ def process_one(task):
                     matte.save(failed/(face+'-matte.png'))
                     write(failed/(face+'.json'),dict(source=item['source'],source_sha256=item['sha256']))
                     raise
+                tight_paper,_=paper_mask(image,face)
+                image,tight_proof=trim_visible_canvas(image,tight_paper)
+                evidence['visible_canvas_trim']=tight_proof
+                evidence['output_size']=list(image.size)
                 p=folder/(face+'.png');image.save(p)
                 artifacts=gr.make_evidence(item['snapshot'],image,stages,records/'geometry-review'/sku/face)
                 geometry['images'].append(dict(sku=sku,face=face,source=item['snapshot'],
@@ -121,11 +125,15 @@ def process_one(task):
         stage('segmentation_geometry_and_evidence',begin)
         result['device_observations']=device_observations
         result['post_forward_memory_samples']=forward_observations
+        geometry_files={f:folder/(f+'.png') for f in pipeline.FACES}
+        # Freeze the actual landmarks before illumination can alter gradients.
+        structure_proposal=propose(geometry_files,coordinate_mode='canvas_pixel_centers')
+        write(case/'work/geometry-structure-proposal.json',structure_proposal)
         light=case/'work/lighting'/sku;checks={};jobs={};analyses={};begin=time.perf_counter()
         for face in pipeline.FACES:
             progress('lighting',face,6+len(checks))
             p=folder/(face+'.png');assets=case/'work/material-inputs'/face
-            job,analysis,allowed,paper=propose_job(p,face,assets,companions={f:folder/(f+'.png') for f in pipeline.FACES})
+            job,analysis,allowed,paper=propose_job(p,face,assets,companions=geometry_files,landmarks=structure_proposal)
             effect_spec=lighting_scope(p,face,job,assets/'effect-source-witnesses')
             write(assets/'lighting-scope.json',effect_spec)
             job.update(output_dir=str(light),records_dir=str(case/'work/lighting-records'/face))
@@ -141,7 +149,9 @@ def process_one(task):
         write(case/'work/lighting-jobs.json',{sku:jobs});write(case/'work/lighting-checks.json',checks)
         begin=time.perf_counter();files={f:light/(f+'.png') for f in pipeline.FACES}
         progress('alignment',completed=12)
-        spec={sku:propose(files)};spec_path=case/'work/structure-spec.json';write(spec_path,spec)
+        from .auto_structure import bind_lighting_sources
+        spec={sku:bind_lighting_sources(structure_proposal,geometry_files,files)}
+        spec_path=case/'work/structure-spec.json';write(spec_path,spec)
         structural=sr.prepare(case/'work/lighting',spec_path,case/'work/structure-records')
         stage('fresh_landmarks_structure_and_checks',begin)
         begin=time.perf_counter()
@@ -152,15 +162,20 @@ def process_one(task):
         candidate=case/'candidate';pipeline.publish(case/'work/seam-candidates',candidate)
         # Computational completeness is explicit, distinct from visual approval.
         final=pipeline.batch_files(candidate);assert set(final)=={sku}
+        canvas_checks={}
         for face in pipeline.FACES:
             with Image.open(final[sku][face]) as im:
                 if im.mode!='RGBA' or im.format!='PNG':raise ValueError('Final face is not RGBA PNG')
+                paper=np.array(Image.open(case/'work/material-inputs'/face/'paper.png'))>0
+                _,trim=trim_visible_canvas(im,paper)
+                if any(trim['removed_margins_ltrb']):raise ValueError('Final canvas contains excess soft-matte padding: '+face)
+                canvas_checks[face]=trim
         w.check_sources(manifest)
         pipeline.overview({sku:{f:folder/(f+'.png') for f in pipeline.FACES}},final,case/'overview.png',faces=pipeline.FACES)
         stage('candidate_output_and_final_integrity',begin)
         result.update(status='processed_needs_visual_review',six_faces_processed=True,
             candidate=str(candidate),lighting_checks=checks,structure_checks=structural['checks'],
-            frame_uv_seam_checks=seam_report,
+            frame_uv_seam_checks=seam_report,final_canvas_checks=canvas_checks,
             final_sha256={f:w.sha(p) for f,p in final[sku].items()},source_hashes_unchanged=True)
     except Exception as exc:
         result.update(status='failed',six_faces_processed=False,error=str(exc),traceback=traceback.format_exc())

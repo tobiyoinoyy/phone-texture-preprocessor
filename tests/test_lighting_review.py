@@ -211,3 +211,24 @@ def test_added_seam_check_rejects_artificial_step_but_retains_source_detail(tmp_
     bad=source.copy();bad[16:,:,:3]+=40;Image.fromarray(bad).save(work/'step.png')
     with pytest.raises(ValueError,match='discontinuity'):
         r.measure_local(spec,work/'source.png',work/'step.png',allowed,~allowed)
+
+
+def test_jagged_internal_boundary_rejects_new_steps_but_not_source_texture(tmp_path):
+    work,spec=fixture(tmp_path);source=r.pixels(work/'source.png')
+    yy,xx=np.indices(source.shape[:2]);left=xx<(7+yy%3);right=~left
+    Image.fromarray(left.astype('uint8')*255).save(work/'edge.png')
+    Image.fromarray(right.astype('uint8')*255).save(work/'peer.png')
+    source[left,:3]=100;Image.fromarray(source).save(work/'source.png')
+    spec.update(source_sha256=r.digest(work/'source.png'),mode='regional',local_checks={
+        'join':dict(mask=str(work/'edge.png'),boundary_peer_mask=str(work/'peer.png'),
+                    min_L=0,max_L=100,max_boundary_step_L=2)})
+    allowed=np.ones(left.shape,bool)
+    report=r.measure_local(spec,work/'source.png',work/'source.png',allowed,~allowed)
+    assert report['join']['boundary_step_L99']==0
+    bad=source.copy();bad[left,:3]+=35;Image.fromarray(bad).save(work/'step.png')
+    with pytest.raises(ValueError,match='boundary discontinuity'):
+        r.measure_local(spec,work/'source.png',work/'step.png',allowed,~allowed)
+    r.write(work/'geometry.json',{'SKU_01':{'left':{'path':str(work/'source.png'),'sha256':r.digest(work/'source.png')}}})
+    r.write(work/'scope.json',{'SKU_01':{'left':spec}});r.freeze_scope(work,work/'scope.json')
+    Image.new('L',(16,32),255).save(work/'peer.png')
+    with pytest.raises(ValueError,match='changed after scope freeze'):r.load_scope(work)

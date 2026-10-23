@@ -467,3 +467,104 @@ def test_rim_profile_correction_reduces_shading_without_flattening_facets(tmp_pa
     assert np.array_equal(output[...,3],source[...,3])
     assert np.array_equal(output[~material],source[~material])
     assert report['domains'][0]['source_normal_profile'] is not None
+
+
+def test_continuous_dark_rim_is_lifted_without_replacing_texture_or_paper(tmp_path):
+    from scipy.ndimage import distance_transform_edt
+    # Same-material photographic darkness follows all four sides, so the old
+    # normal-depth reference retains it even when every pixel is editable.
+    h,w=180,120;alpha=np.full((h,w),255,np.uint8);alpha[:,0]=150
+    depth=distance_transform_edt(np.pad(alpha>=128,1))[1:-1,1:-1]
+    yy,xx=np.indices((h,w));rim=depth<=18;paper=(yy>=160)&(xx>=54)&(xx<63)
+    for tag,chroma,target_L in [('copper',[20.,28.],70.),('blue',[4.,-14.],47.)]:
+        lab=np.zeros((h,w,3));lab[...,1:]=chroma
+        lab[...,0]=target_L-35*np.clip((12-depth)/8,0,1)
+        lab[...,0]+=1.8*np.sin(yy*1.3)  # Real source texture, not regenerated noise.
+        lab[70:74,2:5,0]-=7  # A visible scratch across the dark rim.
+        source=np.dstack([MODULE.lab_to_rgb(lab),alpha]);source[paper,:3]=210
+        source[165:168,56:61,:3]=20  # Printed paper must remain byte exact.
+        src=tmp_path/(tag+'.png');Image.fromarray(source).save(src)
+        mask=tmp_path/(tag+'-rim.png');Image.fromarray((rim&~paper).astype('uint8')*255).save(mask)
+        prot=tmp_path/(tag+'-paper.png');Image.fromarray(paper.astype('uint8')*255).save(prot)
+        domain=dict(mask=str(mask),field='contour',reference_profile='contour_depth',
+            sigma=[12,2],contour_inset_depth=2,reference_boxes=[[14,80,18,95]],
+            strength=[.9,0,0],feather=0,correction_smooth=1,max_lab_shift=[48,0,0])
+        item=dict(source=str(src),source_sha256=sha256(src),protection_policy='sticker_only',
+            sticker_mask=str(prot),protected_mask=str(prot),domains=[domain])
+        old,*_=MODULE.process_view(item,np.array([target_L,*chroma]),dict(color_mode='source_lightness'))
+        domain['reference_profile']='contour_depth_lift'
+        new,allowed,_,report=MODULE.process_view(item,np.array([target_L,*chroma]),dict(color_mode='source_lightness'))
+        before=MODULE.rgb_to_lab(source[...,:3]);after=MODULE.rgb_to_lab(new[...,:3]);old_lab=MODULE.rgb_to_lab(old[...,:3])
+        shadow=(depth<=4)&~paper
+        assert np.median(after[...,0][shadow])-np.median(old_lab[...,0][shadow])>24
+        assert np.median(after[...,0][shadow])>target_L-8
+        assert np.percentile(np.abs(after[...,1:]-before[...,1:])[allowed],99)<1
+        # Neighboring original microtexture and scratch contrast survive a
+        # smooth additive field; no uniform-color reconstruction is allowed.
+        before_detail=np.diff(before[45:120,2:5,0],axis=0)
+        after_detail=np.diff(after[45:120,2:5,0],axis=0)
+        assert np.corrcoef(before_detail.ravel(),after_detail.ravel())[0,1]>.97
+        assert abs(np.median(after[70:74,2:5,0])-np.median(after[65:69,2:5,0]))>4
+        assert np.array_equal(new[...,3],source[...,3])
+        assert np.array_equal(new[paper],source[paper])
+        assert np.array_equal(new[~allowed],source[~allowed])
+        assert report['domains'][0]['source_normal_profile']['maximum_source_profile_lift_L']>20
+
+
+def test_body_coordinate_mask_does_not_freeze_or_crop_protruding_button(tmp_path):
+    from scipy.ndimage import distance_transform_edt
+    alpha=np.zeros((200,140),np.uint8);alpha[5:195,15:125]=255
+    body=alpha.copy();alpha[60:120,10:15]=255
+    depth=distance_transform_edt(body>0);rim=(alpha>0)&(depth<=20)
+    lab=np.zeros((200,140,3));lab[:]=[70,18,24]
+    lab[...,0]-=35*np.clip((14-depth)/10,0,1)
+    a=np.dstack([MODULE.lab_to_rgb(lab),alpha]);src=tmp_path/'source.png';Image.fromarray(a).save(src)
+    body_path=tmp_path/'body.png';Image.fromarray(body).save(body_path)
+    mask=tmp_path/'metal.png';Image.fromarray(rim.astype('uint8')*255).save(mask)
+    item=dict(source=str(src),domains=[dict(mask=str(mask),field='contour',reference_profile='contour_depth_lift',
+        contour_alpha_mask=str(body_path),sigma=[12,2],reference_boxes=[[30,80,34,90]],
+        strength=[.9,0,0],feather=0,correction_smooth=1,max_lab_shift=[48,0,0])])
+    result,allowed,protected,report=MODULE.process_view(item,np.array([70,18,24]),dict(color_mode='source_lightness'))
+    assert allowed[75:105,10:15].all() and not protected[75:105,10:15].any()
+    assert np.median(MODULE.rgb_to_lab(result[75:105,10:15,:3])[...,0])>55
+    assert np.array_equal(result[...,3],a[...,3])
+    assert np.array_equal(result[~rim],a[~rim])
+    assert report['domains'][0]['contour_coordinate_sha256']==sha256(body_path)
+
+
+def test_internal_lighting_transition_preserves_texture_and_unlisted_materials():
+    yy,xx=np.indices((100,120));rim=xx<(35+np.rint(3*np.sin(yy/5)))
+    paper=(yy>70)&(xx>25)&(xx<48);glass=(yy<20)&(xx>50)
+    masks={'rim':rim&~paper,'panel':~rim&~paper&~glass}
+    shift=np.zeros((100,120,3));shift[masks['rim'],0]=22;shift[masks['panel'],0]=-5
+    config=dict(domains=['rim','panel'],boundary_domain='rim',sigma=7)
+    blended,report=MODULE.blend_correction_boundary(shift,masks,config)
+    assert np.max(np.abs(np.diff(blended[25:65,:,0],axis=1)))<2
+    assert np.array_equal(blended[:,0],shift[:,0])  # No fading to zero at exterior.
+    assert np.array_equal(blended[paper|glass],shift[paper|glass])
+    source=np.full_like(shift,50.);source[...,0]+=2*np.sin(xx*2)+3*np.cos(yy*1.7)
+    source[40:43,25:65,0]-=8  # Genuine scratch crosses the algorithm boundary.
+    out=source+blended
+    detail_before=np.diff(source[25:65,24:47,0],axis=0)
+    detail_after=np.diff(out[25:65,24:47,0],axis=0)
+    assert np.corrcoef(detail_before.ravel(),detail_after.ravel())[0,1]>.99
+    assert np.array_equal(out[...,1:],source[...,1:])
+    assert report['transition_pixels']>0
+    import pytest
+    for bad in [dict(config,sigma=0),dict(config,domains=['rim','missing'])]:
+        with pytest.raises(ValueError):MODULE.blend_correction_boundary(shift,masks,bad)
+
+
+def test_internal_transition_limits_gamut_without_pixelwise_bright_speckles():
+    yy,xx=np.indices((60,100));source=np.zeros((60,100,3));source[:]=[65,25,35]
+    source[::2,48:52]=[78,25,35]  # High-L source texture close to the gamut edge.
+    masks={'rim':xx<50,'panel':xx>=50};shift=np.zeros_like(source)
+    shift[...,0]=np.where(xx<50,24,10)
+    config=dict(domains=['rim','panel'],boundary_domain='rim',sigma=7)
+    blended,proof=MODULE.blend_correction_boundary(shift,masks,config,source)
+    limited,_=MODULE.preserve_chroma_in_gamut(source+blended,source)
+    delta=(limited-source)[...,0]
+    assert np.max(np.abs(np.diff(delta[10:50,48:52],axis=0)))<.7
+    assert np.max(np.abs(delta[:,50]-delta[:,49]))<1
+    assert np.array_equal(limited[...,1:],source[...,1:])
+    assert proof['gamut_continuity_pixels']>0

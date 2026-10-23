@@ -15,7 +15,7 @@ from PIL import Image, ImageOps
 
 FACES = ('front', 'back', 'left', 'right', 'top', 'bottom')
 DATA = Path(__file__).with_name('recognition_data')
-PROFILE = 'iphone17-studio-views-v1'
+PROFILE = 'iphone17-studio-views-v2-hardware-orientation'
 
 
 def read_rgb(path):
@@ -64,6 +64,17 @@ def atlas():
     return meta, arrays
 
 
+def hardware_feature(feature):
+    """Independent interior-button witness within the studio framing.
+
+    Excludes the long silhouette rails and stand dominating whole-side scores.
+    Uses the existing frozen descriptors, without adding incoming samples.
+    """
+    grid = feature.reshape(96, 96)
+    vector = grid[48:52, 16:80].ravel().copy()
+    return vector / (np.linalg.norm(vector) + 1e-8)
+
+
 def recognize(path, exclude_group=None):
     rgb = read_rgb(path); feature = edge_feature(rgb)
     meta, arrays = atlas()
@@ -87,7 +98,17 @@ def recognize(path, exclude_group=None):
         a,b = detail[order[0]],detail[order[1]]
         result.update(method='multiscale_side_edges', side_scores=detail, mirror_score=mirrored)
         if a-mirrored < .015:
-            result['reason'] = '疑似镜像或侧面方向不确定'; return result
+            hardware = hardware_feature(feature); flipped = hardware_feature(mirror)
+            fine = {face:max(float(hardware @ hardware_feature(arrays[r['id']+'_side']))
+                            for r in refs if r['face']==face) for face in ('left','right')}
+            flipped_score = max(float(flipped @ hardware_feature(arrays[r['id']+'_side']))
+                                for r in refs if r['face'] in ('left','right'))
+            result['hardware_orientation'] = dict(scores=fine, mirror_score=flipped_score)
+            # Only resolve a near tie with a second, agreeing pixel witness.
+            # A mirror winning either comparison remains rejected.
+            if (a <= mirrored or max(fine,key=fine.get) != order[0]
+                    or fine[order[0]] < .90 or fine[order[0]]-flipped_score < .01):
+                result['reason'] = '疑似镜像或侧面方向不确定'; return result
         if a < .90 or a-b < .035:
             result['reason'] = '左右侧面特征不足'; return result
         best = order[0]

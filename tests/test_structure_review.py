@@ -46,6 +46,25 @@ def test_real_pixels_align_and_unaligned_control_is_rejected(tmp_path):
     with pytest.raises(ValueError,match='remapping'):s.verify(files,files,spec)
 
 
+def test_canvas_height_ratio_and_frozen_landmarks_ignore_lighting(tmp_path):
+    from phone_texture.auto_structure import bind_lighting_sources
+    root,files,spec,path=fixture(tmp_path);geometry=files['A'];lighting={}
+    for face,p in geometry.items():
+        # Intentional replacement of RGB gradient must not move frozen geometry.
+        a=s.pixels(p);a[...,:3]=160;dest=tmp_path/(face+'-lit.png');Image.fromarray(a).save(dest);lighting[face]=dest
+    for cfg in spec['A'].values():
+        cfg['coordinate_mode']='canvas_pixel_centers'
+        cfg['body_y']=[8,246];cfg['back']['body_y']=[2,250]
+    bound=bind_lighting_sources(spec['A'],geometry,lighting)
+    _,_,target,_=s.mapping(lighting,'left',bound['left'])
+    assert np.allclose(target[:,0],spec['A']['left']['back']['antenna_rows'])
+    # Equal canvas heights preserve the exact normalized position, regardless
+    # of different estimated body endpoint margins or subsequent RGB lighting.
+    a=s.pixels(geometry['back']);a[10,10,0]+=1;Image.fromarray(a).save(geometry['back'])
+    with pytest.raises(ValueError,match='Frozen measurement source changed'):
+        s.mapping(lighting,'left',bound['left'])
+
+
 @pytest.mark.parametrize('failure',['candidate','source','spec','review','evidence','companion'])
 def test_stale_or_incomplete_structure_proof_is_rejected(tmp_path,failure):
     root,files,spec,path,process=approved(tmp_path)

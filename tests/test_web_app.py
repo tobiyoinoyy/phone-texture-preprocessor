@@ -122,13 +122,22 @@ def test_one_active_batch_and_command_uses_original_pipeline(tmp_path,monkeypatc
     job=app.start(dict(scan_id=scan['id'],skus=['raw'],model='iphone17pro',concurrency=5))
     assert job['concurrency']==1 and job['requested_concurrency']==5
     assert job['status']=='starting'
+    assert Path(job['root']).parent==app.runs
+    assert Path(job['work']).parent==Path(job['root'])
+    assert Path(job['output']).parent==app.default_output
+    assert job['output_base']==str(app.default_output)
+    assert not Path(job['output']).exists()  # Pipeline publishes only finished images.
     with pytest.raises(ValueError,match='已有批次'):app.start(dict(scan_id=scan['id'],skus=['raw'],model='iphone17pro',concurrency=1))
     app.cancel(job['id']);assert app.cancel_events[job['id']].is_set()
 
 
-def test_completed_batch_exports_only_six_checked_faces(tmp_path,monkeypatch):
-    app=web.App(tmp_path/'app');raw=six(tmp_path/'raw');root=tmp_path/'run';root.mkdir()
-    work=root/'过程';work.mkdir();out=root/'六面图片';six(out/'raw')
+@pytest.mark.parametrize('legacy', [False, True])
+def test_completed_batch_exports_only_six_checked_faces(tmp_path,monkeypatch,legacy):
+    app=web.App(tmp_path/'app');raw=six(tmp_path/'raw')
+    root=(tmp_path/'run') if legacy else app.runs/'run';root.mkdir()
+    work=root/'过程';work.mkdir()
+    out=(root/'六面图片') if legacy else tmp_path/'selected-export'/'run'
+    six(out/'raw')
     # Real export validation requires PNG output hashes from the worker report.
     hashes={}
     for face in web.FACES:
@@ -152,6 +161,13 @@ def test_completed_batch_exports_only_six_checked_faces(tmp_path,monkeypatch):
     with zipfile.ZipFile(root/'六面图片.zip') as z:
         assert sorted(z.namelist())==sorted('raw/'+f+'.png' for f in web.FACES)
     assert (root/'验收总览.jpg').exists()
+    assert app.artifact(dict(job='good',kind='log'))==root/'运行日志.txt'
+    assert app.artifact(dict(job='good',kind='zip'))==root/'六面图片.zip'
+    if not legacy:
+        assert all(p.suffix=='.png' for p in out.parent.rglob('*') if p.is_file())
+        assert len([p for p in out.parent.rglob('*') if p.is_file()])==6
+    # Older records still retry to their original export parent, not runtime.
+    assert app.snapshot(job)['output_base']==str(root.parent)
 
 
 def test_browser_folder_picker_lists_only_visible_directories(tmp_path):
@@ -201,3 +217,27 @@ def test_naming_keeps_skipped_rows_visible_and_blocks_during_processing(tmp_path
     with pytest.raises(ValueError,match='等待'):app.apply_names(scan['id'])
     app.jobs.clear();result=app.apply_names(scan['id'])
     assert result['valid']==1 and result['skipped']==['incomplete']
+
+
+def test_model_buttons_expose_pro_and_promax_as_one_radio_group():
+    from html.parser import HTMLParser
+    class Models(HTMLParser):
+        def __init__(self):
+            super().__init__();self.options={};self.selects=[]
+        def handle_starttag(self,tag,attrs):
+            attrs=dict(attrs)
+            if tag=='select':self.selects.append(attrs.get('id'))
+            if tag=='input' and attrs.get('name')=='model':
+                assert attrs['type']=='radio'
+                self.options[attrs['value']]=attrs['aria-label']
+    models=Models();models.feed((web.ASSETS/'index.html').read_text())
+    assert models.options=={'iphone17pro':'iPhone 17 Pro','iphone17promax':'iPhone 17 Pro Max'}
+    assert 'model' not in models.selects
+
+
+def test_export_directory_cannot_contain_internal_records(tmp_path,identified):
+    app=web.App(tmp_path/'app');scan=app.scan(six(tmp_path/'raw'))
+    body=dict(scan_id=scan['id'],skus=['raw'],model='iphone17pro',concurrency=1)
+    for path in [app.home,app.runs,app.runs/'nested']:
+        with pytest.raises(ValueError,match='运行记录'):app.start(dict(body,output=str(path)))
+    assert not app.jobs

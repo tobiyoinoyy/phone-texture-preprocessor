@@ -8,7 +8,7 @@
 <div class="workspace">
 <aside>
 <section class="panel setup"><h2>处理设置</h2>
-<div class="setting-row"><label for="model">型号</label><select id="model"><option value="">选择型号</option value="iphone17pro">iPhone 17 Pro</option><option value="iphone17promax">iPhone 17 Pro Max</option></select></div>
+<fieldset id="model" class="model-setting"><legend>型号</legend><div class="model-options"><label class="model-option"><input type="radio" name="model" value="iphone17pro" aria-label="iPhone 17 Pro"><span>17 Pro</span></label><label class="model-option"><input type="radio" name="model" value="iphone17promax" aria-label="iPhone 17 Pro Max"><span>17 Pro Max</span></label></div></fieldset>
 <button id="pickInput" class="button secondary full choose-folder" aria-label="选择原图文件夹">选择原图文件夹</button>
 <div class="path-entry"><input id="source" aria-label="原图文件夹" placeholder="或粘贴路径" autocomplete="off"><button id="scan" class="icon-button" title="重新读取" aria-label="重新读取">↻</button></div>
 <div class="concurrency-setting"><div class="setting-row"><label for="concurrency">并发数</label><output id="concurrencyValue" for="concurrency">5</output></div><input id="concurrency" type="range" min="1" max="8" step="1" value="5" aria-valuetext="5 并发"><div class="range-labels"><span>1</span><span>5 推荐</span><span>8</span></div></div>

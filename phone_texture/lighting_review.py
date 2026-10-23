@@ -120,6 +120,7 @@ def freeze_scope(work, path):
             if spec.get('protection_policy') == 'sticker_only':
                 assets[str(Path(spec['sticker_mask']).resolve())] = digest(spec['sticker_mask'])
             paths = [z['mask'] for z in spec.get('local_checks', {}).values()]
+            paths += [z['boundary_peer_mask'] for z in spec.get('local_checks', {}).values() if 'boundary_peer_mask' in z]
             if spec['mode'] == 'perimeter':
                 paths += [spec['required_metal_mask']] + [z['mask'] for z in spec['zones'].values()]
             assets.update({str(Path(p).resolve()): digest(p) for p in paths})
@@ -181,6 +182,24 @@ def measure_local(spec, source, output, allowed, protected):
         if not bounds[1] <= value <= bounds[2]:
             raise ValueError(f'Local feature effect failed: {name}: L={value:.2f}')
         reports[name] = {'after_percentile_L':value,'percentile':q,'witness_sha256':digest(zone['mask'])}
+        if 'boundary_peer_mask' in zone:
+            peer=witness(zone['boundary_peer_mask'],a.shape[:2])
+            limit=float(zone['max_boundary_step_L'])
+            if (np.any(peer&m) or np.any(peer&((a[...,3]<240)|~allowed|protected))
+                    or not np.isfinite(limit) or not 0<limit<=5):
+                raise ValueError('Invalid same-material boundary witness')
+            delta=after_L-lightness(a[...,:3]);samples=[]
+            for axis in (0,1):
+                lo=[slice(None),slice(None)];hi=lo.copy()
+                lo[axis]=slice(None,-1);hi[axis]=slice(1,None);lo=tuple(lo);hi=tuple(hi)
+                pairs=(m[lo]&peer[hi])|(peer[lo]&m[hi])
+                samples.extend(np.abs(np.diff(delta,axis=axis))[pairs])
+            if len(samples)<20:raise ValueError('Too few internal boundary pairs')
+            step=float(np.percentile(samples,99));peak=float(np.max(samples))
+            if step>limit or peak>limit*1.5:
+                raise ValueError(f'Lighting boundary discontinuity at {name}: {step:.2f} L (peak {peak:.2f})')
+            reports[name].update(boundary_step_L99=step,boundary_peak_L=peak,
+                limit_L=limit,pair_count=len(samples),peer_sha256=digest(zone['boundary_peer_mask']))
         if 'max_added_step_L' in zone:
             limit=float(zone['max_added_step_L'])
             axis=zone.get('step_axis',0)

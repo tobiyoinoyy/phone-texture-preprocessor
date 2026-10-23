@@ -11,6 +11,34 @@ from phone_normalizer.frame_strip import _line
 from scripts.geometry_postprocess import rotate_alpha_safe
 
 
+def trim_visible_canvas(image, paper=None):
+    """Discard remote soft-matte fringe, retaining body and one AA pixel.
+
+    This crops source pixels only. It never thresholds the retained alpha,
+    erodes corners, resizes a face, or trims a real paper tail.
+    """
+    a=np.array(image.convert('RGBA'));h,w=a.shape[:2]
+    core=a[...,3]>=128
+    if not core.any():raise ValueError('No visible body for tight canvas')
+    retained=core.copy()
+    if paper is not None:
+        paper=np.asarray(paper,dtype=bool)
+        if paper.shape!=(h,w):raise ValueError('Paper geometry differs from canvas')
+        retained |= paper&(a[...,3]>0)
+    yy,xx=np.nonzero(retained)
+    box=[max(0,int(xx.min())-1),max(0,int(yy.min())-1),
+         min(w,int(xx.max())+2),min(h,int(yy.max())+2)]
+    outside=np.ones((h,w),bool);outside[box[1]:box[3],box[0]:box[2]]=False
+    if np.any(outside&retained):raise ValueError('Tight canvas would clip visible body or paper')
+    result=image.crop(box)
+    return result,dict(method='visible_alpha_body_bbox_with_one_pixel_antialias',
+        alpha_body_threshold=128,antialias_allowance_px=1,source_size=[w,h],
+        output_size=list(result.size),crop_xyxy=box,
+        removed_margins_ltrb=[box[0],box[1],w-box[2],h-box[3]],
+        removed_max_alpha=int(a[...,3][outside].max()) if outside.any() else 0,
+        body_pixels_lost=0,paper_pixels_lost=0,retained_rgba_unchanged=True,resampled=False)
+
+
 def consensus_line(x,y,tolerance,max_slope,min_fraction=.6):
     """Bounded-residual source-point consensus, with explicit outlier support."""
     x=np.asarray(x,float);y=np.asarray(y,float)
@@ -250,6 +278,41 @@ def frame_geometry(matte, face, stage_sink=None,source_image=None):
         review_reasons=['extrapolated_frame_edges','complete_outline_requires_review'])
 
 
+def exposed_lower_plane(mask, raw_gradient, x0, x1, last_body_row, paper=None):
+    """Fit the photographed cross-edge independently of the long-side axis.
+
+    Mild perspective makes those axes non-perpendicular. Require both exposed
+    halves and independent RGB support; never fit the central stand or paper.
+    """
+    h,w=mask.shape;bw=x1-x0;options=[]
+    for lo,hi in ((.12,.28),(.14,.30),(.16,.30)):
+        x=np.r_[np.arange(int(x0+lo*bw),int(x0+hi*bw)),
+                np.arange(int(x1-hi*bw),int(x1-lo*bw))]
+        bottom=h-np.argmax(mask[::-1,x],axis=0)
+        valid=(bottom<h-8)&(bottom>last_body_row-.12*bw)
+        if paper is not None:valid &= ~paper[np.clip(bottom-1,0,h-1),x]
+        x,bottom=x[valid],bottom[valid]
+        halves=[x<(x0+x1)/2,x>=(x0+x1)/2]
+        if min(int(s.sum()) for s in halves)<20:continue
+        try:
+            alpha,ak,ae=consensus_line(x+.5,bottom.astype(float),3,np.tan(np.deg2rad(4)))
+            yy=np.rint(np.polyval(alpha,x+.5)[:,None]-.5+np.arange(-4,5)).astype(int)
+            strength=raw_gradient[np.clip(yy,0,h-1),x[:,None]]
+            rgb_y=yy[np.arange(len(x)),np.argmax(strength,axis=1)]+.5
+            rgb,rk,re=consensus_line(x+.5,rgb_y,3,np.tan(np.deg2rad(4)))
+        except ValueError:continue
+        fractions=[float((ak&rk&(strength.max(axis=1)>3))[s].mean()) for s in halves]
+        if min(fractions)<.6:continue
+        disagreement=float(np.max(np.abs(np.polyval(rgb,[x0,x1])-np.polyval(alpha,[x0,x1]))))
+        if disagreement>3:continue
+        options.append((ae+re,alpha,rgb,len(x),[lo,hi],dict(
+            method='independent_exposed_lower_plane_rgb_alpha',
+            half_support_fractions=fractions,alpha_residual_p95_px=ae,
+            raw_rgb_residual_p95_px=re,rgb_alpha_disagreement_px=disagreement)))
+    if not options:raise ValueError('Lower plane lacks two-sided raw/alpha support')
+    return min(options,key=lambda item:item[0])
+
+
 def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
     """Remove the attached stand locally, preserving the segmented round corners."""
     a=np.array(matte.convert('RGBA'));mask=principal(a[...,3]);h,w=mask.shape
@@ -287,6 +350,12 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
         error=np.max(np.abs(np.polyval(rline,[x0,x1])-np.polyval(cline,[x0,x1])))
         if error>3:continue
         clear_options.append((ce+re,cline,rline,int(clear.sum()),[lo,hi]))
+    lower_plane_proof=None
+    if not clear_options:
+        try:
+            score,al,rl,n,bands,lower_plane_proof=exposed_lower_plane(mask,raw_gradient,x0,x1,rows[-1],paper)
+            clear_options.append((score,al,rl,n,bands))
+        except ValueError:pass
     if clear_options:
         score,alpha_line,rgb_line,n_clear,bands=min(clear_options,key=lambda v:v[0])
         # The RGB transition gives a subpixel contour centre, with original
@@ -310,6 +379,7 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
             output_size=list(result.size),body_x=[x0,x1],bottom_rail=line.tolist(),alpha_lower_rail=alpha_line.tolist(),
             clear_bands=bands,exposed_samples=n_clear,lower_edge_residual_p95_px=residual,
             own_corner_evidence=corner_proof if bands is None else None,axis_evidence=axis_proof,
+            lower_plane_evidence=lower_plane_proof,
             rotation_ccw_degrees=angle,canvas_trim_xyxy=list(box),rgb_painted=False,
             review_reasons=['heuristic_support_cut','complete_outline_requires_review'])
     x=np.arange(int(x0+.1*bw),int(x1-.1*bw));bottom=h-np.argmax(mask[::-1,x],axis=0)

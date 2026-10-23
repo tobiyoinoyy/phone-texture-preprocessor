@@ -51,6 +51,18 @@ def antenna_rows(image,x_range,expected_width=None):
 
 
 def rear_reference(image,side,edge,expected_width):
+    """Prefer side-width prior, but never let a bad prior veto rear evidence."""
+    try:
+        return _rear_reference(image,side,edge,expected_width,2)
+    except ValueError:
+        if expected_width is None:raise
+        rows,signs,xr,proof=_rear_reference(image,side,edge,None,3)
+        proof=dict(proof,width_prior_rejected=float(expected_width),
+                   method='independent_rear_column_consensus')
+        return rows,signs,xr,proof
+
+
+def _rear_reference(image,side,edge,expected_width,minimum_support):
     candidates=[]
     for offset in range(6,max(13,int(image.width*.045)),4):
         xr=[edge-offset-7,edge-offset] if side=='left' else [edge+offset,edge+offset+7]
@@ -62,11 +74,12 @@ def rear_reference(image,side,edge,expected_width):
     stable=[]
     for candidate in candidates:
         neighbours=[c for c in candidates if np.max(np.abs(np.array(c[0])-candidate[0]))<=3]
-        if len(neighbours)>=2:
+        if len(neighbours)>=minimum_support:
             stable.append((len(neighbours),min(candidate[3]['scores']),candidate))
     if not stable:raise ValueError('Rear antenna landmarks lack neighbouring-column consensus')
-    _,_,chosen=max(stable,key=lambda v:(v[0],v[1]))
-    return chosen
+    support,_,chosen=max(stable,key=lambda v:(v[0],v[1]))
+    rows,signs,xr,proof=chosen
+    return rows,signs,xr,dict(proof,agreeing_columns=support)
 
 
 def windows(rows,h,radius=4):
@@ -114,8 +127,9 @@ def hardware_ranges(image):
 
 def per_column_boundaries(image,rows):
     a=np.array(image.convert('RGBA'));h,w=a.shape[:2]
-    colors=gaussian_filter1d(a[...,:3].astype(float),1.,axis=0)
-    magnitude=np.linalg.norm(np.gradient(colors,axis=0),axis=2)
+    colors=gaussian_filter1d(a[...,:3].astype(float).mean(axis=2),1.,axis=0)
+    gradient=np.gradient(colors,axis=0)
+    center_gradient=np.gradient(gaussian_filter1d(gray_signal(a,[int(w*.4),int(w*.6)]),1.))
     lines=[]
     band_widths=[rows[1]-rows[0]]*2+[rows[3]-rows[2]]*2
     for i,(row,width) in enumerate(zip(rows,band_widths)):
@@ -123,8 +137,13 @@ def per_column_boundaries(image,rows):
         lo=max(1,row-radius);hi=min(h-1,row+radius+1)
         if i:lo=max(lo,int(np.ceil((rows[i-1]+row)/2)))
         if i<len(rows)-1:hi=min(hi,int(np.floor((row+rows[i+1])/2))+1)
-        peaks=lo+np.argmax(magnitude[lo:hi],axis=0)
-        reliable=(a[peaks,np.arange(w),3]>=128)&(magnitude[peaks,np.arange(w)]>.8)
+        # Follow the same signed material transition across the strip.
+        # Unsigned RGB magnitude can jump onto a nearby opposite-polarity glint.
+        sign=np.sign(center_gradient[row])
+        if sign==0:raise ValueError('Antenna material polarity is ambiguous')
+        response=gradient*sign
+        peaks=lo+np.argmax(response[lo:hi],axis=0)
+        reliable=(a[peaks,np.arange(w),3]>=128)&(response[peaks,np.arange(w)]>.5)
         if reliable.sum()<w*.6:raise ValueError('Too few supported antenna columns')
         x=np.arange(w);line=np.interp(x,x[reliable],peaks[reliable].astype(float))
         line=gaussian_filter1d(median_filter(line,size=5),1.)
@@ -134,7 +153,27 @@ def per_column_boundaries(image,rows):
     return result
 
 
-def propose(files):
+def bind_lighting_sources(proposal, geometry, lighting):
+    """Retain frozen pre-lighting landmarks; bind their same-coordinate RGB output."""
+    import copy
+    result=copy.deepcopy(proposal)
+    for side,cfg in result.items():
+        for face in (side,'back'):
+            a=np.array(Image.open(geometry[face]).convert('RGBA'))
+            b=np.array(Image.open(lighting[face]).convert('RGBA'))
+            if a.shape!=b.shape or not np.array_equal(a[...,3],b[...,3]):
+                raise ValueError('Lighting changed landmark coordinate system')
+        cfg['measurement_source']=dict(path=str(geometry[side]),sha256=digest(geometry[side]))
+        cfg['source_sha256']=digest(lighting[side])
+        cfg['back']['measurement_source']=dict(path=str(geometry['back']),sha256=digest(geometry['back']))
+        cfg['back']['sha256']=digest(lighting['back'])
+        gate.mapping(lighting,side,cfg)
+    return result
+
+
+def propose(files, coordinate_mode='body_endpoints'):
+    if coordinate_mode not in ('body_endpoints','canvas_pixel_centers'):
+        raise ValueError('Unknown image alignment coordinates')
     result={};back=Image.open(files['back']).convert('RGBA');b=np.array(back);h,w=b.shape[:2]
     y0,y1=int(h*.25),int(h*.75);opaque=b[y0:y1,:,3]>=128
     left=int(np.median(np.argmax(opaque,axis=1)));right=int(np.median(w-1-np.argmax(opaque[:,::-1],axis=1)))
@@ -147,22 +186,33 @@ def propose(files):
         body=body_rows(image);back_body=body_rows(back)
         expected_width=np.mean([rows[1]-rows[0],rows[3]-rows[2]])*(back_body[1]-back_body[0])/(body[1]-body[0])
         br,bs,back_x,bproof=rear_reference(back,side,right if side=='left' else left,expected_width)
+        if 'width_prior_rejected' in bproof:
+            expected_side_width=np.mean([br[1]-br[0],br[3]-br[2]])*sh/h
+            rows,signs,proof=antenna_rows(image,xr,expected_side_width)
+            proof['width_reference']='independent_current_back'
         desired=np.array([(v-back_body[0])/(back_body[1]-back_body[0])*(body[1]-body[0])+body[0] for v in br])
+        if coordinate_mode=='canvas_pixel_centers':
+            desired=(np.asarray(br,dtype=float)+.5)/h*sh-.5
         middle_lo=min(r[0] for r in buttons)-3;middle_hi=max(r[1] for r in buttons)+3
         if middle_lo<=max(rows[1],desired[1])+4 or middle_hi>=min(rows[2],desired[2])-4:
             raise ValueError('Independent hardware contours overlap an antenna remapping zone')
         measured_lines=per_column_boundaries(image,rows)
         anchors=np.vstack([measured_lines[0:2],np.full(sw,middle_lo),np.full(sw,middle_hi),measured_lines[2:4]])
+        antenna_indices=[0,1,4,5];outline_ranges=[]
+        if coordinate_mode=='canvas_pixel_centers':
+            cap=max(8,int(np.ceil(sw*.75)))
+            if min(measured_lines[0].min(),desired[0])<=cap+4 or max(measured_lines[-1].max(),desired[-1])>=sh-1-cap-4:
+                raise ValueError('Antenna remapping overlaps the rounded endcaps')
+            anchors=np.vstack([np.full(sw,cap),anchors,np.full(sw,sh-1-cap)])
+            antenna_indices=[1,2,5,6];outline_ranges=[[0,cap+1],[sh-1-cap,sh]]
         measurements={}
         for name,xx in [('left_end',[max(2,int(sw*.07)),max(6,int(sw*.20))]),
                         ('center',xr),('right_end',[int(sw*.80),min(sw-2,int(sw*.93))])]:
-            signal=gray_signal(np.array(image),xx);gradient=np.gradient(gaussian_filter1d(signal,1.))
-            local_rows=np.rint(np.median(measured_lines[:,xx[0]:xx[1]],axis=1)).astype(int)
-            local_signs=[int(np.sign(gradient[r])) for r in local_rows]
+            local_signs=signs
             if 0 in local_signs:raise ValueError('Endpoint antenna polarity is ambiguous')
             measurements[name]=dict(x_range=xx,search_windows=windows(desired,sh,6),signs=local_signs)
-        cfg=dict(source_sha256=digest(files[side]),basis='back_image',body_y=body,
-            source_lines=anchors.tolist(),antenna_indices=[0,1,4,5],button_ranges=buttons,
+        cfg=dict(source_sha256=digest(files[side]),basis='back_image',body_y=body,coordinate_mode=coordinate_mode,
+            source_lines=anchors.tolist(),antenna_indices=antenna_indices,button_ranges=buttons,outline_ranges=outline_ranges,
             button_basis='Independent source Canny hardware contours; complete bounding ranges expanded five pixels',
             hardware_boxes=boxes,source_detection=proof,
             back=dict(face='back',sha256=digest(files['back']),body_y=back_body,

@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 from PIL import Image, ImageOps
-from phone_texture.view_recognition import FACES, recognize
+from phone_texture.view_recognition import FACES, PROFILE, recognize
 from phone_texture.web_app import App
 
 
@@ -59,10 +59,10 @@ def main():
         # Use a fresh, unconfirmed scan, then alter its bytes.
         changed=app.scan(Path(output['source'])/'unnamed')
         (Path(output['source'])/'unnamed'/'front.jpg').write_bytes(expected['back'])
-        try:app.start(dict(scan_id=changed['id'],skus=['unnamed'],concurrency=1))
+        try:app.start(dict(scan_id=changed['id'],skus=['unnamed'],concurrency=1,model='iphone17pro'))
         except ValueError as exc:assert '图片已改变' in str(exc)
         else:raise AssertionError('Changed images accepted')
-    report=dict(profile='iphone17-studio-views-v1',reference_groups='SKU_01–06, self excluded',
+    report=dict(profile=PROFILE,reference_groups='SKU_01–06, self excluded',
                 held_out='SKU_07–10 plus Pro Max',correct=sum(r['correct'] for r in rows),total=len(rows),
                 rejected=sum(r['rejected'] for r in negative),negative_total=len(negative),
                 integration='unnamed, swapped, duplicate, copy byte integrity, idempotency, changed source passed',

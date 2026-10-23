@@ -237,6 +237,7 @@ class App:
         self.home.mkdir(parents=True, exist_ok=True)
         self.registry = self.home/'任务记录'; self.registry.mkdir(exist_ok=True)
         self.default_output = self.home/'处理结果'; self.default_output.mkdir(exist_ok=True)
+        self.runs = self.home/'运行记录'; self.runs.mkdir(exist_ok=True)
         self.token = secrets.token_urlsafe(32)
         self.lock = threading.RLock()
         self.scans = {}; self.jobs = {}; self.cancel_events = {}; self.threads = {}
@@ -339,18 +340,24 @@ class App:
             output_base = Path(body.get('output') or self.default_output).expanduser().resolve()
             if within(output_base, source) or within(source, output_base):
                 raise ValueError('保存目录与原图目录不能互相包含，请选择独立的结果目录。')
+            if within(output_base, self.runs) or within(self.runs, output_base):
+                raise ValueError('导出文件夹需与工具运行记录分开，请选择其他文件夹。')
+            if within(source, self.runs) or within(self.runs, source):
+                raise ValueError('原图文件夹需与工具运行记录分开，请选择具体的原图文件夹。')
             output_base.mkdir(parents=True, exist_ok=True)
             if shutil.disk_usage(output_base).free < max(2*1024**3, len(names)*160*1024**2):
                 raise ValueError('保存目录空间不足，请至少预留 2 GB，较大批次每台预留 160 MB。')
+            if shutil.disk_usage(self.runs).free < max(2*1024**3, len(names)*160*1024**2):
+                raise ValueError('工具运行记录所在磁盘空间不足，请至少预留 2 GB。')
             sample = host_sample()
             reason = guard_reason(sample, sample)
             if reason:
                 raise ValueError(reason.replace('已停止本批处理', '暂不能开始'))
             stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+secrets.token_hex(3)
-            root = output_base/stamp; root.mkdir()
+            root = self.runs/stamp; root.mkdir()
             job = dict(id=stamp, status='starting', created=time.time(), source=str(source), single=scan['single'],
                        names=names, model=model, concurrency=min(jobs, len(names)), requested_concurrency=jobs,
-                       root=str(root), output=str(root/'六面图片'), work=str(root/'过程'),
+                       root=str(root), output=str(output_base/stamp), output_base=str(output_base), work=str(root/'过程'),
                        message='准备处理', elapsed=0, host=sample)
             self.jobs[stamp] = job; self.cancel_events[stamp] = threading.Event()
             self.update(job)
@@ -417,6 +424,8 @@ class App:
     def snapshot(self, job):
         with self.lock:
             result = dict(job)
+        # Older batches keep their original on-disk layout and retry destination.
+        result.setdefault('output_base', str(Path(job['root']).parent))
         rows = []; units = 0
         for name in result['names']:
             case = Path(result['work'])/'cases'/name

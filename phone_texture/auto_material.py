@@ -398,7 +398,48 @@ def digest_image_array(a):
     return hashlib.sha256(a.tobytes()).hexdigest()
 
 
-def propose_job(source,face,folder,companions=None):
+
+def rear_body_contour(image):
+    """Illumination coordinates follow the body, never the protruding buttons.
+
+    A quantile quadratic estimates each exposed long edge from the current
+    alpha, rejecting outward hardware. This is only a coordinate mask: the
+    saved image silhouette and editable button pixels are never cropped.
+    """
+    from scipy.optimize import linprog
+    a=np.array(image.convert('RGBA'));h,w=a.shape[:2];inside=a[...,3]>=128
+    rows=np.arange(int(h*.12),int(h*.88),max(1,h//500))
+    if len(rows)<60 or not inside[rows].any(axis=1).all():
+        raise ValueError('Rear body lacks continuous source edges')
+    t=rows/h*2-1;X=np.column_stack([t*t,t,np.ones(len(t))]);n=len(rows)
+    edges=[np.argmax(inside,axis=1),w-1-np.argmax(inside[:,::-1],axis=1)]
+    virtual=inside.copy();proof=dict(method='source_body_quantile_contour_v1',sides={})
+    yy=np.arange(h);xx=np.arange(w)[None,:]
+    ramp=np.clip(np.minimum(yy-h*.12,h*.88-yy)/(h*.025),0,1);ramp=ramp*ramp*(3-2*ramp)
+    for side,edge,q,sign in zip(('left','right'),edges,(.75,.25),(-1,1)):
+        result=linprog(np.r_[np.zeros(3),np.full(n,q),np.full(n,1-q)],
+            A_eq=np.column_stack([X,np.eye(n),-np.eye(n)]),b_eq=edge[rows],
+            bounds=[(None,None)]*3+[(0,None)]*(2*n),method='highs')
+        if not result.success:raise ValueError('Rear body contour fit failed')
+        coefficients=result.x[:3];curve=np.polyval(coefficients,yy/h*2-1)
+        residual=np.abs(edge[rows]-curve[rows]);support=float(np.mean(residual<=1.5))
+        if support<.55 or np.max(np.abs(edge[rows]-curve[rows]))>w*.025:
+            raise ValueError('Rear body contour lacks independent source support')
+        blended=edge+(curve-edge)*ramp
+        strip=xx<w*.1 if side=='left' else xx>w*.9
+        replacement=xx>=blended[:,None] if side=='left' else xx<=blended[:,None]
+        virtual=np.where(strip&((ramp>0)[:,None]),replacement,virtual)
+        protrusion=(sign*(edge-curve)>2)&(ramp>.99)
+        protrusion=ndimage.binary_closing(protrusion,iterations=3)
+        components,count=ndimage.label(protrusion);ranges=[]
+        for label in range(1,count+1):
+            found=np.flatnonzero(components==label)
+            if len(found)>=max(10,h*.012):ranges.append([int(found[0]),int(found[-1])+1])
+        proof['sides'][side]=dict(coefficients=coefficients.tolist(),source_support=support,protrusion_rows=ranges)
+    if np.any(virtual.sum(axis=1)[rows]<w*.75):raise ValueError('Rear body contour width is inconsistent')
+    return virtual,proof
+
+def propose_job(source,face,folder,companions=None,landmarks=None):
     """Create fresh material masks/reference boxes for one geometry candidate."""
     from .auto_structure import antenna_rows,per_column_boundaries,hardware_ranges
     image=Image.open(source).convert('RGBA');a=np.array(image);h,w=a.shape[:2]
@@ -411,8 +452,16 @@ def propose_job(source,face,folder,companions=None):
     if face=='front':
         remaining,rim=front_metal(image);remaining &= ~paper;proof['front_rim']=rim
     if face in ('left','right'):
-        rows,signs,antenna_proof=antenna_rows(image,[int(w*.4),int(w*.6)])
-        lines=per_column_boundaries(image,rows);yy=np.arange(h)[:,None]
+        if landmarks is not None:
+            cfg=landmarks[face]
+            if cfg['source_sha256']!=digest(source):raise ValueError('Material landmarks belong to another source')
+            lines=np.asarray(cfg['source_lines'])[cfg['antenna_indices']]
+            rows=np.median(lines[:,int(w*.4):int(w*.6)],axis=1)
+            antenna_proof=dict(cfg['source_detection'],shared_geometry_landmarks=True)
+        else:
+            rows,signs,antenna_proof=antenna_rows(image,[int(w*.4),int(w*.6)])
+            lines=per_column_boundaries(image,rows)
+        yy=np.arange(h)[:,None]
         for i in range(2):
             region=(yy>=lines[2*i])&(yy<lines[2*i+1])&remaining
             materials.append(('antenna_'+str(i),region,[max(6,(rows[2*i+1]-rows[2*i])*.30),max(8,w*.20)]))
@@ -436,6 +485,8 @@ def propose_job(source,face,folder,companions=None):
             if .025*w<bw<.35*w and .025*w<bh<.35*w and .5<bw/max(1,bh)<2 and area>40:
                 glass|=ndimage.binary_fill_holes(labels==i)
         remaining &= ~glass;proof['camera_glass_pixels']=int(glass.sum())
+        body_contour,body_proof=rear_body_contour(image)
+        body_path=save_mask(folder/'body-contour.png',body_contour);proof['rear_body_contour']=body_proof
         distance=ndimage.distance_transform_edt(np.pad(a[...,3]>=128,1))[1:-1,1:-1];rim=remaining&(distance<=max(8,w*.035))
         # Rear plastic antenna bars must never enter the aluminum illumination
         # field. Locate them before lighting from this same fresh SKU's side
@@ -449,7 +500,11 @@ def propose_job(source,face,folder,companions=None):
             side_image=Image.open(companions[side]).convert('RGBA');sw=side_image.width
             rows,_,_=antenna_rows(side_image,[int(sw*.4),int(sw*.6)]);body=body_rows(side_image)
             expected=float(np.mean([rows[1]-rows[0],rows[3]-rows[2]])*(back_body[1]-back_body[0])/(body[1]-body[0]))
-            br,_,xr,brproof=rear_reference(image,side,right if side=='left' else left,expected)
+            if landmarks is not None:
+                ref=landmarks[side]['back']
+                if ref['sha256']!=digest(source):raise ValueError('Rear material landmarks belong to another source')
+                br,xr,brproof=ref['antenna_rows'],ref['x_range'],dict(ref['source_detection'],shared_geometry_landmarks=True)
+            else:br,_,xr,brproof=rear_reference(image,side,right if side=='left' else left,expected)
             side_columns=(xx>w/2) if side=='left' else (xx<w/2)
             for i in range(2):
                 region=rim&side_columns&(yy>=br[2*i])&(yy<br[2*i+1])
@@ -473,7 +528,7 @@ def propose_job(source,face,folder,companions=None):
             strength=[.72,0,0],feather=0,correction_smooth=1.5))
         if name=='rear_perimeter' or (face=='front' and name=='main_surface'):
             domains[-1].update(field='contour',sigma=[max(18,h*.012),max(5,w*.006)])
-        if name=='rear_perimeter':domains[-1].update(reference_profile='contour_depth')
+        if name=='rear_perimeter':domains[-1].update(reference_profile='contour_depth_lift',strength=[.92,0,0],max_lab_shift=[48,0,0],contour_alpha_mask=body_path,source_body_contour=body_proof)
         if face=='front':
             reliable=region&(a[...,3]>=240)
             shoulder=float(ndimage.distance_transform_edt(~reliable)[region&(a[...,3]>=128)].max())
@@ -486,6 +541,9 @@ def propose_job(source,face,folder,companions=None):
     view=dict(name=face,source=str(Path(source).resolve()),source_sha256=digest(source),
         protection_policy='sticker_only',sticker_mask=paper_path,protected_mask=paper_path,
         required_editable_mask=required,reference_boxes=domains[0]['reference_boxes'],domains=domains)
+    if face=='back':
+        view['correction_blends']=[dict(domains=['rear_perimeter','camera_surround','main_surface'],
+            boundary_domain='rear_perimeter',sigma=max(3.,w*.008))]
     job=dict(color_mode='source_lightness',defaults=dict(max_lab_shift=[35,0,0],feather=0),views=[view])
     proof.update(materials=[dict(name=d['name'],reference_boxes=d['reference_boxes'],mask=d['mask']) for d in domains],source_sha256=digest(source),source=str(source))
     return job,proof,allowed,paper
@@ -523,7 +581,20 @@ def lighting_scope(source,face,job,folder):
         rr=np.zeros((h,w),bool);rr[max(0,cy-5):min(h,cy+6),max(0,cx-5):min(w,cx+6)]=True;rr &= candidates
         if rr.sum()<20:raise ValueError('Too few independent source effect pixels')
         if normal_target is not None:minimum=float(np.median(normal_target[rr]))
-        source_L=float(np.median(lightness(a[...,:3])[rr]))
+        source_values=lightness(a[...,:3])[rr]
+        source_L=float(np.median(source_values))
+        if face=='back' and domains['rear_perimeter'].get('reference_profile')=='contour_depth_lift':
+            # Freeze an actual shadow-reduction requirement, not just a wide
+            # corruption guard that accepts the original dark border.
+            source_dark=float(np.percentile(source_values,10))
+            path=save_mask(folder/(name+'.png'),rr)
+            spec['local_checks']['rear_shadow_'+name]=dict(mask=path,percentile=10,
+                min_L=source_dark+.50*max(0.,minimum-source_dark),max_L=min(100.,max(minimum,source_L)+20.),
+                source_before_L=source_dark,source_reference_L=minimum,
+                bounds_basis='Recover at least half the source shadow deficit to same-face metal reference')
+            return dict(mask=path,min_L=max(.01,source_L+.55*max(0.,minimum-source_L)),
+                max_L=min(100.,max(minimum,source_L)+20.),source_before_L=source_L,source_reference_L=minimum,
+                bounds_basis='Recover at least 55% of source median shadow deficit; preserve source detail')
         # A source-relative damage guard cannot label real dark wear or a
         # polished facet defective merely for differing from a global target.
         # Both measured source and source-profile reference are frozen before
@@ -541,6 +612,19 @@ def lighting_scope(source,face,job,folder):
             'top_left':(x0+6,y0+6),'top_right':(x1-6,y0+6),
             'bottom_left':(x0+6,y1-6),'bottom_right':(x1-6,y1-6)}
         for zone in ZONES:spec['zones'][zone]=point_witness(metal,*points[zone],zone,target(name))
+    if face=='back' and domains['rear_perimeter'].get('source_body_contour'):
+        metal=domain_mask('rear_perimeter');opaque=metal&(a[...,3]>=240)
+        for side,entry in domains['rear_perimeter']['source_body_contour']['sides'].items():
+            for index,(lo,hi) in enumerate(entry['protrusion_rows']):
+                witness=opaque.copy();padding=max(20,int(h*.015))
+                witness[:max(0,lo-padding)]=False;witness[min(h,hi+padding):]=False
+                if side=='left':witness[:,w//2:]=False
+                else:witness[:,:w//2]=False
+                key=f'rear_button_{side}_{index}'
+                if witness.sum()<20:raise ValueError('Rear button lacks independent source material samples')
+                spec['local_checks'][key]=dict(mask=save_mask(folder/(key+'.png'),witness),
+                    min_L=0,max_L=100,percentile=10,max_added_step_L=1.25,step_axis=0,
+                    bounds_basis='Continuous added illumination around source-detected protrusion; no button protection')
     if face=='back':
         # Independent witnesses across the old artificial split, excluding
         # actual material boundaries, paper and lens openings. Erosion limits
@@ -559,6 +643,18 @@ def lighting_scope(source,face,job,folder):
             spec['local_checks'][name]=dict(mask=save_mask(folder/(name+'.png'),witness),
                 min_L=0,max_L=100,percentile=10,max_added_step_L=1.25,step_axis=0,
                 bounds_basis='Added lightness step across same-source-material pixels; real texture subtracted')
+    if face=='back' and view.get('correction_blends'):
+        metal=domain_mask('rear_perimeter')&(a[...,3]>=240)
+        peers=(domain_mask('camera_surround')|domain_mask('main_surface'))&(a[...,3]>=240)
+        edge=metal&ndimage.binary_dilation(peers)
+        yy,xx=np.indices((h,w))
+        nearest=np.argmin(np.stack([xx,w-1-xx,yy,h-1-yy]),axis=0)
+        peer_path=save_mask(folder/'rear-transition-peers.png',peers)
+        for side,index in [('left',0),('right',1),('top',2),('bottom',3)]:
+            key='rear_inner_boundary_'+side
+            spec['local_checks'][key]=dict(mask=save_mask(folder/(key+'.png'),edge&(nearest==index)),
+                boundary_peer_mask=peer_path,min_L=0,max_L=100,percentile=10,max_boundary_step_L=2.,
+                bounds_basis='99th percentile of added L step across source-defined metal-domain interfaces; both axes, peak <= 3 L')
     if face in ('left','right'):
         for name in ('antenna_0','antenna_1'):
             material=domain_mask(name);yy,xx=np.nonzero(material&(a[...,3]>=240));middle=float(np.median(yy))

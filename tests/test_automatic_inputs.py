@@ -213,3 +213,74 @@ def test_rear_panel_rejects_source_without_supported_material_seams():
     from phone_texture.auto_material import rear_panel
     with pytest.raises(ValueError,match='Rear panel'):
         rear_panel(Image.new('RGBA',(600,1200),(180,110,65,255)))
+
+
+def test_rear_body_coordinates_ignore_buttons_without_cropping_source():
+    from phone_texture.auto_material import rear_body_contour
+    image=Image.new('RGBA',(400,820),(190,110,60,0))
+    draw=ImageDraw.Draw(image)
+    draw.rounded_rectangle((20,5,379,814),radius=30,fill=(190,110,60,255))
+    draw.rectangle((14,260,20,390),fill=(150,85,45,255))
+    draw.rectangle((379,180,385,240),fill=(150,85,45,255))
+    draw.rectangle((379,280,385,360),fill=(150,85,45,255))
+    before=np.array(image);body,proof=rear_body_contour(image)
+    assert not body[300,15] and not body[200,384]
+    assert body[300,21] and body[200,378]
+    assert np.array_equal(before,np.array(image))
+    assert proof['sides']['left']['protrusion_rows']
+    assert len(proof['sides']['right']['protrusion_rows'])==2
+
+
+def test_visible_canvas_removes_soft_fringe_without_eroding_body_or_paper():
+    from phone_texture.auto_geometry import trim_visible_canvas
+    im=Image.new('RGBA',(90,160),(190,110,60,0));d=ImageDraw.Draw(im)
+    d.rounded_rectangle((5,4,85,155),radius=12,fill=(190,110,60,3))
+    d.rounded_rectangle((12,14,77,140),radius=16,fill=(190,110,60,255))
+    d.rectangle((40,136,47,151),fill=(230,230,230,70))
+    paper=np.zeros((160,90),bool);paper[136:152,40:48]=True
+    before=np.array(im);out,proof=trim_visible_canvas(im,paper);box=proof['crop_xyxy']
+    assert box==[11,13,79,153]
+    assert np.array_equal(np.array(out),before[13:153,11:79])
+    assert proof['body_pixels_lost']==proof['paper_pixels_lost']==0
+    again,p=trim_visible_canvas(out,paper[13:153,11:79])
+    assert p['removed_margins_ltrb']==[0,0,0,0]
+    assert np.array_equal(np.array(again),np.array(out))
+
+
+def test_antenna_columns_follow_material_polarity_not_opposite_glint():
+    a=np.full((500,80,4),255,np.uint8);a[...,:3]=130
+    a[42:50,:,:3]=70;a[450:458,:,:3]=70
+    # The brighter rising edge is close to the upper dark antenna transition.
+    a[35:42,55:,:3]=250
+    rows,_,_=antenna_rows(Image.fromarray(a),[30,45])
+    lines=per_column_boundaries(Image.fromarray(a),rows)
+    assert np.max(np.abs(lines[0,60:]-41.5))<1.5
+    assert np.max(np.abs(lines[1,60:]-49.5))<1.5
+
+
+def test_independent_lower_plane_requires_both_sides_and_raw_rgb_support():
+    from phone_texture.auto_geometry import exposed_lower_plane
+    from scipy import ndimage
+    h,w=420,400;y,x=np.mgrid[:h,:w];bottom=330+.025*x
+    body=(x>=50)&(x<350)&(y>=60)&(y<bottom)
+    stand=(x>=170)&(x<230)&(y>=320)
+    mask=body|stand
+    raw=np.where(mask[...,None],np.array([90,100,110]),np.array([220,220,220])).astype(float)
+    gradient=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw,.8,axis=0),axis=0),axis=2)
+    _,alpha,rgb,_,_,proof=exposed_lower_plane(mask,gradient,50,350,330)
+    assert np.max(abs(np.polyval(rgb,[90,310])-(330+.025*np.array([90,310]))))<2
+    assert min(proof['half_support_fractions'])>=.6
+    assert proof['rgb_alpha_disagreement_px']<=3
+    gradient[:,200:]=0
+    with pytest.raises(ValueError,match='two-sided'):exposed_lower_plane(mask,gradient,50,350,330)
+
+
+def test_rear_can_reject_bad_side_width_only_with_independent_consensus():
+    from phone_texture.auto_structure import rear_reference
+    a=np.full((500,400,4),255,np.uint8);a[...,:3]=170
+    a[42:54,:,:3]=65;a[450:462,:,:3]=65
+    rows,_,_,proof=rear_reference(Image.fromarray(a),'left',399,5.)
+    assert np.max(abs(np.array(rows)-[41.5,53.5,449.5,461.5]))<1
+    assert proof['width_prior_rejected']==5 and proof['agreeing_columns']>=3
+    a[400:,:,:3]=170
+    with pytest.raises(ValueError):rear_reference(Image.fromarray(a),'left',399,5.)
