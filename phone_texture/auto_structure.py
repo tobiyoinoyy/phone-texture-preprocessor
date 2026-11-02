@@ -125,14 +125,15 @@ def hardware_ranges(image):
     return merged,boxes
 
 
-def per_column_boundaries(image,rows):
+def _retained_upper_boundaries(image,rows):
+    rows=np.rint(rows).astype(int)
     a=np.array(image.convert('RGBA'));h,w=a.shape[:2]
     colors=gaussian_filter1d(a[...,:3].astype(float).mean(axis=2),1.,axis=0)
     gradient=np.gradient(colors,axis=0)
     center_gradient=np.gradient(gaussian_filter1d(gray_signal(a,[int(w*.4),int(w*.6)]),1.))
     lines=[]
     band_widths=[rows[1]-rows[0]]*2+[rows[3]-rows[2]]*2
-    for i,(row,width) in enumerate(zip(rows,band_widths)):
+    for i,(row,width) in enumerate(zip(rows[:2],band_widths[:2])):
         radius=max(7,int(np.ceil(width*.6)))
         lo=max(1,row-radius);hi=min(h-1,row+radius+1)
         if i:lo=max(lo,int(np.ceil((rows[i-1]+row)/2)))
@@ -151,6 +152,18 @@ def per_column_boundaries(image,rows):
     result=np.array(lines)
     if np.any(np.diff(result,axis=0)<=0):raise ValueError('Per-column antenna boundaries cross')
     return result
+
+
+def per_column_boundaries(image,rows,return_proof=False):
+    # This repair is intentionally scoped to the user-marked lower antenna.
+    # Retain the accepted upper algorithm/mapping instead of silently changing
+    # it while fixing a lower-band material classification problem.
+    from .antenna_material import trace_boundaries
+    lower,proof=trace_boundaries(image,rows,bands=(1,))
+    result=np.vstack([_retained_upper_boundaries(image,rows),lower])
+    if np.any(np.diff(result,axis=0)<=0):raise ValueError('Per-column antenna boundaries cross')
+    proof=dict(proof,revision_bands=[1],upper_algorithm_retained=True)
+    return (result,proof) if return_proof else result
 
 
 def bind_lighting_sources(proposal, geometry, lighting):
@@ -196,7 +209,7 @@ def propose(files, coordinate_mode='body_endpoints'):
         middle_lo=min(r[0] for r in buttons)-3;middle_hi=max(r[1] for r in buttons)+3
         if middle_lo<=max(rows[1],desired[1])+4 or middle_hi>=min(rows[2],desired[2])-4:
             raise ValueError('Independent hardware contours overlap an antenna remapping zone')
-        measured_lines=per_column_boundaries(image,rows)
+        measured_lines,boundary_proof=per_column_boundaries(image,rows,return_proof=True)
         anchors=np.vstack([measured_lines[0:2],np.full(sw,middle_lo),np.full(sw,middle_hi),measured_lines[2:4]])
         antenna_indices=[0,1,4,5];outline_ranges=[]
         if coordinate_mode=='canvas_pixel_centers':
@@ -214,7 +227,7 @@ def propose(files, coordinate_mode='body_endpoints'):
         cfg=dict(source_sha256=digest(files[side]),basis='back_image',body_y=body,coordinate_mode=coordinate_mode,
             source_lines=anchors.tolist(),antenna_indices=antenna_indices,button_ranges=buttons,outline_ranges=outline_ranges,
             button_basis='Independent source Canny hardware contours; complete bounding ranges expanded five pixels',
-            hardware_boxes=boxes,source_detection=proof,
+            hardware_boxes=boxes,source_detection=proof,source_boundary_detection=boundary_proof,
             back=dict(face='back',sha256=digest(files['back']),body_y=back_body,
                 antenna_rows=br,x_range=back_x,search_windows=windows(br,h),signs=bs,
                 physical_side=side,edge_in_back_image='right' if side=='left' else 'left',

@@ -568,3 +568,126 @@ def test_internal_transition_limits_gamut_without_pixelwise_bright_speckles():
     assert np.max(np.abs(delta[:,50]-delta[:,49]))<1
     assert np.array_equal(limited[...,1:],source[...,1:])
     assert proof['gamut_continuity_pixels']>0
+
+
+def test_gamut_continuity_inside_material_far_from_blended_seam():
+    yy,xx=np.indices((100,160))
+    source=np.zeros((100,160,3));source[:]=[65,25,35]
+    source[50,75:145]=[78,25,35]
+    # Use representable source pixels and assess the final quantized RGB, as
+    # the publication check does. This highlight is >3 sigma from the seam.
+    source=MODULE.rgb_to_lab(MODULE.lab_to_rgb(source))
+    masks={'rim':xx<20,'panel':xx>=20}
+    shift=np.zeros_like(source);shift[...,0]=10
+    blended,_=MODULE.blend_correction_boundary(shift,masks,
+        dict(domains=['rim','panel'],boundary_domain='rim',sigma=4),source)
+    desired=source+blended
+    safe,_=MODULE.preserve_chroma_in_gamut(desired,source)
+    result,proof=MODULE.continuous_gamut_limits(desired,safe,source,masks['panel'],.6)
+    def peak_line_p75(lab):
+        delta=MODULE.rgb_to_lab(MODULE.lab_to_rgb(lab))[...,0]-source[...,0]
+        return np.percentile(np.abs(np.diff(delta[:,90:130],axis=0)),75,axis=1).max()
+    assert peak_line_p75(safe)>1.25  # Old boundary-only fix misses this case.
+    assert peak_line_p75(result)<=1.25
+    assert proof['gamut_seed_pixels']>0 and proof['adjusted_pixels']>0
+    np.testing.assert_array_equal(result[masks['rim']],safe[masks['rim']])
+    np.testing.assert_array_equal(result[...,1:],source[...,1:])
+
+
+def test_gamut_caps_only_reduce_each_sign_and_respect_material_barriers():
+    source=np.zeros((11,31,3));source[:]=[50,10,15]
+    mask=np.ones((11,31),bool);mask[:,15]=False  # Paper/material gap.
+    for sign in (1.,-1.):
+        desired=source.copy();desired[...,0]+=sign*12
+        desired[:,8,0]=source[:,8,0]-sign*5  # Opposite correction blocks paths.
+        safe=desired.copy();safe[5,14,0]=source[5,14,0]+sign*2
+        result,proof=MODULE.continuous_gamut_limits(desired,safe,source,mask,.6)
+        old_delta=safe[...,0]-source[...,0];new_delta=result[...,0]-source[...,0]
+        assert np.all(np.abs(new_delta)<=np.abs(old_delta)+1e-12)
+        assert np.all(new_delta*old_delta>=0)
+        assert proof['adjusted_pixels']>0
+        np.testing.assert_array_equal(result[:,:9],safe[:,:9])
+        np.testing.assert_array_equal(result[:,15:],safe[:,15:])
+        np.testing.assert_array_equal(result[...,1:],source[...,1:])
+    # Diagonally touching islands must not bypass a one-pixel material gap.
+    source=source[:2,:2].copy();desired=source.copy();desired[...,0]+=12
+    safe=desired.copy();safe[0,0,0]=source[0,0,0]+2
+    result,_=MODULE.continuous_gamut_limits(desired,safe,source,np.eye(2,dtype=bool),.6)
+    np.testing.assert_array_equal(result,safe)
+
+
+def test_gamut_continuity_leaves_unclipped_steep_field_exactly_unchanged():
+    yy,xx=np.indices((12,18));source=np.zeros((12,18,3));source[:]=[50,0,0]
+    desired=source.copy();desired[...,0]+=np.where((xx+yy)%2,12.,-12.)
+    safe,count=MODULE.preserve_chroma_in_gamut(desired,source)
+    assert count==0
+    result,proof=MODULE.continuous_gamut_limits(desired,safe,source,np.ones((12,18),bool),.6)
+    np.testing.assert_array_equal(result,safe)
+    assert proof['gamut_seed_pixels']==0 and proof['adjusted_pixels']==0
+
+
+def test_mixed_alpha_gamut_cap_cannot_dim_opaque_body():
+    import pytest
+    source=np.zeros((11,41,3));source[:]=[50,0,0]
+    desired=source.copy();desired[...,0]+=12
+    safe=desired.copy();safe[:,0,0]=source[:,0,0]
+    allowed=np.ones(source.shape[:2],bool)
+    opaque=allowed.copy();opaque[:,0]=False
+    old,_=MODULE.continuous_gamut_limits(desired,safe,source,allowed,.6)
+    result,proof=MODULE.continuous_gamut_limits(desired,safe,source,allowed,.6,opaque)
+    assert np.max(np.abs(old-safe))>10
+    np.testing.assert_array_equal(result,safe)
+    # A real interior highlight still constrains the same material. The
+    # unreliable edge is neither frozen nor allowed to seed a new cloud band.
+    safe[5,20,0]=source[5,20,0]+2
+    result,proof=MODULE.continuous_gamut_limits(desired,safe,source,allowed,.6,opaque)
+    assert proof['gamut_seed_pixels']==1 and proof['adjusted_pixels']>0
+    assert np.all(np.abs(result[...,0]-source[...,0])<=np.abs(safe[...,0]-source[...,0]))
+    np.testing.assert_array_equal(result[:,0],safe[:,0])
+    np.testing.assert_array_equal(result[...,1:],source[...,1:])
+    with pytest.raises(ValueError,match='Gamut seed mask dimensions'):
+        MODULE.continuous_gamut_limits(desired,safe,source,allowed,.6,np.ones((2,2),bool))
+
+
+def test_process_view_gamut_continuity_preserves_paper_other_material_and_texture(tmp_path):
+    h,w=100,160;yy,xx=np.indices((h,w))
+    lab=np.zeros((h,w,3));lab[:]=[65,25,35];lab[50,75:145]=[78,25,35]
+    alpha=np.full((h,w),255,np.uint8);alpha[:,:2]=0;alpha[:,-2:]=0
+    alpha[:,2]=128;alpha[:,-3]=128
+    source=np.dstack([MODULE.lab_to_rgb(lab),alpha])
+    paper=(yy>=44)&(yy<57)&(xx>=60)&(xx<68)
+    source[paper,:3]=[225,222,218]
+    path=tmp_path/'source.png';Image.fromarray(source).save(path);before_hash=sha256(path)
+    paper_path=tmp_path/'paper.png';Image.fromarray(paper.astype('uint8')*255).save(paper_path)
+    domains=[]
+    for name,mask in [('rim',(xx<18)&(alpha>0)),('panel',(xx>=18)&(alpha>0))]:
+        mask_path=tmp_path/(name+'.png');Image.fromarray(mask.astype('uint8')*255).save(mask_path)
+        domains.append(dict(name=name,mask=str(mask_path),sigma=[8,8],
+            strength=[1,0,0],feather=0,correction_smooth=1.5))
+    item=dict(source=str(path),source_sha256=before_hash,domains=domains,protection_policy='sticker_only',
+        sticker_mask=str(paper_path),protected_mask=str(paper_path))
+    target=np.array([75,25,35]);defaults=dict(color_mode='source_lightness',max_lab_shift=[35,0,0])
+    old,old_allowed,_,_=MODULE.process_view(item,target,defaults)
+    item=dict(item,domains=[domains[0],dict(domains[1],gamut_continuity_step_L=.6)])
+    result,allowed,protected,report=MODULE.process_view(item,target,defaults)
+    output=tmp_path/'output.png';Image.fromarray(result).save(output)
+    result=np.array(Image.open(output).convert('RGBA'))
+    source_lab=MODULE.rgb_to_lab(source[...,:3]);result_lab=MODULE.rgb_to_lab(result[...,:3])
+    def peak_line_p75(pixels):
+        delta=MODULE.rgb_to_lab(pixels[...,:3])[...,0]-source_lab[...,0]
+        return np.percentile(np.abs(np.diff(delta[:,90:130],axis=0)),75,axis=1).max()
+    assert peak_line_p75(old)>1.25
+    assert peak_line_p75(result)<=1.25
+    # The real high-L source stripe survives: only the additive correction
+    # was made continuous; output/source texture were never blurred together.
+    assert np.median(result_lab[50,90:130,0]-result_lab[49,90:130,0])>10
+    assert np.max(np.abs(result_lab[allowed,1:]-source_lab[allowed,1:]))<.8
+    np.testing.assert_array_equal(result[...,3],source[...,3])
+    np.testing.assert_array_equal(result[paper],source[paper])
+    np.testing.assert_array_equal(result[~allowed],source[~allowed])
+    np.testing.assert_array_equal(result[xx<18],old[xx<18])
+    np.testing.assert_array_equal(allowed,old_allowed)
+    np.testing.assert_array_equal(protected,paper)
+    assert sha256(path)==before_hash
+    assert report['gamut_continuity'][0]['name']=='panel'
+    assert report['gamut_continuity'][0]['adjusted_pixels']>0

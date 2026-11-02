@@ -13,6 +13,7 @@ import multiprocessing
 import os
 import resource
 import shutil
+import sys
 import time
 import traceback
 
@@ -30,6 +31,17 @@ _INFERENCE_SLOTS=None
 def initialize_worker(inference_slots):
     global _INFERENCE_SLOTS
     _INFERENCE_SLOTS=inference_slots
+
+
+def peak_process_memory():
+    """Normalize the worker's lifetime high-water RSS, not a per-SKU/tree peak."""
+    raw = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    # getrusage(2): Linux reports KiB; Darwin reports bytes. Do not label
+    # an unverified platform's native value as bytes.
+    unit, scale = {'linux': ('KiB', 1024), 'darwin': ('bytes', 1)}.get(sys.platform, (None, None))
+    return dict(peak_process_rss_bytes=raw * scale if scale is not None else None,
+        peak_process_rss_measurement=dict(source='getrusage(RUSAGE_SELF).ru_maxrss',
+            raw_value=raw, raw_unit=unit, platform=sys.platform, scope='worker_process_lifetime'))
 
 
 def write(path,value):
@@ -179,8 +191,7 @@ def process_one(task):
             final_sha256={f:w.sha(p) for f,p in final[sku].items()},source_hashes_unchanged=True)
     except Exception as exc:
         result.update(status='failed',six_faces_processed=False,error=str(exc),traceback=traceback.format_exc())
-    result.update(seconds=time.perf_counter()-started,events=events,
-        peak_process_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    result.update(seconds=time.perf_counter()-started,events=events,**peak_process_memory())
     write(case/'result.json',result)
     progress('complete' if result.get('six_faces_processed') else 'failed',completed=15 if result.get('six_faces_processed') else 0)
     return result

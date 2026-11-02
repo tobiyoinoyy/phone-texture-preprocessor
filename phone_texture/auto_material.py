@@ -11,6 +11,8 @@ from PIL import Image
 from pathlib import Path
 from .geometry_review import digest
 
+REAR_GAMUT_CONTINUITY_STEP_L = .6
+
 
 def red_markers(a):
     h,w=a.shape[:2];hsv=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2HSV)
@@ -448,7 +450,7 @@ def propose_job(source,face,folder,companions=None,landmarks=None):
     if face in ('back','bottom') and not paper.any():
         raise ValueError('This QC studio profile requires a resolved printed paper label on back/bottom')
     paper &= visible;paper_path=save_mask(folder/'paper.png',paper)
-    remaining=visible&~paper;materials=[];proof={'paper':paper_proof}
+    remaining=visible&~paper;materials=[];proof={'paper':paper_proof};fit_masks={}
     if face=='front':
         remaining,rim=front_metal(image);remaining &= ~paper;proof['front_rim']=rim
     if face in ('left','right'):
@@ -457,23 +459,40 @@ def propose_job(source,face,folder,companions=None,landmarks=None):
             if cfg['source_sha256']!=digest(source):raise ValueError('Material landmarks belong to another source')
             lines=np.asarray(cfg['source_lines'])[cfg['antenna_indices']]
             rows=np.median(lines[:,int(w*.4):int(w*.6)],axis=1)
-            antenna_proof=dict(cfg['source_detection'],shared_geometry_landmarks=True)
+            # Revalidate with independently detected source seeds. Feeding the
+            # already-smoothed curves back as new seeds can select a neighboring
+            # peak and falsely reject this detector's own frozen proposal.
+            source_rows,_,_=antenna_rows(image,[int(w*.4),int(w*.6)])
+            supported,boundary_proof=per_column_boundaries(image,source_rows,return_proof=True)
+            if np.max(np.abs(lines-supported))>2.5:
+                raise ValueError('Frozen antenna boundaries disagree with paired source material edges; regenerate geometry landmarks')
+            antenna_proof=dict(cfg['source_detection'],shared_geometry_landmarks=True,boundary_detection=boundary_proof)
         else:
             rows,signs,antenna_proof=antenna_rows(image,[int(w*.4),int(w*.6)])
-            lines=per_column_boundaries(image,rows)
+            lines,boundary_proof=per_column_boundaries(image,rows,return_proof=True)
+            antenna_proof=dict(antenna_proof,boundary_detection=boundary_proof)
         yy=np.arange(h)[:,None]
         for i in range(2):
             region=(yy>=lines[2*i])&(yy<lines[2*i+1])&remaining
             materials.append(('antenna_'+str(i),region,[max(6,(rows[2*i+1]-rows[2*i])*.30),max(8,w*.20)]))
             remaining &= ~region
         buttons,boxes=hardware_ranges(image);proof.update(antenna=antenna_proof,hardware_boxes=boxes)
-        # Complete detected hardware has its own material/reference, including
-        # dark glass control surfaces. It is not a frozen pixel rectangle.
-        hw=np.zeros((h,w),bool)
-        for x0,y0,x1,y1 in boxes:
-            hw[y0:y1,x0:x1]=True
-        hw &= remaining
-        if hw.sum()>=30:materials.append(('hardware',hw,[max(6,h*.012),max(2,w*.08)]));remaining &= ~hw
+        # Structural locking boxes intentionally include weak edge fragments;
+        # they must never be used as material labels or independent color islands.
+        from .side_material import hardware_materials
+        components=hardware_materials(image,face);hw=np.zeros((h,w),bool)
+        proof['hardware_materials']=[]
+        for index,(region,component_proof) in enumerate(components):
+            if np.any(region&~remaining):raise ValueError('Hardware material crosses antenna/paper')
+            name=f'hardware_{index}';hw |= region
+            materials.append((name,region,[max(6,h*.012),max(2,w*.08)]))
+            # Fit each component from its own interior; a groove or a separate
+            # dark control cannot determine another button's illumination.
+            depth=ndimage.distance_transform_edt(region)
+            fit_masks[name]=region&(depth>max(3.,w*.045))
+            proof['hardware_materials'].append(dict(name=name,**component_proof))
+        remaining &= ~hw
+        fit_masks['main_surface']=remaining&~ndimage.binary_dilation(hw,iterations=max(2,int(w*.025)))
     if face=='back':
         # Camera glass/flash components are distinct from aluminum and do not
         # enter metal fitting. Shape + position are required, not darkness alone.
@@ -523,9 +542,20 @@ def propose_job(source,face,folder,companions=None,landmarks=None):
     domains=[];allowed=np.zeros((h,w),bool)
     for name,region,sigma in materials:
         if np.count_nonzero(region&(a[...,3]>=240))<20:raise ValueError('Material region has no reliable fit samples: '+name)
-        ref=reference_box(a,region);mp=save_mask(folder/(name+'.png'),region);allowed|=region
+        reference_region=fit_masks.get(name,region)
+        ref=reference_box(a,reference_region);mp=save_mask(folder/(name+'.png'),region);allowed|=region
         domains.append(dict(name=name,mask=mp,reference_boxes=[ref],sigma=sigma,
             strength=[.72,0,0],feather=0,correction_smooth=1.5))
+        if name in fit_masks:
+            domains[-1]['fit_mask']=save_mask(folder/(name+'-fit.png'),fit_masks[name])
+        if face in ('left','right') and (name=='main_surface' or name.startswith('hardware_')):
+            # Final gamut clipping can also introduce steps around bright side
+            # texture; propagate only actual gamut caps, never smooth source RGB.
+            domains[-1].update(gamut_continuity_step_L=.6,gamut_continuity_opaque_seeds=True)
+        if face=='back' and name in ('camera_surround','main_surface'):
+            # Saturated source highlights can make the final per-pixel gamut
+            # limiter discontinuous well away from a material-domain seam.
+            domains[-1]['gamut_continuity_step_L']=REAR_GAMUT_CONTINUITY_STEP_L
         if name=='rear_perimeter' or (face=='front' and name=='main_surface'):
             domains[-1].update(field='contour',sigma=[max(18,h*.012),max(5,w*.006)])
         if name=='rear_perimeter':domains[-1].update(reference_profile='contour_depth_lift',strength=[.92,0,0],max_lab_shift=[48,0,0],contour_alpha_mask=body_path,source_body_contour=body_proof)
@@ -544,6 +574,14 @@ def propose_job(source,face,folder,companions=None,landmarks=None):
     if face=='back':
         view['correction_blends']=[dict(domains=['rear_perimeter','camera_surround','main_surface'],
             boundary_domain='rear_perimeter',sigma=max(3.,w*.008))]
+    if face in ('left','right'):
+        # Source photo edges contain mixed-material sensor pixels. Blend only
+        # their additive fields, keeping both materials' independent targets
+        # and every original RGB detail; do not blur the resulting photograph.
+        view['correction_blends']=[dict(domains=[name,'main_surface'],
+            boundary_domain=name,sigma=1.25,kind='source_material_transition')
+            for name in ('antenna_1',)]
+        view['antenna_boundary_bands']=[1]
     job=dict(color_mode='source_lightness',defaults=dict(max_lab_shift=[35,0,0],feather=0),views=[view])
     proof.update(materials=[dict(name=d['name'],reference_boxes=d['reference_boxes'],mask=d['mask']) for d in domains],source_sha256=digest(source),source=str(source))
     return job,proof,allowed,paper
@@ -656,9 +694,68 @@ def lighting_scope(source,face,job,folder):
                 boundary_peer_mask=peer_path,min_L=0,max_L=100,percentile=10,max_boundary_step_L=2.,
                 bounds_basis='99th percentile of added L step across source-defined metal-domain interfaces; both axes, peak <= 3 L')
     if face in ('left','right'):
+        # True material transitions may change the added field rapidly. Check
+        # every pixel in the adjoining pure metal, excluding exactly the
+        # declared source transition support rather than a guessed wider box.
+        metal=domain_mask('main_surface')
+        for band in view.get('antenna_boundary_bands',[]):
+            name=f'antenna_{band}';material=domain_mask(name)
+            config=next(c for c in view['correction_blends'] if c['boundary_domain']==name)
+            seam=(material&ndimage.binary_dilation(metal))|(metal&ndimage.binary_dilation(material))
+            transition=ndimage.distance_transform_edt(~seam)<3*config['sigma']
+            transition_path=save_mask(folder/(name+'-source-transition.png'),transition&(material|metal))
+            yy=np.arange(h)[:,None];band_y=np.nonzero(material)[0]
+            for edge,columns in [('left',np.arange(w)<w*.22),('right',np.arange(w)>=w*.78)]:
+                witness=metal&(a[...,3]>=240)&~transition&columns[None,:]
+                witness &= (yy>=int(band_y.min())-18)&(yy<=int(band_y.max())+18)
+                key=name+'_'+edge+'_metal'
+                spec['local_checks'][key]=dict(mask=save_mask(folder/(key+'.png'),witness),
+                    min_L=0,max_L=100,max_added_step_L=1.25,max_pixel_added_step_L=1.25,
+                    step_axis=0,percentile=10,source_transition_mask=transition_path,
+                    bounds_basis='Paired source antenna endpoint pure metal; actual mixed-material field support excluded, every remaining pair checked')
         for name in ('antenna_0','antenna_1'):
             material=domain_mask(name);yy,xx=np.nonzero(material&(a[...,3]>=240));middle=float(np.median(yy))
             for end,x in [('left',w*.12),('right',w*.88)]:
                 key=name+'_'+end;spec['local_checks'][key]=point_witness(material,x,middle,key,target(name))
+        # Full components, including both caps and rails, must be checked in
+        # both directions. A clean surrounding strip cannot certify a button.
+        for name in domains:
+            if not name.startswith('hardware_'):continue
+            material=domain_mask(name)&(a[...,3]>=240)
+            path=save_mask(folder/(name+'-complete.png'),material)
+            for axis,direction in ((0,'length'),(1,'width')):
+                key=name+'_'+direction
+                spec['local_checks'][key]=dict(mask=path,min_L=0,max_L=100,
+                    percentile=10,max_added_step_L=1.25,max_pixel_added_step_L=1.25,step_axis=axis,
+                    bounds_basis='Complete source-supported hardware component; added L continuity with source texture subtracted')
+            fit=np.asarray(Image.open(domains[name]['fit_mask']).convert('L'))>0
+            fit &= material
+            source_median=float(np.median(lightness(a[...,:3])[fit]));reference=target(name)
+            spec['local_checks'][name+'_reference']=dict(mask=save_mask(folder/(name+'-reference.png'),fit),
+                percentile=50,min_L=max(0.,min(source_median,reference)-5.),
+                max_L=min(100.,max(source_median,reference)+5.),
+                source_before_L=source_median,source_reference_L=reference,
+                bounds_basis='Independent component interior source/reference envelope plus 5 L quantization/field tolerance; never a shared hardware target')
+        # Source-only witnesses for the old false hardware rectangles. Every
+        # component is checked separately; a whole-side median hides small blocks.
+        from .auto_structure import hardware_ranges
+        _,boxes=hardware_ranges(image)
+        fragments=np.zeros((h,w),bool)
+        for x0,y0,x1,y1 in boxes:fragments[y0:y1,x0:x1]=True
+        metal=domain_mask('main_surface')&(a[...,3]>=240)
+        fragments &= metal
+        labels,count=ndimage.label(fragments)
+        for label in range(1,count+1):
+            sample=labels==label
+            # Inspect each fragment's horizontal ends in the tangent direction.
+            # A steep but smooth normal correction across the narrow metal rim
+            # is legitimate and must not be confused with a rectangular jump.
+            sample=ndimage.binary_dilation(sample,structure=np.ones((5,7),bool))&metal
+            pairs=sample[1:]&sample[:-1]
+            if pairs.sum()<20 or not np.any(pairs.sum(axis=1)>=10):continue
+            key=f'side_metal_fragment_{label:02d}'
+            spec['local_checks'][key]=dict(mask=save_mask(folder/(key+'.png'),sample),
+                min_L=0,max_L=100,percentile=10,max_added_step_L=1.25,step_axis=0,
+                bounds_basis='Source edge fragment is ordinary metal; tangent added L step at each artificial rectangle end, source texture subtracted')
     validate_spec(spec,source)
     return spec

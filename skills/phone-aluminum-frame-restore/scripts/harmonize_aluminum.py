@@ -76,6 +76,53 @@ def color_mode(config):
     return mode
 
 
+def continuous_gamut_limits(desired, safe, source, mask, max_step, seed_mask=None):
+    """Propagate actual gamut caps through one material's correction field.
+
+    Only reduce L displacement toward the source. Source texture/chroma are
+    never filtered, and an unbounded field is returned exactly unchanged.
+    Paper, other materials and opposite-sign corrections block propagation.
+    """
+    from scipy.ndimage import minimum_filter
+    max_step = float(max_step)
+    if not np.isfinite(max_step) or max_step <= 0:
+        raise ValueError('Gamut continuity step must be finite and positive')
+    wanted = desired[..., 0] - source[..., 0]
+    bounded = safe[..., 0] - source[..., 0]
+    limited = mask & (np.abs(bounded) < np.abs(wanted) - 1e-6)
+    # Mixed/background-contaminated edge RGB still receives its own safe
+    # correction, but must not dim reliable body pixels through propagation.
+    if seed_mask is not None:
+        seed_mask = np.asarray(seed_mask, dtype=bool)
+        if seed_mask.shape != mask.shape:
+            raise ValueError('Gamut seed mask dimensions differ from source')
+        limited &= seed_mask
+    result = safe.copy()
+    changed = np.zeros(mask.shape, bool)
+    # Four-neighbor paths cannot jump diagonally across a material/label gap.
+    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
+    for sign in (1., -1.):
+        region = mask & (sign * wanted > 0)
+        seeds = region & limited
+        if not seeds.any():
+            continue
+        magnitude = np.maximum(0., sign * bounded)
+        cap = np.where(seeds, magnitude, np.inf)
+        # Beyond this radius even a zero cap cannot reduce the largest shift.
+        for _ in range(int(np.ceil(float(magnitude[region].max()) / max_step)) + 1):
+            updated = np.where(region, np.minimum(cap, minimum_filter(
+                cap, footprint=cross, mode='constant', cval=np.inf) + max_step), np.inf)
+            if np.array_equal(updated, cap):
+                break
+            cap = updated
+        affected = region & (cap < magnitude)
+        result[affected, 0] = source[affected, 0] + sign * cap[affected]
+        changed |= affected
+    return result, dict(max_step_L=max_step, gamut_seed_pixels=int(limited.sum()),
+                        adjusted_pixels=int(changed.sum()),
+                        method='same_material_gamut_cap_propagation')
+
+
 def gaussian(arr, sigma):
     """Float separable Gaussian; reflection padding avoids dark image borders."""
     out = np.asarray(arr, dtype=float)
@@ -270,13 +317,18 @@ def contour_depth_reference(lab, fit, alpha):
 
 
 def blend_correction_boundary(shift, masks, config, source_lab=None):
-    """Join illumination fields across a declared same-metal internal seam.
+    """Join additive fields at an internal seam or source material transition.
 
     Smooth only additive corrections, never RGB/texture. Outer alpha edges,
     paper, glass and other unlisted materials do not become transition targets.
     """
     from scipy.ndimage import binary_dilation, distance_transform_edt, gaussian_filter, minimum_filter
     names=config['domains'];anchor=config['boundary_domain'];sigma=float(config['sigma'])
+    kind=config.get('kind','same_material')
+    if kind not in ('same_material','source_material_transition'):
+        raise ValueError('Unknown correction boundary kind')
+    if kind=='source_material_transition' and (len(names)!=2 or sigma>2):
+        raise ValueError('Source material transition requires two domains and a narrow sensor-edge blend')
     if len(set(names))!=len(names) or anchor not in names or len(names)<2:
         raise ValueError('Correction blend requires distinct adjacent material domains')
     if not np.isfinite(sigma) or sigma<=0:
@@ -294,7 +346,7 @@ def blend_correction_boundary(shift, masks, config, source_lab=None):
                      for c in range(3)],axis=-1)
     result=shift+(smooth-shift)*weight[...,None]
     gamut_adjusted=0
-    if source_lab is not None:
+    if source_lab is not None and kind=='same_material':
         # Per-pixel gamut clipping can turn a smooth field into speckled steps
         # near saturated highlights. Propagate conservative L limits through
         # this same-metal field, not through source pixels or their texture.
@@ -319,7 +371,8 @@ def blend_correction_boundary(shift, masks, config, source_lab=None):
     return result,dict(domains=names,boundary_domain=anchor,sigma=sigma,
                        transition_pixels=int(np.count_nonzero(weight)),
                        gamut_continuity_pixels=gamut_adjusted,
-                       method='same_material_additive_field_only')
+                       method=('same_material_additive_field_only' if kind=='same_material'
+                               else 'source_material_transition_additive_field_only'))
 
 
 def process_view(item, target, defaults):
@@ -381,6 +434,11 @@ def process_view(item, target, defaults):
             raise ValueError('Material domains must not overlap')
         allowed_union |= allowed
         fit = material & ~exclude & (src[...,3] >= 240)
+        if domain.get('fit_mask'):
+            fit_region = np.array(Image.open(domain['fit_mask']).convert('L'))
+            if fit_region.shape != (h,w):
+                raise ValueError('Fit mask dimensions differ from source')
+            fit &= fit_region > 0
         if fit.sum() < 20:
             raise ValueError('Insufficient reviewed material samples')
         sigma = domain.get('sigma', defaults.get('sigma', [18,18]))
@@ -455,7 +513,7 @@ def process_view(item, target, defaults):
         out_lab=lab+shift;blends.append(proof)
     if np.any(required & ~allowed_union):
         raise ValueError('Required editable pixels missing from material domains or editable mask')
-    gamut_limited = 0
+    gamut_limited = 0; gamut_continuity = []
     if mode == 'source_lightness':
         threshold = np.asarray(defaults.get('lightness_deadband', [0, 0]), dtype=float)
         if (threshold.shape != (2,) or not np.isfinite(threshold).all()
@@ -466,7 +524,20 @@ def process_view(item, target, defaults):
             delta = out_lab[..., 0]-lab[..., 0]
             t = np.clip((np.abs(delta)-threshold[0])/(threshold[1]-threshold[0]), 0, 1)
             out_lab[..., 0] = lab[..., 0]+delta*t*t*(3-2*t)
-        out_lab, gamut_limited = preserve_chroma_in_gamut(out_lab, lab)
+        desired = out_lab
+        out_lab, gamut_limited = preserve_chroma_in_gamut(desired, lab)
+        for domain in item['domains']:
+            if 'gamut_continuity_step_L' in domain:
+                name = domain.get('name', 'metal')
+                seed_mask = None
+                if domain.get('gamut_continuity_opaque_seeds', False):
+                    seed_mask = src[..., 3] >= 240
+                out_lab, proof = continuous_gamut_limits(desired, out_lab, lab,
+                    domain_masks[name], domain['gamut_continuity_step_L'], seed_mask)
+                proof['opaque_seeds_only'] = seed_mask is not None
+                gamut_continuity.append(dict(name=name, **proof))
+    elif any('gamut_continuity_step_L' in domain for domain in item['domains']):
+        raise ValueError('Gamut continuity requires source_lightness')
     dst = src.copy()
     converted = lab_to_rgb(out_lab)
     dst[allowed_union,:3] = converted[allowed_union]
@@ -478,6 +549,7 @@ def process_view(item, target, defaults):
     return dst, allowed_union, protect, {'source':str(path),'source_sha256':before_hash,
         'size':[w,h], 'domains':domains, 'color_mode':mode,
         'gamut_limited_pixels':gamut_limited,'correction_blends':blends,
+        'gamut_continuity':gamut_continuity,
         'required_editable_pixels':int(required.sum()),
         'required_editable_missing':0,
         'changed_pixels':int(np.any(dst != src,axis=-1).sum()),
