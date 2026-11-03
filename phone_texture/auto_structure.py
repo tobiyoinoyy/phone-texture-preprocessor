@@ -19,11 +19,11 @@ def gray_signal(a,x_range):
     return np.median(a[:,x_range[0]:x_range[1],:3].astype(float).mean(axis=2),axis=1)
 
 
-def antenna_rows(image,x_range,expected_width=None):
+def antenna_rows(image,x_range,expected_width=None,require_full_span=False):
     a=np.array(image.convert('RGBA'));h,w=a.shape[:2]
     signal=gray_signal(a,x_range);g=np.gradient(gaussian_filter1d(signal,1.))
     peaks,_=find_peaks(np.abs(g),height=.5,distance=2)
-    result=[];signs=[];scores=[]
+    result=[];signs=[];scores=[];ranked=[]
     for lower,upper in ((.025,.18),(.82,.975)):
         group=[int(p) for p in peaks if lower*h<p<upper*h]
         pairs=[]
@@ -43,11 +43,35 @@ def antenna_rows(image,x_range,expected_width=None):
                 score=min(abs(g[lo]),abs(g[hi]))*np.sqrt(width)*min(1.,contrast/4.)
                 if contrast>=1 and score>0:pairs.append((score,lo,hi))
         if not pairs:raise ValueError('No supported antenna strip in both body ends')
+        ranked.append(sorted(pairs,reverse=True))
         score,lo,hi=max(pairs)
         if np.median(a[[lo,hi],x_range[0]:x_range[1],3])<128:
             raise ValueError('Antenna boundary falls outside opaque body')
         result.extend([lo,hi]);signs.extend([int(np.sign(g[lo])),int(np.sign(g[hi]))]);scores.append(float(score))
-    return result,signs,dict(signal_columns=list(x_range),scores=scores)
+    selection=[]
+    if require_full_span:
+        # A button cap or a scratch can outrank the real antenna in the
+        # central 1-D signal. Every chosen side candidate must independently
+        # satisfy the existing full-width material-pair/endpoint gates.
+        from .antenna_material import trace_boundaries
+        for band,pairs in enumerate(ranked):
+            rejected=[];first_error=None
+            for score,lo,hi in pairs:
+                candidate=result.copy();candidate[2*band:2*band+2]=[lo,hi]
+                try:trace_boundaries(image,candidate,bands=(band,))
+                except ValueError as exc:
+                    if first_error is None:first_error=exc
+                    rejected.append(dict(rows=[lo,hi],reason=str(exc)))
+                    continue
+                result=candidate;signs[2*band:2*band+2]=[int(np.sign(g[lo])),int(np.sign(g[hi]))]
+                scores[band]=float(score)
+                selection.append(dict(band=band,rows=[lo,hi],rejected_candidates=rejected))
+                break
+            else:
+                raise first_error
+    proof=dict(signal_columns=list(x_range),scores=scores)
+    if require_full_span:proof['full_span_candidate_selection']=selection
+    return result,signs,proof
 
 
 def rear_reference(image,side,edge,expected_width):
@@ -154,15 +178,18 @@ def _retained_upper_boundaries(image,rows):
     return result
 
 
-def per_column_boundaries(image,rows,return_proof=False):
-    # This repair is intentionally scoped to the user-marked lower antenna.
-    # Retain the accepted upper algorithm/mapping instead of silently changing
-    # it while fixing a lower-band material classification problem.
+def per_column_boundaries(image,rows,return_proof=False,*,revision_bands=(0,1)):
+    # New full processing verifies both bands. A recorded lower-only repair
+    # can explicitly preserve its previously accepted upper mapping.
     from .antenna_material import trace_boundaries
-    lower,proof=trace_boundaries(image,rows,bands=(1,))
-    result=np.vstack([_retained_upper_boundaries(image,rows),lower])
+    if tuple(revision_bands)==(1,):
+        lower,proof=trace_boundaries(image,rows,bands=(1,))
+        result=np.vstack([_retained_upper_boundaries(image,rows),lower])
+    elif tuple(revision_bands)==(0,1):
+        result,proof=trace_boundaries(image,rows)
+    else:raise ValueError('Unsupported antenna revision scope')
     if np.any(np.diff(result,axis=0)<=0):raise ValueError('Per-column antenna boundaries cross')
-    proof=dict(proof,revision_bands=[1],upper_algorithm_retained=True)
+    proof=dict(proof,revision_bands=list(revision_bands),upper_algorithm_retained=tuple(revision_bands)==(1,))
     return (result,proof) if return_proof else result
 
 
@@ -193,7 +220,7 @@ def propose(files, coordinate_mode='body_endpoints'):
     for side in ('left','right'):
         image=Image.open(files[side]).convert('RGBA');sh,sw=image.height,image.width
         xr=[max(1,int(sw*.40)),min(sw-1,int(sw*.60))]
-        rows,signs,proof=antenna_rows(image,xr);buttons,boxes=hardware_ranges(image)
+        rows,signs,proof=antenna_rows(image,xr,require_full_span=True);buttons,boxes=hardware_ranges(image)
         # The physical side identities are established by the named, upright
         # source capture convention, never by copying another SKU's targets.
         body=body_rows(image);back_body=body_rows(back)
@@ -201,7 +228,7 @@ def propose(files, coordinate_mode='body_endpoints'):
         br,bs,back_x,bproof=rear_reference(back,side,right if side=='left' else left,expected_width)
         if 'width_prior_rejected' in bproof:
             expected_side_width=np.mean([br[1]-br[0],br[3]-br[2]])*sh/h
-            rows,signs,proof=antenna_rows(image,xr,expected_side_width)
+            rows,signs,proof=antenna_rows(image,xr,expected_side_width,require_full_span=True)
             proof['width_reference']='independent_current_back'
         desired=np.array([(v-back_body[0])/(back_body[1]-back_body[0])*(body[1]-body[0])+body[0] for v in br])
         if coordinate_mode=='canvas_pixel_centers':

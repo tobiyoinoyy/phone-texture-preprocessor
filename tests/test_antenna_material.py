@@ -54,7 +54,7 @@ def test_normal_auto_scope_rejects_a_narrow_endpoint_block(tmp_path):
     path=tmp_path/'right.png';im.save(path)
     job,_,allowed,paper=auto_material.propose_job(path,'right',tmp_path/'materials')
     scope=auto_material.lighting_scope(path,'right',job,tmp_path/'scope')
-    assert job['views'][0]['antenna_boundary_bands']==[1]
+    assert job['views'][0]['antenna_boundary_bands']==[0,1]
     assert {'antenna_1_left_metal','antenna_1_right_metal'}<=set(scope['local_checks'])
     engine=lighting.engine('aluminum');result,_,_,_=engine.process_view(job['views'][0],engine.target_color(job)[0],dict(job['defaults'],color_mode=job['color_mode']))
     output=tmp_path/'fixed.png';Image.fromarray(result).save(output)

@@ -153,7 +153,63 @@ def plate_plane_from_own_corners(rgba,raw_rgb,wide_rows):
     return line,dict(method='own_top_bottom_corner_curve_consensus_v1',
         own_corner_support_fractions=fractions,corner_residual_p95_px=residual,
         raw_rgb_supported_fraction=float(np.mean(edge>3)),body_u=[uleft,uright],top_v=vtop,bottom_v=plane,
-        symmetric_body_assumption=True,samples=int(keep.sum()))
+        symmetric_body_assumption=True,samples=int(keep.sum()),axis_slope=slope,
+        upper_curve_u=curve_u.tolist(),upper_curve_v=curve_v.tolist())
+
+
+def plate_corner_contact_limit(rgba, raw_rgb, line, corner, support_columns, paper=None):
+    """Remove a supported contact outside the curved body, not a rectangle.
+
+    The existing two-corner fit supplies a geometric search neighbourhood.
+    Independent raw RGB edges validate each affected corner before its local
+    silhouette can change. Exposed corners, body reflections and paper stay
+    unchanged. A poor correspondence is a failure, never a smaller body.
+    """
+    a=np.asarray(rgba);h,w=a.shape[:2];mask=principal(a[...,3]);x=np.arange(w,dtype=float)
+    base=np.polyval(line,x+.5);curve=base.copy()
+    slope=float(corner['axis_slope']);normal=np.sqrt(1+slope*slope)
+    u0,u1=corner['body_u'];width=u1-u0
+    for _ in range(4):
+        u=(x-slope*curve)/normal
+        curve=normal*(corner['bottom_v']-np.interp(u,corner['upper_curve_u'],corner['upper_curve_v']))-slope*x
+    present=a[...,3]>0
+    bottom=h-1-np.argmax(present[::-1],axis=0)
+    # A real exposed corner follows the fitted curve. Only a clearly attached
+    # projection extends farther, so do not recut every already good corner.
+    corner_columns=((u>u0+.025*width)&(u<u0+.23*width))|((u>u1-.23*width)&(u<u1-.025*width))
+    support_columns=np.asarray(support_columns,dtype=bool).reshape(-1)
+    if support_columns.shape!=(w,):raise ValueError('Stand projection columns differ from source width')
+    affected=corner_columns&(bottom>curve+4)&(base>curve+4)&support_columns&present.any(axis=0)
+    if paper is not None:
+        affected &= ~np.any(np.asarray(paper,dtype=bool)&(np.arange(h)[:,None]>=curve[None,:]-3),axis=0)
+    limit=base.copy();details=[]
+    if not affected.any():return limit,dict(method='raw_supported_local_corner_contact',changed_columns=[],corners=[])
+    gradient=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(np.float32),.8,axis=0),axis=0),axis=2)
+    for name,side in [('left',u<(u0+u1)/2),('right',u>=(u0+u1)/2)]:
+        cols=np.flatnonzero(affected&side)
+        if not len(cols):continue
+        # Validate a full local neighbourhood, including exposed witnesses on
+        # both sides of the contact. Do not fit the stand's distant white rail.
+        check=np.arange(max(0,cols.min()-8),min(w,cols.max()+9))
+        ys=np.rint(curve[check,None]+np.arange(-3,4)).astype(int)
+        values=gradient[np.clip(ys,0,h-1),check[:,None]]
+        peak=np.argmax(values,axis=1);strength=values[np.arange(len(check)),peak]
+        measured=ys[np.arange(len(check)),peak].astype(float)
+        supported=(strength>3)&(peak>0)&(peak<6)
+        if supported.mean()<.6 or supported.sum()<12:
+            raise ValueError('Corner contact lacks independent raw RGB boundary support: '+name)
+        displacement=measured[supported]-curve[check[supported]]
+        offset=float(np.median(displacement));residual=float(np.percentile(np.abs(displacement-offset),95))
+        if abs(offset)>2.5 or residual>2.5:
+            raise ValueError('Corner contact raw RGB disagrees with own body curve: '+name)
+        # Retain a full source pixel beyond the independently measured edge.
+        # This is a conservative alpha-only trim, never synthesized RGB.
+        local=curve[cols]+max(0.,offset)+1.
+        limit[cols]=np.minimum(base[cols],local)
+        details.append(dict(side=name,columns=[int(cols.min()),int(cols.max())],
+            rgb_support_fraction=float(supported.mean()),rgb_offset_px=offset,
+            rgb_residual_p95_px=residual,source_samples=int(supported.sum())))
+    return limit,dict(method='raw_supported_local_corner_contact',changed_columns=np.flatnonzero(limit<base).tolist(),corners=details)
 
 
 def line_samples(alpha, lo, hi):
@@ -362,8 +418,22 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
         # alpha retained at both exposed, already segmented round corners.
         line=rgb_line;residual=corner_proof['corner_residual_p95_px'] if bands is None else score/2;inlier_fraction=1.
         yy=np.arange(h)[:,None];xx=np.arange(w)[None,:]+.5;limit=np.polyval(line,xx)
+        paper_tail_proof=None
+        if face=='back' and paper is not None and paper.any():
+            from .auto_material import source_paper_tail
+            paper,tail_info=source_paper_tail(np.dstack([raw_rgb,a[...,3]]),paper,{},physical_end=limit[0])
+            paper_tail_proof=tail_info.get('source_paper_tail')
         far_start=min(h-1,max(0,int(np.min(limit))+12))
         support_columns=ndimage.binary_dilation((a[far_start:,:,3]>0).any(axis=0),iterations=8)[None,:]
+        contact_curve_proof=None
+        if bands is None:
+            # With a tilted body, a single global far-start row can still
+            # intersect the phone at the opposite end. This new corner-only
+            # projection must be genuinely beyond each column's body plane.
+            remote=(yy>limit+12)&(a[...,3]>0)
+            corner_support=ndimage.binary_dilation(remote.any(axis=0),iterations=8)
+            local_limit,contact_curve_proof=plate_corner_contact_limit(a,raw_rgb,line,corner_proof,corner_support,paper)
+            limit=local_limit[None,:]
         outside=(yy>limit+1)&support_columns
         if paper is not None:outside &= ~paper
         a[...,3][outside]=0
@@ -379,6 +449,8 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
             output_size=list(result.size),body_x=[x0,x1],bottom_rail=line.tolist(),alpha_lower_rail=alpha_line.tolist(),
             clear_bands=bands,exposed_samples=n_clear,lower_edge_residual_p95_px=residual,
             own_corner_evidence=corner_proof if bands is None else None,axis_evidence=axis_proof,
+            corner_contact_evidence=contact_curve_proof,
+            source_paper_tail=paper_tail_proof,
             lower_plane_evidence=lower_plane_proof,
             rotation_ccw_degrees=angle,canvas_trim_xyxy=list(box),rgb_painted=False,
             review_reasons=['heuristic_support_cut','complete_outline_requires_review'])
@@ -428,6 +500,11 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
         raise ValueError('Plate lower boundary is uncertain')
     _,line,residual,inlier_fraction=max(options,key=lambda v:v[0])
     yy=np.arange(h)[:,None];xx=np.arange(w)[None,:]+.5;limit=np.polyval(line,xx)+1.
+    paper_tail_proof=None
+    if face=='back' and paper is not None and paper.any():
+        from .auto_material import source_paper_tail
+        paper,tail_info=source_paper_tail(np.dstack([raw_rgb,a[...,3]]),paper,{},physical_end=np.polyval(line,xx)[0])
+        paper_tail_proof=tail_info.get('source_paper_tail')
     far=mask[int(np.polyval(line,(x0+x1)/2)+12):]
     support_columns=ndimage.binary_dilation(far.any(axis=0),iterations=8)
     support=ndimage.binary_fill_holes(np.broadcast_to(support_columns,(h,w))) & (yy>=limit)
@@ -443,5 +520,6 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
     return result,dict(method='local_stand_removal_from_exposed_plate_edges_v1',
         source_size=list(matte.size),output_size=list(result.size),body_x=[x0,x1],
         bottom_rail=line.tolist(),lower_edge_residual_p95_px=residual,exposed_samples=int(valid.sum()),
+        source_paper_tail=paper_tail_proof,
         rotation_ccw_degrees=angle,canvas_trim_xyxy=list(box),removed_support_pixels=int(support.sum()),
         rgb_painted=False,axis_evidence=axis_proof,review_reasons=['heuristic_support_cut','complete_outline_requires_review'])

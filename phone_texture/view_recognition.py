@@ -15,7 +15,7 @@ from PIL import Image, ImageOps
 
 FACES = ('front', 'back', 'left', 'right', 'top', 'bottom')
 DATA = Path(__file__).with_name('recognition_data')
-PROFILE = 'iphone17-studio-views-v2-hardware-orientation'
+PROFILE = 'iphone17-studio-views-v3-outline-registration'
 
 
 def read_rgb(path):
@@ -75,6 +75,127 @@ def hardware_feature(feature):
     return vector / (np.linalg.norm(vector) + 1e-8)
 
 
+def _plate_regions():
+    """Disjoint pose and identity witnesses in the frozen studio atlas space."""
+    y,x=np.indices((48,48))
+    # Leave a gap even under the bounded candidate transforms: the camera/
+    # screen witness cannot enter the cap/rail estimator's sampling footprint.
+    outer=((((x>=11)&(x<19))|((x>=29)&(x<37)))&(y>=23)&(y<33))
+    outer |= (y>=3)&(y<7)&(x>=19)&(x<29)
+    interior=(y>=12)&(y<19)&(x>=18)&(x<30)
+    return outer,interior
+
+
+def _outline_registration(feature, references):
+    """Estimate pose using only the cap and long rails, never class scores.
+
+    One common transform is evaluated against every class afterwards. The
+    existing front descriptors provide an unoccluded silhouette; no incoming
+    image becomes a reference and camera/screen pixels cannot select the fit.
+    """
+    outer,_=_plate_regions()
+    target=np.median(np.stack(references),axis=0).reshape(48,48)[outer]
+    norm=float(np.linalg.norm(target))
+    if norm<=1e-8:raise ValueError('Frozen atlas lacks plate outline support')
+    target=target/norm;grid=np.asarray(feature).reshape(48,48)
+    best=(-1.,None,None)
+    def consider(scale,dx,dy):
+        nonlocal best
+        if not .90<=scale<=1.10 or abs(dx)>3 or abs(dy)>3:return
+        matrix=np.array([[scale,0,23.5*(1-scale)+dx],
+                         [0,scale,23.5*(1-scale)+dy]],np.float32)
+        aligned=cv2.warpAffine(grid,matrix,(48,48),flags=cv2.INTER_LINEAR)
+        values=aligned[outer];support=float(np.linalg.norm(values))
+        score=float(values@target/(support+1e-8))
+        if score>best[0]:best=(score,(float(scale),float(dx),float(dy)),matrix)
+    for scale in np.linspace(.90,1.10,11):
+        for dx in np.linspace(-3,3,13):
+            for dy in np.linspace(-3,3,13):consider(scale,dx,dy)
+    _,(scale,dx,dy),_=best
+    for s in np.linspace(scale-.01,scale+.01,5):
+        for x in np.linspace(dx-.375,dx+.375,7):
+            for y in np.linspace(dy-.375,dy+.375,7):consider(s,x,y)
+    score,(scale,dx,dy),matrix=best
+    proof=dict(outline_score=score,scale=scale,translation_cells=[dx,dy],
+        descriptor_size=48,scale_bounds=[.90,1.10],translation_bound_cells=3.,
+        estimation='frozen_front_outer_cap_and_rails_only')
+    if score<.90:raise ValueError('Outer silhouette support is insufficient')
+    # A boundary optimum can indicate that the actual pose lies outside the
+    # declared capture tolerance; do not accept a clipped best-effort fit.
+    if min(scale-.90,1.10-scale)<1e-6 or max(abs(dx),abs(dy))>=3-1e-6:
+        raise ValueError('Plate framing lies outside bounded registration')
+    return matrix,proof
+
+
+def _plate_source_support(rgb,matrix,face):
+    """Independently require visible closure, plus front glass in source RGB."""
+    small=cv2.resize(rgb,(48,48),interpolation=cv2.INTER_AREA).astype(np.float32)
+    aligned=cv2.warpAffine(small,matrix,(48,48),flags=cv2.INTER_LINEAR)
+    valid=cv2.warpAffine(np.ones((48,48),np.float32),matrix,(48,48),flags=cv2.INTER_LINEAR)>.999
+    gray=aligned.mean(axis=2);gy=np.abs(np.gradient(gray,axis=0))
+    # The atlas intentionally suppresses the stand/lower label. Verify the
+    # lower body on both sides of that label from the uncensored source RGB.
+    bottoms=[]
+    for lo,hi in ((17,20),(28,31)):
+        # The same studio profile places the lower corners in rows 42..45.
+        # Earlier edges can be a truncated body; padded warp borders are not
+        # source evidence and must not compete with the actual lower edge.
+        rows=[row for row in range(42,46) if valid[row-1:row+2,lo:hi].all()]
+        if not rows:
+            raise ValueError('Plate bottom closure is unsupported or clipped')
+        signal=np.array([np.median(gy[row,lo:hi]) for row in rows])
+        row=rows[int(np.argmax(signal))]
+        if signal.max()<4:
+            raise ValueError('Plate bottom closure is unsupported or clipped')
+        bottoms.append(row)
+    if abs(bottoms[0]-bottoms[1])>2:
+        raise ValueError('Plate lower corners do not support one upright body')
+    proof=dict(bottom_edge_rows=bottoms)
+    if face=='front':
+        glass=gray[12:31,18:30];background=np.concatenate([gray[12:31,3:10].ravel(),gray[12:31,38:45].ravel()])
+        if not valid[12:31,3:45].all():raise ValueError('Front glass witness leaves source image')
+        contrast=float(np.median(background)-np.median(glass))
+        fraction=float(np.mean(glass<np.median(background)-40))
+        if contrast<40 or fraction<.90:
+            raise ValueError('Outer outline lacks independent dark screen evidence')
+        proof.update(screen_background_contrast=contrast,dark_screen_fraction=fraction)
+    return proof
+
+
+def register_plate(rgb,feature,refs,arrays):
+    """Conservative framing fallback; unchanged atlas/score/margin gates."""
+    proof=dict(accepted=False,scope='upright front/back studio framing only')
+    try:
+        matrix,fit=_outline_registration(feature,[arrays[r['id']+'_edge'] for r in refs if r['face']=='front'])
+        proof.update(fit)
+        aligned=cv2.warpAffine(np.asarray(feature).reshape(48,48),matrix,(48,48),flags=cv2.INTER_LINEAR).ravel()
+        aligned=aligned/(np.linalg.norm(aligned)+1e-8)
+        scores={face:max(float(aligned@arrays[r['id']+'_edge']) for r in refs if r['face']==face) for face in FACES}
+        ranked=sorted(scores,key=scores.get,reverse=True);face=ranked[0]
+        proof.update(scores=scores,face=face,score=scores[face],margin=scores[face]-scores[ranked[1]])
+        if face not in ('front','back') or scores[face]<.90 or proof['margin']<.025:
+            raise ValueError('Registered view fails unchanged class score/margin gates')
+        _,interior=_plate_regions();inside=aligned.reshape(48,48)[interior]
+        energy=float(np.linalg.norm(inside))
+        relevant=[r for r in refs if r['face']==face]
+        reference_energy=[float(np.linalg.norm(arrays[r['id']+'_edge'].reshape(48,48)[interior])) for r in relevant]
+        if energy<min(reference_energy)*.5:
+            raise ValueError('Plate interior has insufficient independent structure')
+        inside=inside/(energy+1e-8)
+        interior_scores={f:max(float(inside@(arrays[r['id']+'_edge'].reshape(48,48)[interior]/
+            (np.linalg.norm(arrays[r['id']+'_edge'].reshape(48,48)[interior])+1e-8)))
+            for r in refs if r['face']==f) for f in ('front','back')}
+        proof.update(interior_scores=interior_scores,interior_energy=energy)
+        other='back' if face=='front' else 'front'
+        if interior_scores[face]<.90 or interior_scores[face]-interior_scores[other]<.025:
+            raise ValueError('Independent plate interior disagrees with registered outline')
+        proof['source_support']=_plate_source_support(rgb,matrix,face)
+        proof['accepted']=True
+    except ValueError as exc:
+        proof['reason']=str(exc)
+    return proof
+
+
 def recognize(path, exclude_group=None):
     rgb = read_rgb(path); feature = edge_feature(rgb)
     meta, arrays = atlas()
@@ -85,6 +206,15 @@ def recognize(path, exclude_group=None):
     result = dict(face=None, suggested_face=best, score=round(score,5), margin=round(margin,5),
                   method='edge_atlas', profile=PROFILE, scores=scores)
     if score < .90:
+        if best in ('front','back'):
+            registration=register_plate(rgb,feature,refs,arrays)
+            result['registration']=registration
+            if registration['accepted']:
+                result.update(face=registration['face'],suggested_face=registration['face'],
+                    method='outline_registered_plate',raw_scores=scores,
+                    scores=registration['scores'],score=round(registration['score'],5),
+                    margin=round(registration['margin'],5),reason=None)
+                return result
         result['reason'] = '画面与当前拍摄规范差异较大'; return result
     if best in ('left', 'right'):
         # Fine edges resolve buttons/antenna layout that a coarse silhouette

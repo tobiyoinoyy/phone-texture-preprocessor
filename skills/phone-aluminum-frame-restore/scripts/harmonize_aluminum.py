@@ -261,7 +261,34 @@ def target_color(job):
     return target, info
 
 
-def supported_contour_field(lab, fit, editable, alpha, sigma, inset_depth=5.):
+def smooth_material_correction(shift, reliable, fit, editable, sigma, mode='legacy'):
+    """Smooth an additive field without treating interpolated pixels as source.
+
+    Source fit coverage continuously weights the independent fit estimate. A
+    protrusion or soft edge without nearby fit pixels keeps its already
+    supported field; it is never assigned zero correction or made uneditable.
+    Historical jobs retain their original smoothing unless explicitly opted in.
+    """
+    denominator=gaussian(reliable.astype(float),sigma)
+    original=gaussian(shift*reliable[...,None],sigma)/np.maximum(denominator[...,None],1e-9)
+    if mode=='legacy':return original,None
+    if mode!='source_fit_coverage':raise ValueError('Unknown correction smoothing mode')
+    source_fit=fit&reliable
+    fit_denominator=gaussian(source_fit.astype(float),sigma)
+    coverage=fit_denominator/np.maximum(denominator,1e-9)
+    result=((1-coverage[...,None])*original
+            +gaussian(shift*source_fit[...,None],sigma)/np.maximum(denominator[...,None],1e-9))
+    if np.any(denominator[editable]<=1e-9) or not np.isfinite(result[editable]).all():
+        raise ValueError('Unsupported source-fit correction smoothing')
+    no_fit=editable&(fit_denominator==0)
+    info=dict(mode=mode,minimum_reliable_support=float(denominator[editable].min()),
+              source_fit_coverage_range=[float(coverage[editable].min()),float(coverage[editable].max())],
+              zero_local_fit_pixels=int(no_fit.sum()),
+              zero_local_fit_max_legacy_difference=float(np.max(np.abs(result[no_fit]-original[no_fit]))) if no_fit.any() else 0.)
+    return result,info
+
+
+def supported_contour_field(lab, fit, editable, alpha, sigma, inset_depth=5., source_inset_limit=None):
     """Tangent/normal source sampling; include curved rims and alpha fringes.
 
     Requires SciPy (included by phone-texture-preprocessor). No nearest-neighbor
@@ -274,18 +301,59 @@ def supported_contour_field(lab, fit, editable, alpha, sigma, inset_depth=5.):
     if not np.isfinite(inset_depth) or inset_depth<0:
         raise ValueError('Contour inset depth must be finite and nonnegative')
     inside=alpha>=128
-    dist=distance_transform_edt(np.pad(inside,1))[1:-1,1:-1]-distance_transform_edt(~inside)
-    gy,gx=np.gradient(gaussian_filter(dist,3));norm=np.maximum(np.hypot(gx,gy),1e-8)
+    if source_inset_limit is not None:
+        # Compute normals before cropping the transparent exterior. Reflecting
+        # an already cropped distance field tilts normals at a tight canvas
+        # edge and makes the result depend on incidental transparent margins.
+        # The pad covers Gaussian's default four-sigma support plus gradient.
+        pad=13;extended=np.pad(inside,pad)
+        signed=distance_transform_edt(extended)-distance_transform_edt(~extended)
+        gy,gx=np.gradient(gaussian_filter(signed,3))
+        dist=signed[pad:-pad,pad:-pad]
+        gy,gx=gy[pad:-pad,pad:-pad],gx[pad:-pad,pad:-pad]
+    else:
+        dist=distance_transform_edt(np.pad(inside,1))[1:-1,1:-1]-distance_transform_edt(~inside)
+        gy,gx=np.gradient(gaussian_filter(dist,3))
+    norm=np.maximum(np.hypot(gx,gy),1e-8)
     nx,ny=gx/norm,gy/norm;y,x=np.nonzero(editable)
+    inset=np.maximum(0,inset_depth-dist[y,x])
+    if source_inset_limit is not None:
+        if not np.isfinite(source_inset_limit) or not 0<source_inset_limit<=min(alpha.shape)*.1:
+            raise ValueError('Invalid source-normal sampling bound')
+        # Locate the actual opaque material along each inward normal. A single
+        # widest alpha shoulder elsewhere on the rim must not move a thin
+        # bottom rim's sampling window across its glass boundary. These are
+        # sampling coordinates only, never nearest-pixel RGB replacement.
+        found=np.zeros(len(x),bool);inset=np.zeros(len(x));best=np.full(len(x),-1.)
+        for offset in np.arange(0,float(source_inset_limit)+1e-12,.5):
+            coordinates=[y+ny[y,x]*offset,x+nx[y,x]*offset]
+            # Classify the discrete source mask without averaging away a
+            # genuine one-pixel metal strip. RGB integration below remains
+            # weighted/bilinear and must pass the unchanged .008 support gate.
+            supported=map_coordinates(fit.astype(np.uint8),coordinates,order=0,mode='constant',cval=0)>0
+            material=map_coordinates(editable.astype(np.uint8),coordinates,order=0,mode='constant',cval=0)>0
+            coverage=map_coordinates(alpha.astype(float),coordinates,order=0,mode='constant',cval=0)
+            # A short translucent span can use opaque neighbours along the
+            # same tangent. Keep its sampling centre inside actual material;
+            # the integration must still have >=.008 opaque fit support.
+            score=coverage+supported*256.
+            take=material&(score>best);inset[take]=offset;best[take]=score[take];found |= material
+        if not found.all():
+            missing=~found
+            raise ValueError(f'No same-material samples on bounded contour normals: {int(missing.sum())} pixels; '
+                             f'bounds [{int(x[missing].min())}, {int(y[missing].min())}, {int(x[missing].max())}, {int(y[missing].max())}]')
+    # Interpolate against the same zero-valued exterior whether transparent
+    # padding is explicit or implicit; `constant` drops fractional border
+    # samples wholesale and therefore changes when the canvas is padded.
+    sample_mode='grid-constant' if source_inset_limit is not None else 'constant'
     num=np.zeros((len(x),3));den=np.zeros(len(x));total=0.
     for t in np.linspace(-2.5*tangent,2.5*tangent,19):
         for n in np.linspace(-2*normal,2*normal,5):
-            inset=np.maximum(0,inset_depth-dist[y,x])
             coordinates=[y+nx[y,x]*t+ny[y,x]*(n+inset),x-ny[y,x]*t+nx[y,x]*(n+inset)]
             weight=np.exp(-.5*(t/tangent)**2-.5*(n/normal)**2);total+=weight
-            den+=weight*map_coordinates(fit.astype(float),coordinates,order=1,mode='constant',cval=0)
+            den+=weight*map_coordinates(fit.astype(float),coordinates,order=1,mode=sample_mode,cval=0)
             for channel in range(3):
-                num[:,channel]+=weight*map_coordinates(lab[...,channel]*fit,coordinates,order=1,mode='constant',cval=0)
+                num[:,channel]+=weight*map_coordinates(lab[...,channel]*fit,coordinates,order=1,mode=sample_mode,cval=0)
     strength=den/total
     if (strength<.008).any():
         missing=strength<.008
@@ -462,7 +530,7 @@ def process_view(item, target, defaults):
             # their real finish differences to lighting and create dark bands.
             field_lab=lab.copy();field_lab[...,0]-=profile
         if field == 'contour':
-            low, support, reliable = supported_contour_field(field_lab, fit, allowed, contour_alpha, sigma,domain.get('contour_inset_depth',5.))
+            low, support, reliable = supported_contour_field(field_lab, fit, allowed, contour_alpha, sigma,domain.get('contour_inset_depth',5.),domain.get('contour_source_inset_limit'))
         elif field == 'gaussian':
             low, support, reliable = supported_field(lab, fit, allowed, sigma)
         else:
@@ -495,14 +563,18 @@ def process_view(item, target, defaults):
         # Smooth all correction components, including across excluded features.
         # Protected pixels themselves are reinstated exactly after conversion.
         smooth = domain.get('correction_smooth', 3)
-        shift = (gaussian(shift*reliable[..., None], smooth)
-                 / np.maximum(gaussian(reliable.astype(float), smooth)[..., None], 1e-9))
+        smoothing_mode=domain.get('correction_smoothing','legacy')
+        if smoothing_mode=='source_fit_coverage' and (mode!='source_lightness' or field!='contour'
+                or domain.get('reference_profile')!='contour_depth_lift'):
+            raise ValueError('Source fit coverage smoothing requires source-lightness contour-depth-lift')
+        shift,smoothing_info=smooth_material_correction(shift,reliable,fit,allowed,smooth,smoothing_mode)
         weight = inward_weight(allowed, domain.get('feather', defaults.get('feather', 5)))
         out_lab += shift*weight[...,None]
         domains.append({'name':domain.get('name','metal'), 'editable_pixels':int(allowed.sum()),
                         'fit_pixels':int(fit.sum()),'field':field,'strength':strengths.tolist(),
                         'source_reference_lab':source_reference.tolist(),
                         'source_normal_profile':profile_info,
+                        'correction_smoothing':smoothing_info,
                         'contour_coordinate_sha256':digest(domain['contour_alpha_mask']) if domain.get('contour_alpha_mask') else None,
                         'minimum_editable_support':float(support[allowed].min()) if allowed.any() else None,
                         'unsupported_editable_pixels':0})

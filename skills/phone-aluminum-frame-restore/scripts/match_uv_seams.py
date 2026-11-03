@@ -34,21 +34,47 @@ def resample_side(side,arc,ss):
 
 
 def apply_band(shape, side, arc, ss, offset, slope, width_units, guard):
-    h,w=shape;pts=side['points'];width=width_units*side['px_per_unit']
-    # Locate each image pixel relative to its closest actual UV edge segment.
-    pad=int(np.ceil(max(width,guard)))+2
+    """Extend the correction continuously across a monotone UV cross-section.
+
+    Closest-segment projection is multivalued on the inside of a curved seam.
+    Its arc coordinate jumps across the curve's medial axis, creating diagonal
+    color blocks even for perfectly smooth input. Frame seams are graphs over
+    their long axis: intersecting each transverse image line with that graph
+    gives one continuous correspondence. This changes only the correction
+    field, never the UV coordinates, source texture, or material masks.
+    """
+    h,w=shape;pts=np.asarray(side['points']);arc=np.asarray(arc)
+    normals=np.asarray(side['normals']);width=width_units*side['px_per_unit']
+    if width <= 0 or guard <= 0:
+        raise ValueError('Seam width and guard must be positive')
+    axis=int(np.argmax(np.ptp(pts,axis=0)));cross=1-axis
+    along=pts[:,axis];differences=np.diff(along)
+    if np.all(differences < 0):
+        pts=pts[::-1];arc=arc[::-1];normals=normals[::-1]
+    elif np.all(differences > 0):
+        pass
+    else:
+        raise ValueError('UV seam must be a monotone cross-section; split the turning chain')
+    along=pts[:,axis]
+    if np.any(np.abs(normals[:,cross]) < .1) or np.any(normals[:,cross]*normals[0,cross] <= 0):
+        raise ValueError('UV seam normals do not define a consistent cross-section')
+    # The band width is a normal distance. Its transverse image extent grows
+    # at a curved end; a width-sized rectangular crop would cut the field off
+    # before the cubic taper reaches zero and create a new straight boundary.
+    pad=np.full(2,int(np.ceil(guard))+2)
+    pad[cross]=int(np.ceil(max(width,guard)/np.min(np.abs(normals[:,cross]))+guard))+2
     lo=np.maximum(np.floor(pts.min(0)-pad).astype(int),[0,0]);hi=np.minimum(np.ceil(pts.max(0)+pad).astype(int),[w,h])
     yy,xx=np.mgrid[lo[1]:hi[1],lo[0]:hi[0]];grid=np.stack([xx,yy],axis=-1)
-    best=np.full(xx.shape,np.inf);coord=np.zeros_like(xx,dtype=float);dist=np.zeros_like(coord)
-    endpoint_excess=np.zeros_like(coord)
-    for i,(a,b) in enumerate(zip(pts[:-1],pts[1:])):
-        v=b-a;raw=np.sum((grid-a)*v,axis=-1)/np.dot(v,v);t=np.clip(raw,0,1)
-        near=a+t[...,None]*v;delta=grid-near;d2=np.sum(delta*delta,axis=-1);sel=d2<best
-        normal=(1-t[...,None])*side['normals'][i]+t[...,None]*side['normals'][i+1]
-        normal/=np.linalg.norm(normal,axis=-1)[...,None]
-        best[sel]=d2[sel];coord[sel]=(arc[i]+t*(arc[i+1]-arc[i]))[sel]
-        dist[sel]=np.sum(delta*normal,axis=-1)[sel]
-        endpoint_excess[sel]=(np.abs(raw-t)*np.linalg.norm(v))[sel]
+    tangent=grid[...,axis];clamped=np.clip(tangent,along[0],along[-1])
+    coord=np.interp(clamped,along,arc)
+    normal=np.stack([np.interp(clamped,along,normals[:,i]) for i in range(2)],axis=-1)
+    normal/=np.linalg.norm(normal,axis=-1)[...,None]
+    boundary=np.interp(clamped,along,pts[:,cross])
+    # Continue the end tangent only beyond the two genuine chain endpoints.
+    # Capping every constituent segment also introduced artificial wedges.
+    boundary-=normal[...,axis]/normal[...,cross]*(tangent-clamped)
+    dist=(grid[...,cross]-boundary)*normal[...,cross]
+    endpoint_excess=np.abs(tangent-clamped)/np.abs(normal[...,cross])
     t=np.clip(dist/width,0,1)
     delta=np.stack([np.interp(coord,ss,offset[:,c]) for c in range(3)],axis=-1)
     deriv=np.stack([np.interp(coord,ss,slope[:,c]) for c in range(3)],axis=-1)
@@ -63,6 +89,28 @@ def apply_band(shape, side, arc, ss, offset, slope, width_units, guard):
     full=np.zeros((h,w,3));full[lo[1]:hi[1],lo[0]:hi[0]]=correction
     mask=np.zeros((h,w),bool);mask[lo[1]:hi[1],lo[0]:hi[0]]=active&(cap>0)
     return full,mask
+
+
+def correction_continuity(field, valid):
+    """Measure the added field, not photographic grain or material edges."""
+    maximum=0.;maximum_l=0.;location=None;count=0
+    for axis in (0,1):
+        adjacent=(valid[1:]&valid[:-1]) if axis==0 else (valid[:,1:]&valid[:,:-1])
+        delta=np.diff(field,axis=axis)
+        values=np.linalg.norm(delta,axis=-1)
+        if not np.isfinite(delta[adjacent]).all():
+            raise ValueError('Nonfinite UV seam correction field')
+        count+=int(adjacent.sum())
+        if not adjacent.any():
+            continue
+        maximum_l=max(maximum_l,float(np.abs(delta[...,0])[adjacent].max()))
+        values=np.where(adjacent,values,0.)
+        y,x=np.unravel_index(values.argmax(),values.shape)
+        if values[y,x]>maximum:
+            maximum=float(values[y,x]);location=[int(x),int(y),axis]
+    return dict(max_step_deltaE76=maximum,max_step_L=maximum_l,
+                max_step_xy_axis=location,adjacent_pairs=count,
+                scope='added floating Lab field within opaque editable material')
 
 
 def run(job_path):
@@ -161,6 +209,17 @@ def run(job_path):
                 field,_=apply_band(originals[side['name']].shape[:2],side,arc,ss,residual,
                     np.zeros_like(residual),job.get('width_units',.20),job.get('guard_pixels',6))
                 fields[side['name']]+=field
+    limit=job.get('maximum_correction_step_deltaE76',float('inf'))
+    if np.isnan(limit) or limit<=0:
+        raise ValueError('Correction continuity limit must be positive')
+    continuity={}
+    for n,src in originals.items():
+        effective=allows[n]&bands[n]
+        applied=np.where(effective[...,None],fields[n]*weights[n][...,None],0.)
+        continuity[n]=correction_continuity(applied,allows[n]&(src[...,3]>=240))
+        if continuity[n]['max_step_deltaE76']>limit:
+            raise ValueError('UV seam correction field discontinuity on '+n+': '+
+                             str(continuity[n]['max_step_deltaE76'])+' exceeds '+str(limit))
     output.mkdir(parents=True,exist_ok=True);records.mkdir(parents=True,exist_ok=True)
     checks={};outputs={}
     for n,src in originals.items():
@@ -174,7 +233,7 @@ def run(job_path):
         assert digest(job['views'][n]['source'])==hashes[n]
         outputs[n]=rgb_to_lab(saved[...,:3])
         Image.fromarray(effective.astype(np.uint8)*255).save(records/(n+'-seam-mask.png'))
-        checks[n]={'source':job['views'][n]['source'],'source_sha256':hashes[n],'output':str(output/(n+'.png')),'size':list(ims[n].size),'alpha_changed':0,'protected_changed':0,'outside_changed':0,'changed_pixels':int(np.any(saved!=src,axis=-1).sum())}
+        checks[n]={'source':job['views'][n]['source'],'source_sha256':hashes[n],'output':str(output/(n+'.png')),'size':list(ims[n].size),'alpha_changed':0,'protected_changed':0,'outside_changed':0,'changed_pixels':int(np.any(saved!=src,axis=-1).sum()),'correction_continuity':continuity[n]}
     for chain,entry in zip(paired,info):
         arc=chain['arc'];ss=np.linspace(0,arc[-1],192);samples=[]
         metric_valid=np.ones(len(ss),bool)
@@ -187,7 +246,8 @@ def run(job_path):
             metric_valid &= sample(weights[name][...,None],p)[:,0]>.98
         diff=np.linalg.norm(samples[0]-samples[1],axis=-1)[metric_valid]
         entry.update(after_mean_deltaE76=float(diff.mean()),after_p95_deltaE76=float(np.quantile(diff,.95)))
-    report={'seams':info,'checks':checks,'validation_scope':'actual paired mesh UV samples; render separately'}
+    report={'seams':info,'checks':checks,'field_coordinates':'monotone_uv_cross_sections',
+            'validation_scope':'actual paired mesh UV samples; render separately'}
     (records/'validation.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
     (records/'job.json').write_text(json.dumps(job,ensure_ascii=False,indent=2))
     if any(s['after_p95_deltaE76'] > job.get('maximum_p95_deltaE76',float('inf')) for s in info):

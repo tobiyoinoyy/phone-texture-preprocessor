@@ -80,7 +80,8 @@ def run(work, sku, model, output, records):
         views=views, output_dir=str(output), records_dir=str(records/'engine'),
         width_units=.20, sigma=3, guard_pixels=18, protection_feather=0,
         max_lab_shift=[25,15,15], minimum_joint_coverage=.98,
-        maximum_p95_deltaE76=2.0, sampling_refinements=2)
+        maximum_p95_deltaE76=2.0, sampling_refinements=2,
+        maximum_correction_step_deltaE76=3.0)
     write(records/'job.json', job)
     scripts = Path(__file__).resolve().parents[1]/'skills/phone-aluminum-frame-restore/scripts'
     if str(scripts) not in sys.path:

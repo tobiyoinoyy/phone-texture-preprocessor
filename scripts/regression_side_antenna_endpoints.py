@@ -37,7 +37,7 @@ def run(bundle,v1,output,skus,faces=('left','right')):
                 raise ValueError('Frozen side/back landmarks belong to another geometry source')
             indices=cfg['antenna_indices'];source_lines=np.asarray(cfg['source_lines'])
             rows=np.median(source_lines[indices,int(w*.4):int(w*.6)],axis=1)
-            fresh,boundary_proof=auto_structure.per_column_boundaries(im,rows,return_proof=True)
+            fresh,boundary_proof=auto_structure.per_column_boundaries(im,rows,return_proof=True,revision_bands=(1,))
             for i in (2,3):cfg['source_lines'][indices[i]]=fresh[i].tolist()
             cfg['source_boundary_detection']=dict(boundary_proof,revision_bands=[1],upper_mapping_retained=True)
             view=job['views'][0];domains={d['name']:d for d in view['domains']}

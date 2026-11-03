@@ -32,17 +32,11 @@ def run(bundle, output, skus, baseline_ref='7659e67', structure=False):
         landmark_path=bundle/'logs'/sku/'process/cases'/sku/'work/geometry-structure-proposal.json'
         landmarks=json.loads(landmark_path.read_text())
         fresh_landmarks=auto_structure.propose(geometry,coordinate_mode='canvas_pixel_centers')
-        # Keep accepted upper coordinates bit-for-bit. Independently recomputed
-        # SciPy curves can differ by 1e-14 at integer rows across platforms;
-        # casting that harmless float difference to a mask shifts an entire row.
+        # Full reprocessing now checks both bands; the separate lower-only
+        # replay preserves an existing accepted upper mapping explicitly.
         for side in ('left','right'):
             if landmarks[side]['source_sha256']!=review.digest(geometry[side]):
                 raise ValueError('Stored side landmarks belong to another source')
-            for old_i,new_i in zip(landmarks[side]['antenna_indices'][:2],fresh_landmarks[side]['antenna_indices'][:2]):
-                accepted=landmarks[side]['source_lines'][old_i]
-                if not np.allclose(accepted,fresh_landmarks[side]['source_lines'][new_i],atol=1e-10,rtol=0):
-                    raise ValueError('Upper source algorithm unexpectedly changed')
-                fresh_landmarks[side]['source_lines'][new_i]=accepted
         hashes={str(p):review.digest(p) for p in [*geometry.values(),landmark_path]}
         for face in ('right','left'):
             begin=time.perf_counter();source=geometry[face];work=output/sku/face;work.mkdir(parents=True)
@@ -75,11 +69,12 @@ def run(bundle, output, skus, baseline_ref='7659e67', structure=False):
                 if not name.startswith('side_metal_fragment_'):continue
                 try:review.measure_local(dict(scope,local_checks={name:check}),source,work/'before-lighting.png',allowed,paper)
                 except ValueError as error:baseline_rejections[name]=str(error)
-            # Preserve the accepted upper antenna; the lower boundary is now source-corrected.
+            # Record the upper correction rather than treating a known old
+            # material-label artifact as a pixel-invariance requirement.
             antenna=np.zeros(allowed.shape,bool)
             for domain in job['views'][0]['domains']:
                 if domain['name']=='antenna_0':antenna |= np.asarray(Image.open(domain['mask']))>0
-            assert np.array_equal(fixed[antenna],old[antenna])
+            upper_changed=int(np.any(fixed[antenna]!=old[antenna],axis=1).sum())
             review.evidence_images(scope,source,fixed_path,work/'source-vs-fixed')
             review.evidence_images(scope,work/'before-lighting.png',fixed_path,work/'before-vs-fixed')
             # Full-size source/old/new, and source-only material overlays.
@@ -91,7 +86,7 @@ def run(bundle, output, skus, baseline_ref='7659e67', structure=False):
             row=dict(seconds=time.perf_counter()-begin,source_sha256=review.digest(source),
                 cloud_baseline_pixel_equal=cloud_equal,old_hardware_box_count=len(old_proof['hardware_boxes']),
                 new_hardware_component_count=len(proof['hardware_materials']),invariants=invariants,
-                original_upper_antenna_pixels_unchanged=True,lower_antenna_source_boundaries_refreshed=True,local_checks=metrics,old_rejected_checks=baseline_rejections,
+                upper_antenna_changed_pixels=upper_changed,antenna_source_boundaries_refreshed=[0,1],local_checks=metrics,old_rejected_checks=baseline_rejections,
                 validation=validation,visual_acceptance='pending',model_uv_verified=False)
             result['skus'][sku][face]=row;review.write(work/'validation.json',row)
             print(sku,face,round(row['seconds'],3),'s',len(baseline_rejections),'old false partitions rejected',flush=True)

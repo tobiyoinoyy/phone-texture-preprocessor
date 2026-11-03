@@ -24,7 +24,7 @@ from .auto_geometry import frame_geometry,plate_geometry,trim_visible_canvas
 from .auto_material import paper_mask,propose_job,save_mask,lighting_scope
 from .auto_structure import propose
 
-PROFILE='iphone17-aluminum-studio-v9-independent-landmarks-lower-plane'
+PROFILE='iphone17-aluminum-studio-v10-source-material-boundaries'
 _INFERENCE_SLOTS=None
 
 
@@ -47,6 +47,21 @@ def peak_process_memory():
 def write(path,value):
     path=Path(path);temporary=path.with_suffix(path.suffix+'.tmp')
     w.save(temporary,value);temporary.replace(path)
+
+
+def implementation_manifest(repo):
+    """Fingerprint the shipped runtime, including delegated material helpers.
+
+    Installed packages need no Git checkout. Newly added Python modules and
+    frozen recognition/seam resources cannot silently fall outside provenance.
+    """
+    repo=Path(repo);paths=set()
+    for package in ('phone_texture','phone_normalizer','texture_alignment'):
+        paths.update(p for p in (repo/package).rglob('*') if p.is_file() and p.suffix in ('.py','.json','.npz'))
+    paths.update((repo/'scripts').glob('*.py'))
+    for skill in ('phone-aluminum-frame-restore','phone-six-view-restore'):
+        paths.update((repo/'skills'/skill/'scripts').glob('*.py'))
+    return {str(p.relative_to(repo)):w.sha(p) for p in sorted(paths)}
 
 
 def measure_masks(source,output,allowed,paper):
@@ -104,6 +119,7 @@ def process_one(task):
                     matte,info=norm.normalize(raw)
                 stages={}
                 def capture(name,image):stages[name]=image.copy()
+                pre_trim_image=None;analysis_stage='geometry'
                 try:
                     if face in pipeline.FRAMES:
                         image,evidence=frame_geometry(matte,face,capture,source_image=raw)
@@ -111,13 +127,24 @@ def process_one(task):
                         paper,paper_info=paper_mask(matte,face)
                         image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw)
                         evidence['source_paper_proposal']=paper_info
+                    pre_trim_image=image
+                    analysis_stage='paper_before_visible_canvas_trim'
+                    tight_paper,_=paper_mask(image,face)
+                    analysis_stage='visible_canvas_trim'
+                    image,tight_proof=trim_visible_canvas(image,tight_paper)
                 except Exception:
                     failed=records/'failed-source-analysis';failed.mkdir(exist_ok=True)
                     matte.save(failed/(face+'-matte.png'))
-                    write(failed/(face+'.json'),dict(source=item['source'],source_sha256=item['sha256']))
+                    failure=dict(source=item['source'],source_sha256=item['sha256'],analysis_stage=analysis_stage)
+                    if pre_trim_image is not None:
+                        failed_image=failed/(face+'-geometry-before-final-trim.png')
+                        pre_trim_image.save(failed_image)
+                        failure.update(geometry_source_image=str(failed_image),
+                            geometry_source_sha256=w.sha(failed_image),
+                            geometry_source_size=list(pre_trim_image.size),
+                            coordinate_space='post_geometry_before_visible_canvas_trim')
+                    write(failed/(face+'.json'),failure)
                     raise
-                tight_paper,_=paper_mask(image,face)
-                image,tight_proof=trim_visible_canvas(image,tight_paper)
                 evidence['visible_canvas_trim']=tight_proof
                 evidence['output_size']=list(image.size)
                 p=folder/(face+'.png');image.save(p)
@@ -247,8 +274,7 @@ def run(source,work=None,output=None,*,jobs=2,device='auto',skus=None,single_nam
         final_visual_review_included_in_processing_time=False,model_uv_verified=False,
         frame_seam_model=model,frame_seam_model_sha256=model_data['model_sha256'])
     repo=Path(__file__).resolve().parents[1]
-    protocol['implementation_sha256']={str(p.relative_to(repo)):w.sha(p) for p in
-        sorted([*repo.glob('phone_texture/auto*.py'),repo/'phone_texture/top_frame.py',repo/'skills/phone-aluminum-frame-restore/scripts/harmonize_aluminum.py',repo/'skills/phone-aluminum-frame-restore/scripts/match_uv_seams.py',repo/'phone_texture/frame_seams.py',*repo.glob('phone_texture/seam_profiles/*.json')])}
+    protocol['implementation_sha256']=implementation_manifest(repo)
     write(work/'protocol.json',protocol)
     tasks=[(n,str(source if is_single else source/n),str(work/'cases'/n),device,cpu_threads,model) for n in names]
     result=[]
