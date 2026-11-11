@@ -364,7 +364,7 @@ def source_paper_tail(a,paper,proof,physical_end=None):
         alpha_unchanged=True,added_paper_pixels=int((result&~paper).sum()),removed_metal_pixels=int((paper&~result).sum())))
 
 
-def paper_mask(image,face,resolve_end=True):
+def paper_mask(image,face,resolve_end=True,source_tail=True):
     a=np.array(image.convert('RGBA'));h,w=a.shape[:2];rgb=a[...,:3]
     mask=np.zeros((h,w),bool)
     if face not in ('back','bottom'):return mask,dict(method='profile_no_label_face',components=[])
@@ -413,14 +413,14 @@ def paper_mask(image,face,resolve_end=True):
             return mask,dict(method='unresolved_source_label_fit_hint',reason=str(error),pixel_protection=False)
         if recovered is not None:
             if not resolve_end:return recovered,dict(proof,usage='material_fit_exclusion_only',pixel_protection=False)
-            return source_paper_tail(a,recovered,proof) if face=='back' else (recovered,proof)
+            return source_paper_tail(a,recovered,proof) if face=='back' and source_tail else (recovered,proof)
     proof=dict(method='white_paper_component_with_enclosed_print_v1',components=selected)
     if face=='bottom' and len(source_strip_edges)==1:
         proof['source_strip_edges']=source_strip_edges[0]
         proof['paper_side_evidence']='current_source_white_component_margin_fits_with_enclosed_print'
     if not resolve_end:return mask,dict(proof,usage='material_fit_exclusion_only',pixel_protection=False)
     if face=='bottom' and mask.any():mask,proof=trim_strip_to_source_end(a,mask,proof)
-    if face=='back' and mask.any():mask,proof=source_paper_tail(a,mask,proof)
+    if face=='back' and source_tail and mask.any():mask,proof=source_paper_tail(a,mask,proof)
     return mask,proof
 
 

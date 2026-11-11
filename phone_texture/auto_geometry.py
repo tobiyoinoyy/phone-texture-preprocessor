@@ -354,7 +354,7 @@ def frame_rails(rgba,source_rgb=None):
         top_rail=top.tolist(), bottom_rail=bottom.tolist())
 
 
-def frame_geometry(matte, face, stage_sink=None,source_image=None):
+def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_support_edge=True):
     a=np.array(matte.convert('RGBA')); original=a.copy()
     raw=np.array(source_image.convert('RGB')) if source_image else None
     if face == 'top':
@@ -372,7 +372,7 @@ def frame_geometry(matte, face, stage_sink=None,source_image=None):
     # body. Ambiguous source/alpha agreement keeps the conservative proposal
     # and remains explicitly unresolved for geometry review.
     lower_allowance = 1.
-    if face in ('left', 'right'):
+    if face in ('left', 'right') and separate_support_edge:
         agreed = (proof['rgb_boundary_error_px'] <= 1. and
                   proof['rgb_boundary_residual_p95_px'] <= 1.)
         if agreed:

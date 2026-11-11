@@ -11,7 +11,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     command = sub.add_parser('auto', help='仅原图：自动生成铝材六面候选、材料范围和本机背面天线标记（需最终视觉验收）')
     command.add_argument('input', type=Path)
-    command.add_argument('--model', required=True, choices=('iphone17pro','iphone17promax'), help='导出贴图对应的固定 UV 模型')
+    command.add_argument('--model', required=True, choices=('iphone17','iphone17pro','iphone17promax'), help='手机型号；iphone17（标准版）使用独立玻璃背板流程，需单组六面并经独立复核发布')
     command.add_argument('--work', type=Path, help='过程目录；省略时自动创建独立目录')
     command.add_argument('--output', type=Path, help='六面候选目录；省略时自动创建独立目录')
     command.add_argument('--bottom-alignment',choices=('appearance','off'),default='appearance',help='底面按可见结构校正；不能可靠校正时保留原底面并继续')
@@ -125,6 +125,14 @@ def main(argv=None):
                     raise ValueError('保存候选清单 SHA-256 需与清单路径一同提供，并为64位小写十六进制')
                 if workspace.sha(args.saved_review_manifest.expanduser().resolve()) != digest:
                     raise ValueError('保存候选清单已改变，未开始处理')
+            if args.model == 'iphone17':
+                # Standard glass-back route: single six-view group, explicit
+                # --work/--output, published only after independent review.
+                from .iphone17 import run as standard_run
+                result = standard_run(args.input,args.work,args.output,single_name=args.single_name,
+                                      device=args.device,cpu_threads=args.cpu_threads)
+                print(json.dumps({k:result.get(k) for k in ('status','processed','total','visual_approved','seconds','output')},ensure_ascii=False,indent=2))
+                return 0 if result['status']=='processed_needs_visual_review' else 2
             from .automatic import run
             result = run(args.input,args.work,args.output,jobs=args.jobs,device=args.device,
                          cpu_threads=args.cpu_threads,skus=args.skus,single_name=args.single_name,
