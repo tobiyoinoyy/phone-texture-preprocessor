@@ -26,6 +26,8 @@
 
 macOS 的首次处理压测可运行 `python scripts/benchmark_automatic.py 原图目录 --records 新目录 --levels 1 3 4`，可选依赖为 `.[benchmark]`。每档重建全部输入分析与六面结果，包含模型加载、证据与文件输出；已安装的模型权重和系统文件缓存可以预热。报告分别列出整批时间/数量、摊销吞吐与单任务延迟，失败不报告成功速度。系统压力与交换空间由主机采样；进程 RSS 求和包含共享页，MPS 数值是推理返回后的单进程快照，不是真实显存峰值。代码指纹中途改变即停止对比；不把自动候选耗时称为最终人员验收耗时。
 
+每台任务的 `result.json` 中，`peak_process_rss_bytes` 统一为字节：Linux 的 `ru_maxrss` 原值按 KiB 乘 1024，macOS 原值已是字节。`peak_process_rss_measurement` 保留原值、原单位、平台与采集范围；未核实单位的平台返回 `null` 字节值。该数是工作进程自启动以来的 RSS 高水位，复用工作进程时可能包含前一台任务，不是本 SKU 独立峰值、进程树总峰值或 GPU 显存。修复前的 Linux 报告在这个 bytes 字段内存的是 KiB；历史文件不自动改写，比较时须按运行平台和代码版本明确换算。单位依据：[Linux getrusage(2)](https://man7.org/linux/man-pages/man2/getrusage.2.html)、[Apple XNU getrusage(2)](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/getrusage.2)。
+
 ## 默认基准
 
 默认 `back_image`：每个待处理 SKU 的背面分别约束该 SKU 左右侧上下天线四条边界，侧面天线保持横向平直。按钮独立标定，不能从天线位置推断。SPU 批次包含多 SKU 时也不共享背面坐标。

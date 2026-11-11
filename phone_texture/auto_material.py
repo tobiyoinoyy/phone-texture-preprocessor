@@ -11,6 +11,8 @@ from PIL import Image
 from pathlib import Path
 from .geometry_review import digest
 
+REAR_GAMUT_CONTINUITY_STEP_L = .6
+
 
 def red_markers(a):
     h,w=a.shape[:2];hsv=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2HSV)
@@ -23,7 +25,7 @@ def red_markers(a):
     return result
 
 
-def seeded_paper(a,face):
+def seeded_paper(a,face,resolve_end=True):
     """Recover printed paper on pale metal using print seeds + local background.
 
     The printed QR/vertical text locates the current label. GrabCut classifies
@@ -194,11 +196,11 @@ def seeded_paper(a,face):
         strip_edges=[line.tolist() for line in fitted]
     proof=dict(method='printed_seed_local_background_grabcut_v1',cue=cue,
         seed_box=seed_box,analysis_roi=[x0,y0,x1,y1],pixels=int(result.sum()),source_strip_edges=strip_edges)
-    if face=='bottom':result,proof=trim_strip_to_source_end(a,result,proof,font)
+    if face=='bottom' and resolve_end:result,proof=trim_strip_to_source_end(a,result,proof,font)
     return result,proof
 
 
-def trim_strip_to_source_end(a,paper,proof,font=None):
+def _trim_strip_marker_end(a,paper,proof,font=None):
     """Resolve the physical paper end; do not freeze the metal below a label."""
     h,w=paper.shape;font=float(font or h*.13)
     markers=[v for v in red_markers(a) if paper[min(h-1,int(v[0])),min(w-1,int(v[1]))]]
@@ -225,7 +227,144 @@ def trim_strip_to_source_end(a,paper,proof,font=None):
     return result,dict(proof,source_paper_end=end,red_marker=[cx,cy,bw,bh],source_end_gradient=float(profile[peak]))
 
 
-def paper_mask(image,face):
+def trim_strip_to_source_end(a,paper,proof,font=None):
+    """Prefer unchanged source closures; retry source-aligned independent proof."""
+    from .bottom_paper_audit import guard_bottom_paper_end
+    try:
+        result,info=_trim_strip_marker_end(a,paper,proof,font)
+        if (info.get('source_paper_end')=='unresolved_no_marker' and info.get('source_strip_edges')
+                and proof.get('method')!='white_paper_component_with_enclosed_print_v1'):
+            from .bottom_paper_closure import resolve_unmarked_strip_end
+            result,info=resolve_unmarked_strip_end(a,result,info)
+        return guard_bottom_paper_end(a,result,info)
+    except ValueError as original_error:
+        if not proof.get('source_strip_edges'):raise
+        from .bottom_paper_closure import resolve_aligned_strip_end
+        try:
+            result,info=resolve_aligned_strip_end(a,paper,proof)
+            return guard_bottom_paper_end(a,result,info)
+        except ValueError as aligned_error:
+            raise ValueError('Bottom paper end unresolved: '+str(original_error)+
+                '; source-aligned proof: '+str(aligned_error)) from aligned_error
+
+
+def source_paper_tail(a,paper,proof,physical_end=None):
+    """Resolve the printed back-label stem through the body's dark turn.
+
+    White-component and GrabCut masks are seeds, not physical paper edges:
+    both can collapse to isolated ink when the paper enters the body shadow.
+    Fit the two visible source sides independently, then require printed
+    source detail at the terminal rows before carrying those sides onward.
+    Only alpha-visible pixels between these measured sides become paper.
+    """
+    from phone_normalizer.frame_strip import _line
+    canvas_h,w=paper.shape;ys,xs=np.nonzero(paper)
+    if not len(ys):return paper,proof
+    # Raw photographs contain the stand and blank canvas below the phone.
+    # Geometry supplies its independently measured body contact plane; a
+    # tight texture instead ends at its already reviewed visible canvas.
+    ends=np.full(w,float(canvas_h)) if physical_end is None else np.asarray(physical_end,dtype=float).reshape(-1)
+    if ends.shape!=(w,) or not np.isfinite(ends).all():
+        raise ValueError('Paper tail requires one finite physical end per source column')
+    h=min(canvas_h,int(np.ceil(np.max(ends[int(xs.min()):int(xs.max())+1]))))
+    if h<=0:raise ValueError('Paper tail physical end lies outside source foreground')
+    first,last=int(ys.min()),int(ys.max());height=last-first+1
+    if physical_end is not None and last>h+2:
+        # A caller-supplied paper tail already crossing the phone contour is
+        # not a missing-contact reconstruction. Preserve its source mask.
+        return paper,dict(proof,source_paper_tail=dict(status='existing_paper_crosses_body_contact'))
+    if last<h-3:
+        edge=np.flatnonzero(paper[last])
+        if len(edge)>max(8,.015*w) and len(edge)/(edge[-1]-edge[0]+1)>.9:
+            lo,hi=int(edge[0]),int(edge[-1]);cols=np.arange(lo+2,hi-1)
+            outside=np.r_[np.arange(max(0,lo-8),max(0,lo-3)),np.arange(min(w,hi+4),min(w,hi+9))]
+            if len(cols)>=8 and len(outside)>=8:
+                before=np.median(a[max(first,last-2):last+1,cols,:3].astype(float),axis=0)
+                after=np.median(a[last+1:last+4,cols,:3].astype(float),axis=0)
+                metal=np.median(a[last+1:last+4,outside,:3].astype(float),axis=(0,1))
+                transition=np.linalg.norm(before-after,axis=1)
+                # An actual closed label may end above the body. Its complete
+                # transverse RGB transition and newly exposed adjacent metal
+                # provide evidence to keep the original mask, without fitting
+                # a nonexistent continuation down to the canvas.
+                metal_error=np.linalg.norm(after-metal,axis=1)
+                if np.mean(transition>3)>=.75 and np.percentile(metal_error,75)<=max(3.,np.median(transition)*.25):
+                    return paper,dict(proof,source_paper_tail=dict(status='source_closed_label',
+                        source_end_row=last,transition_support=float(np.mean(transition>3)),
+                        exposed_metal_error_p75=float(np.percentile(metal_error,75))))
+    if last<h-max(20,.10*height):
+        return paper,dict(proof,source_paper_tail=dict(status='label_ends_before_body_contact'))
+    if physical_end is not None:
+        # Once geometry has independently located the real end, a variable
+        # GrabCut ink fragment must not decide the source fitting interval.
+        last=h-1;height=h-first
+    start=int(first+.65*height);stop=last-max(10,int(.07*height));rows=np.arange(start,stop)
+    if len(rows)<16:raise ValueError('Paper tail has insufficient source rows')
+    lefts=[];rights=[]
+    for row in rows[:max(12,len(rows)//4)]:
+        xx=np.flatnonzero(paper[row])
+        if len(xx)>6 and len(xx)/(xx[-1]-xx[0]+1)>.9:
+            lefts.append(xx[0]);rights.append(xx[-1])
+    if len(lefts)<8:raise ValueError('Paper tail lacks a continuous printed-label seed')
+    prior=[float(np.median(lefts)),float(np.median(rights))];width=prior[1]-prior[0]
+    if not .015*w<width<.18*w:raise ValueError('Paper tail is not independently separated from the body')
+    gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY).astype(float)
+    gradient=np.gradient(ndimage.gaussian_filter(gray,(.6,.7)),axis=1)
+    fitted=[];evidence=[];middle=float(np.median(rows));radius=max(7,int(width*.17))
+    for center,sign in zip(prior,[1,-1]):
+        centers=np.arange(max(1,int(center)-radius),min(w-2,int(center)+radius+1));best=None
+        for slope in np.linspace(-.16,.16,65):
+            columns=np.rint(centers[None,:]+slope*(rows[:,None]-middle)).astype(int)
+            values=sign*gradient[rows[:,None],columns]
+            weight=np.exp(-.5*((centers-center)/(radius*.8))**2)
+            score=(np.median(values,axis=0)+.35*np.percentile(values,25,axis=0))*weight
+            index=int(score.argmax());candidate=(float(score[index]),float(slope),float(centers[index]))
+            if best is None or candidate[0]>best[0]:best=candidate
+        strength,slope,center=best;predicted=center+slope*(rows-middle)
+        columns=np.rint(predicted[:,None]+np.arange(-2,3)).astype(int)
+        values=sign*gradient[rows[:,None],columns]
+        measured=columns[np.arange(len(rows)),np.argmax(values,axis=1)];good=values.max(axis=1)>.7
+        if good.mean()<.6:raise ValueError('Paper tail side lacks independent source contrast')
+        line,keep,error=_line(rows[good]+.5,measured[good].astype(float))
+        if error>2.5 or keep.mean()<.6:raise ValueError('Paper tail side is not independently resolved')
+        fitted.append(line);evidence.append(dict(coefficients=line.tolist(),source_support=float(good.mean()),
+            residual_p95=float(error),median_strength=strength))
+    yy=np.arange(start,h)[:,None];xx=np.arange(w)[None,:]
+    left=np.polyval(fitted[0],yy+.5)-.6;right=np.polyval(fitted[1],yy+.5)+.6
+    if np.any(right-left<width*.65) or np.any(right-left>width*1.35):
+        raise ValueError('Paper tail source boundaries cross or diverge')
+    # The terminal paper must still contain source print. A short label that
+    # ends above the contact cannot turn a fitted strip of metal into paper.
+    detail=ndimage.gaussian_filter1d(gray,3,axis=1)-gray
+    terminal_rows=np.arange(max(start,h-max(12,min(32,int(.08*height)))),h)
+    inside=[];outside=[];visible_rows=0;printed_rows=0
+    for row in terminal_rows:
+        lo,hi=[int(round(np.polyval(line,row+.5))) for line in fitted]
+        core=detail[row,max(0,lo+3):min(w,hi-2)]
+        visible=a[row,max(0,lo+3):min(w,hi-2),3]>=128
+        visible &= row<=ends[max(0,lo+3):min(w,hi-2)]
+        if visible.sum()<8:continue
+        core=core[visible];visible_rows+=1;printed_rows+=int(np.sum(core>8)>=3)
+        inside.extend(core.tolist())
+        outside.extend(detail[row,max(0,lo-15):max(0,lo-4)].tolist())
+        outside.extend(detail[row,min(w,hi+5):min(w,hi+16)].tolist())
+    if (visible_rows<8 or printed_rows<visible_rows*.6 or not outside
+            or np.percentile(inside,95)<np.percentile(outside,95)+3):
+        raise ValueError('Paper tail continuation lacks independent terminal print evidence')
+    result=paper.copy();region=(xx>=left)&(xx<=right)&(a[start:h,:,3]>0)
+    if physical_end is not None:region &= yy<=ends[None,:]
+    vicinity=(xx>=min(prior)-radius*2)&(xx<=max(prior)+radius*2)
+    result[start:h]=np.where(vicinity,region,result[start:h])
+    return result,dict(proof,pixels=int(result.sum()),source_paper_tail=dict(
+        method='printed_tail_source_side_consensus_v1',source_rows=[start,stop],sides=evidence,
+        physical_end_source='independent_body_contact_plane' if physical_end is not None else 'tight_visible_canvas',
+        physical_end_at_label=[float(ends[int(np.clip(v,0,w-1))]) for v in prior],
+        terminal_visible_rows=visible_rows,terminal_printed_rows=printed_rows,
+        terminal_print_p95=float(np.percentile(inside,95)),adjacent_metal_print_p95=float(np.percentile(outside,95)),
+        alpha_unchanged=True,added_paper_pixels=int((result&~paper).sum()),removed_metal_pixels=int((paper&~result).sum())))
+
+
+def paper_mask(image,face,resolve_end=True):
     a=np.array(image.convert('RGBA'));h,w=a.shape[:2];rgb=a[...,:3]
     mask=np.zeros((h,w),bool)
     if face not in ('back','bottom'):return mask,dict(method='profile_no_label_face',components=[])
@@ -241,7 +380,7 @@ def paper_mask(image,face):
     if not len(body_x):raise ValueError('Paper detection requires visible phone foreground')
     body_left,body_right=int(body_x[0]),int(body_x[-1]);body_width=body_right-body_left
     n,labels,stats,centroids=cv2.connectedComponentsWithStats(white.astype(np.uint8),8)
-    selected=[]
+    selected=[];source_strip_edges=[]
     for i in range(1,n):
         x,y,bw,bh,area=map(int,stats[i]);cx,cy=centroids[i]
         if area<max(20,.00012*h*w) or not .18*w<cx<.82*w:continue
@@ -263,14 +402,25 @@ def paper_mask(image,face):
             widths=rights-lefts+1;good=widths>=np.percentile(widths,65)
             if good.sum()<max(8,h*.2):continue
             lfit=np.polyfit(unique[good],lefts[good],1);rfit=np.polyfit(unique[good],rights[good],1)
+            source_strip_edges.append([lfit.tolist(),rfit.tolist()])
             yy=np.arange(h)[:,None];xx=np.arange(w)[None,:]
             polygon=((xx>=np.polyval(lfit,yy)-.5)&(xx<=np.polyval(rfit,yy)+.5)&(a[...,3]>0)).astype(np.uint8)
         mask|=polygon>0;selected.append(dict(box=[x,y,x+bw,y+bh],white_pixels=area,ink_pixels=int(ink.sum())))
     if not mask.any():
-        recovered,proof=seeded_paper(a,face)
-        if recovered is not None:return recovered,proof
+        try:recovered,proof=seeded_paper(a,face,resolve_end=resolve_end)
+        except ValueError as error:
+            if resolve_end:raise
+            return mask,dict(method='unresolved_source_label_fit_hint',reason=str(error),pixel_protection=False)
+        if recovered is not None:
+            if not resolve_end:return recovered,dict(proof,usage='material_fit_exclusion_only',pixel_protection=False)
+            return source_paper_tail(a,recovered,proof) if face=='back' else (recovered,proof)
     proof=dict(method='white_paper_component_with_enclosed_print_v1',components=selected)
+    if face=='bottom' and len(source_strip_edges)==1:
+        proof['source_strip_edges']=source_strip_edges[0]
+        proof['paper_side_evidence']='current_source_white_component_margin_fits_with_enclosed_print'
+    if not resolve_end:return mask,dict(proof,usage='material_fit_exclusion_only',pixel_protection=False)
     if face=='bottom' and mask.any():mask,proof=trim_strip_to_source_end(a,mask,proof)
+    if face=='back' and mask.any():mask,proof=source_paper_tail(a,mask,proof)
     return mask,proof
 
 
@@ -380,9 +530,19 @@ def rear_panel(image):
             xx=x+sx*r*(1-np.cos(angles));yy=y+sy*r*(1-np.sin(angles))
             scores.append(float(ndimage.map_coordinates(ridge,[yy,xx],order=1).mean()))
         radius=int(radii[np.argmax(scores)])
-        if max(scores)<2 or radius in (radii[0],radii[-1]):
-            raise ValueError('Rear panel corner lacks source seam support')
-        corners.append(dict(radius=radius,mean_seam_evidence=max(scores)))
+        supported=not (max(scores)<2 or radius in (radii[0],radii[-1]))
+        corners.append(dict(radius=radius,mean_seam_evidence=max(scores),supported=supported))
+    # Lighting direction can make one seam corner read bright instead of dark.
+    # With all four edges and three corners measured, borrow the radius of the
+    # mirrored corner on the same row (same y, so perspective keystone matches).
+    # Two or more weak corners still reject: the panel is then not measured.
+    weak=[i for i,c in enumerate(corners) if not c['supported']]
+    if len(weak)>1 or (weak and min(ls,rs,ts,bs)<2):
+        raise ValueError('Rear panel corner lacks source seam support')
+    for i in weak:
+        partner=corners[i^1]
+        corners[i].update(measured_radius=corners[i]['radius'],radius=partner['radius'],
+                          radius_source='mirrored_same_row_corner')
     # Fit corners independently: perspective can expose different radii.
     yy,xx=np.indices((h,w));panel=(xx>=left)&(xx<=right)&(yy>=top)&(yy<=bottom)
     for (x,y,sx,sy),c in zip([(left,top,1,1),(right,top,-1,1),(left,bottom,1,-1),(right,bottom,-1,-1)],corners):
@@ -439,16 +599,97 @@ def rear_body_contour(image):
     if np.any(virtual.sum(axis=1)[rows]<w*.75):raise ValueError('Rear body contour width is inconsistent')
     return virtual,proof
 
-def propose_job(source,face,folder,companions=None,landmarks=None):
+def rear_camera_glass(a, remaining):
+    """Separate interior camera components from dark outer-body fragments.
+
+    Camera glass on this rear-view capture is enclosed by opaque phone pixels.
+    A round bounding box alone cannot authenticate a silhouette arc as glass.
+    The one-pixel neighbourhood tests source separation, not a protected rim.
+    """
+    h,w=a.shape[:2]
+    gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
+    upper=np.zeros((h,w),bool);upper[:int(h*.30)]=True
+    dark=(gray<max(35,float(np.percentile(gray[remaining&upper],15))))&remaining&upper
+    n,labels,stats,_=cv2.connectedComponentsWithStats(dark.astype(np.uint8),8)
+    glass=np.zeros((h,w),bool)
+    interior=ndimage.binary_erosion(a[...,3]>=240,border_value=0)
+    accepted=[];outer_fragments=[]
+    for i in range(1,n):
+        x,y,bw,bh,area=map(int,stats[i])
+        if .025*w<bw<.35*w and .025*w<bh<.35*w and .5<bw/max(1,bh)<2 and area>40:
+            component=ndimage.binary_fill_holes(labels==i)
+            outer=int(np.count_nonzero(component&~interior))
+            evidence=dict(box=[x,y,bw,bh],source_component_pixels=area,
+                          filled_pixels=int(component.sum()),outer_neighbourhood_pixels=outer)
+            if outer:
+                outer_fragments.append(evidence)
+                continue
+            glass|=component;accepted.append(evidence)
+    return glass,dict(method='source_interior_camera_components_v2',
+                      accepted=accepted,rejected_outer_fragments=outer_fragments)
+
+
+def _independent_rear_material_reference(image,side,edge,source):
+    """Classify rear plastic from this rear image; certify no side geometry.
+
+    Use the existing stricter no-width-prior, three-window consensus. A side's
+    unresolved terminal pixels are not evidence against a visible rear strip.
+    """
+    from .auto_structure import _rear_reference
+    rows,_,columns,proof=_rear_reference(image,side,edge,None,3,per_band=True)
+    return rows,columns,dict(proof,
+        material_reference_basis='current_rear_three_window_consensus',
+        rear_source_sha256=digest(source),side_width_prior_used=False,
+        structural_alignment_certified=False)
+
+
+def propose_job(source,face,folder,companions=None,landmarks=None,protection_policy='sticker_only'):
     """Create fresh material masks/reference boxes for one geometry candidate."""
     from .auto_structure import antenna_rows,per_column_boundaries,hardware_ranges
     image=Image.open(source).convert('RGBA');a=np.array(image);h,w=a.shape[:2]
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=False)
-    visible=a[...,3]>0;paper,paper_proof=paper_mask(image,face)
-    if face in ('back','bottom') and not paper.any():
+    if protection_policy not in ('sticker_only','none'):raise ValueError('Unknown automatic protection policy')
+    visible=a[...,3]>0;label_fit=np.zeros((h,w),bool);label_fit_proof=None;label_hint=None
+    if protection_policy=='none' and face=='bottom':
+        # User decision 2026-11-05: the bottom paper tail is lit together with
+        # the frame metal. No paper/metal boundary is searched, so low-contrast
+        # silver frames are no longer rejected for an unresolved paper end.
+        paper=np.zeros((h,w),bool)
+        paper_proof=dict(method='bottom_paper_lit_with_frame_metal',protected_pixels=0)
+        # A rough location only keeps bright paper out of the metal reference
+        # samples; it is never an edit boundary and needs no closed contour.
+        try:hint,_=paper_mask(image,face,resolve_end=False)
+        except ValueError:hint=np.zeros((h,w),bool)
+        bottom_fit_exclusion=ndimage.binary_dilation(hint,iterations=4) if hint.any() else hint
+        paper_proof['fit_exclusion_hint_pixels']=int(hint.sum())
+    elif protection_policy=='none':
+        label_fit,label_fit_proof=paper_mask(image,face,resolve_end=False)
+        if face=='bottom' and label_fit.any():
+            from .bottom_paper_closure import resolve_material_strip_end
+            label_hint=label_fit.copy()
+            try:
+                label_fit,label_fit_proof=resolve_material_strip_end(a,label_fit,label_fit_proof)
+                if label_fit_proof.get('material_boundary_resolution') == 'unresolved_no_source_cross_edge':
+                    # A returned unresolved hint must reach the independent
+                    # material proposal path; it is never an accepted domain.
+                    raise ValueError('Bottom paper material boundary unresolved: '+
+                        label_fit_proof.get('material_boundary_warning', 'unresolved source cross edge'))
+            except ValueError as original_error:
+                if not str(original_error).startswith('Bottom paper material boundary unresolved:'):
+                    raise
+                # A tight source crop may lack the old three-row metal window.
+                # Independently measure a closed paper boundary and frame on
+                # this source. Canny peer avoidance is not a material verdict.
+                from .source_material_bridge import resolve_current_source_material
+                label_fit,label_fit_proof=resolve_current_source_material(
+                    source,label_hint,label_fit_proof,folder/'source-contour-material',
+                    legacy_error=str(original_error))
+        paper=np.zeros((h,w),bool);paper_proof=dict(method='no_pixel_protection_zones',protected_pixels=0)
+    else:paper,paper_proof=paper_mask(image,face)
+    if protection_policy!='none' and face in ('back','bottom') and not paper.any():
         raise ValueError('This QC studio profile requires a resolved printed paper label on back/bottom')
     paper &= visible;paper_path=save_mask(folder/'paper.png',paper)
-    remaining=visible&~paper;materials=[];proof={'paper':paper_proof}
+    remaining=visible&~paper;materials=[];proof={'paper':paper_proof};fit_masks={}
     if face=='front':
         remaining,rim=front_metal(image);remaining &= ~paper;proof['front_rim']=rim
     if face in ('left','right'):
@@ -457,54 +698,85 @@ def propose_job(source,face,folder,companions=None,landmarks=None):
             if cfg['source_sha256']!=digest(source):raise ValueError('Material landmarks belong to another source')
             lines=np.asarray(cfg['source_lines'])[cfg['antenna_indices']]
             rows=np.median(lines[:,int(w*.4):int(w*.6)],axis=1)
-            antenna_proof=dict(cfg['source_detection'],shared_geometry_landmarks=True)
+            # Revalidate with independently detected source seeds. Feeding the
+            # already-smoothed curves back as new seeds can select a neighboring
+            # peak and falsely reject this detector's own frozen proposal.
+            detection=image
+            if cfg.get('antenna_source_evidence'):
+                from .source_antenna_evidence import load
+                detection=load(cfg['antenna_source_evidence'],source,face)
+            from .auto_structure import frozen_source_rows
+            source_rows=frozen_source_rows(detection,[int(w*.4),int(w*.6)],cfg)
+            supported,boundary_proof=per_column_boundaries(detection,source_rows,return_proof=True)
+            if np.max(np.abs(lines-supported))>2.5:
+                raise ValueError('Frozen antenna boundaries disagree with paired source material edges; regenerate geometry landmarks')
+            antenna_proof=dict(cfg['source_detection'],shared_geometry_landmarks=True,boundary_detection=boundary_proof)
         else:
-            rows,signs,antenna_proof=antenna_rows(image,[int(w*.4),int(w*.6)])
-            lines=per_column_boundaries(image,rows)
+            rows,signs,antenna_proof=antenna_rows(image,[int(w*.4),int(w*.6)],require_full_span=True)
+            lines,boundary_proof=per_column_boundaries(image,rows,return_proof=True)
+            antenna_proof=dict(antenna_proof,boundary_detection=boundary_proof)
         yy=np.arange(h)[:,None]
         for i in range(2):
             region=(yy>=lines[2*i])&(yy<lines[2*i+1])&remaining
             materials.append(('antenna_'+str(i),region,[max(6,(rows[2*i+1]-rows[2*i])*.30),max(8,w*.20)]))
             remaining &= ~region
         buttons,boxes=hardware_ranges(image);proof.update(antenna=antenna_proof,hardware_boxes=boxes)
-        # Complete detected hardware has its own material/reference, including
-        # dark glass control surfaces. It is not a frozen pixel rectangle.
-        hw=np.zeros((h,w),bool)
-        for x0,y0,x1,y1 in boxes:
-            hw[y0:y1,x0:x1]=True
-        hw &= remaining
-        if hw.sum()>=30:materials.append(('hardware',hw,[max(6,h*.012),max(2,w*.08)]));remaining &= ~hw
+        # Structural locking boxes intentionally include weak edge fragments;
+        # they must never be used as material labels or independent color islands.
+        from .side_material import hardware_materials
+        components=hardware_materials(image,face);hw=np.zeros((h,w),bool)
+        proof['hardware_materials']=[]
+        for index,(region,component_proof) in enumerate(components):
+            if np.any(region&~remaining):raise ValueError('Hardware material crosses antenna/paper')
+            name=f'hardware_{index}';hw |= region
+            materials.append((name,region,[max(6,h*.012),max(2,w*.08)]))
+            # Fit each component from its own interior; a groove or a separate
+            # dark control cannot determine another button's illumination.
+            depth=ndimage.distance_transform_edt(region)
+            fit_masks[name]=region&(depth>max(3.,w*.045))
+            proof['hardware_materials'].append(dict(name=name,**component_proof))
+        remaining &= ~hw
+        fit_masks['main_surface']=remaining&~ndimage.binary_dilation(hw,iterations=max(2,int(w*.025)))
     if face=='back':
         # Camera glass/flash components are distinct from aluminum and do not
         # enter metal fitting. Shape + position are required, not darkness alone.
-        gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY);upper=np.zeros((h,w),bool);upper[:int(h*.30)]=True
-        dark=(gray<max(35,float(np.percentile(gray[remaining&upper],15))))&remaining&upper
-        n,labels,stats,_=cv2.connectedComponentsWithStats(dark.astype(np.uint8),8);glass=np.zeros((h,w),bool)
-        for i in range(1,n):
-            x,y,bw,bh,area=map(int,stats[i])
-            if .025*w<bw<.35*w and .025*w<bh<.35*w and .5<bw/max(1,bh)<2 and area>40:
-                glass|=ndimage.binary_fill_holes(labels==i)
+        glass,glass_proof=rear_camera_glass(a,remaining)
         remaining &= ~glass;proof['camera_glass_pixels']=int(glass.sum())
+        proof['camera_glass_source_separation']=glass_proof
         body_contour,body_proof=rear_body_contour(image)
         body_path=save_mask(folder/'body-contour.png',body_contour);proof['rear_body_contour']=body_proof
         distance=ndimage.distance_transform_edt(np.pad(a[...,3]>=128,1))[1:-1,1:-1];rim=remaining&(distance<=max(8,w*.035))
         # Rear plastic antenna bars must never enter the aluminum illumination
-        # field. Locate them before lighting from this same fresh SKU's side
-        # widths and independently agreeing rear RGB strips.
-        from .auto_structure import body_rows,rear_reference
-        if companions is None:raise ValueError('Current same-SKU geometry companions required for rear material classification')
+        # field. Reuse complete frozen source evidence when available; otherwise
+        # classify from this rear image's existing three-window consensus.
+        # This material-only path does not certify a side antenna or alignment.
+        complete_landmarks=landmarks is not None and all(side in landmarks for side in ('left','right'))
+        if complete_landmarks and companions is None:
+            raise ValueError('Current same-SKU geometry companions required for rear material classification')
         middle=a[int(h*.25):int(h*.75),:,3]>=128
         left=int(np.median(np.argmax(middle,axis=1)));right=int(np.median(w-1-np.argmax(middle[:,::-1],axis=1)))
-        rear_proof={};yy=np.arange(h)[:,None];xx=np.arange(w)[None,:];back_body=body_rows(image)
+        rear_proof={};yy=np.arange(h)[:,None];xx=np.arange(w)[None,:]
         for side in ('left','right'):
-            side_image=Image.open(companions[side]).convert('RGBA');sw=side_image.width
-            rows,_,_=antenna_rows(side_image,[int(sw*.4),int(sw*.6)]);body=body_rows(side_image)
-            expected=float(np.mean([rows[1]-rows[0],rows[3]-rows[2]])*(back_body[1]-back_body[0])/(body[1]-body[0]))
-            if landmarks is not None:
-                ref=landmarks[side]['back']
+            if complete_landmarks:
+                side_image=Image.open(companions[side]).convert('RGBA');sw=side_image.width
+                side_cfg=landmarks[side]
+                if side_cfg['source_sha256']!=digest(companions[side]):raise ValueError('Rear companion landmarks belong to another side source')
+                detection=side_image
+                if side_cfg.get('antenna_source_evidence'):
+                    from .source_antenna_evidence import load
+                    detection=load(side_cfg['antenna_source_evidence'],companions[side],side)
+                from .auto_structure import frozen_source_rows
+                source_rows=frozen_source_rows(detection,[int(sw*.4),int(sw*.6)],side_cfg)
+                supported,_=per_column_boundaries(detection,source_rows,return_proof=True)
+                frozen=np.asarray(side_cfg['source_lines'])[side_cfg['antenna_indices']]
+                if np.max(np.abs(frozen-supported))>2.5:
+                    raise ValueError('Rear companion frozen boundaries disagree with source evidence')
+                ref=side_cfg['back']
                 if ref['sha256']!=digest(source):raise ValueError('Rear material landmarks belong to another source')
                 br,xr,brproof=ref['antenna_rows'],ref['x_range'],dict(ref['source_detection'],shared_geometry_landmarks=True)
-            else:br,_,xr,brproof=rear_reference(image,side,right if side=='left' else left,expected)
+            else:
+                br,xr,brproof=_independent_rear_material_reference(
+                    image,side,right if side=='left' else left,source)
             side_columns=(xx>w/2) if side=='left' else (xx<w/2)
             for i in range(2):
                 region=rim&side_columns&(yy>=br[2*i])&(yy<br[2*i+1])
@@ -512,38 +784,152 @@ def propose_job(source,face,folder,companions=None,landmarks=None):
                 materials.append((f'rear_antenna_{side}_{i}',region,[max(6,(br[2*i+1]-br[2*i])*.5),max(8,w*.006)]))
                 remaining &= ~region;rim &= ~region
             rear_proof[side]=dict(antenna_rows=br,signal_columns=xr,measurement=brproof,
-                side_geometry_sha256=digest(companions[side]))
+                rear_source_sha256=digest(source),shared_geometry_landmarks=complete_landmarks)
+            if complete_landmarks:
+                rear_proof[side]['side_geometry_sha256']=digest(companions[side])
         proof['rear_plastic_materials']=rear_proof
         if rim.sum()>=30:materials.append(('rear_perimeter',rim,[max(6,h*.012),max(2,w*.004)]));remaining &= ~rim
         panel,panel_proof=rear_panel(image);proof['rear_panel']=panel_proof
         camera=remaining&~panel
         if camera.sum()>=30:materials.append(('camera_surround',camera,[max(6,h*.015),max(6,w*.02)]));remaining &= ~camera
+    if remaining.sum()>=30 and face=='bottom' and protection_policy=='none':
+        fit=remaining&~bottom_fit_exclusion
+        if np.count_nonzero(fit&(a[...,3]>=240))>=20:fit_masks['main_surface']=fit
     if remaining.sum()>=30:
         materials.append(('main_surface',remaining,[max(3,h*.018),max(3,w*.12)] if face in ('left','right','top','bottom') else [max(8,h*.015),max(8,w*.025)]))
+    label_components=[]
+    if protection_policy=='none' and label_fit.any():
+        from .lighting import engine
+        render=engine('aluminum');revised=[]
+        for name,region,sigma in materials:
+            source_fit=fit_masks.get(name,region)&~label_fit&(a[...,3]>=240)
+            label_part=region&label_fit
+            # Previously protected paper can be a thin continuation of a
+            # Gaussian material field with no local metal fit. Give only such
+            # source-label parts their own source-sampled illumination domain;
+            # do not lower support or insert a median/nearest-pixel field.
+            unsupported=region&(render.gaussian(source_fit.astype(float),sigma)<.008)
+            if (name!='rear_perimeter' and np.any(unsupported&label_part)
+                    and np.count_nonzero(label_part&(a[...,3]>=240))>=20):
+                key='label_component_'+str(len(label_components));revised.append((name,region&~label_part,sigma))
+                label_components.append((key,label_part,sigma));fit_masks[key]=label_part
+                if name in fit_masks:fit_masks[name]&=~label_part
+            else:revised.append((name,region,sigma))
+        materials=[item for item in revised if item[1].any()]+label_components
     domains=[];allowed=np.zeros((h,w),bool)
     for name,region,sigma in materials:
         if np.count_nonzero(region&(a[...,3]>=240))<20:raise ValueError('Material region has no reliable fit samples: '+name)
-        ref=reference_box(a,region);mp=save_mask(folder/(name+'.png'),region);allowed|=region
+        reference_region=fit_masks.get(name,region)
+        if protection_policy=='none' and not name.startswith('label_component_'):
+            reference_region=reference_region&~label_fit
+            fit_masks[name]=reference_region
+        ref=reference_box(a,reference_region);mp=save_mask(folder/(name+'.png'),region);allowed|=region
         domains.append(dict(name=name,mask=mp,reference_boxes=[ref],sigma=sigma,
             strength=[.72,0,0],feather=0,correction_smooth=1.5))
+        if name in fit_masks:
+            domains[-1]['fit_mask']=save_mask(folder/(name+'-fit.png'),fit_masks[name])
+        if face in ('left','right') and name=='main_surface':
+            # The downward-facing long rail has a much narrower illumination
+            # scale than the full strip. A broad normal fit leaves a dark rail
+            # beside a bright halo. Fit along the rail over a longer span and
+            # across it over >=6 pixels; only the additive L field is changed.
+            # The normal floor retains independently tested fine scratches,
+            # while the larger lift budget can recover deep source shadows.
+            domains[-1].update(sigma=[max(36,h*.03),max(6,w*.05)],
+                strength=[.9,0,0],max_lab_shift=[60,0,0],
+                gamut_continuity_follow_field=True,
+                gamut_continuity_follow_source_edges=True,
+                gamut_continuity_source_edge_guard=max(12,w*.1))
+        if face in ('left','right') and name.startswith('antenna_'):
+            # The same narrow cast shadow crosses the plastic strip. Fit its
+            # own material/reference at the rail's normal scale too; leaving
+            # a broad fit here can reverse a valid source endpoint contrast
+            # once adjacent aluminum is correctly illuminated.
+            domains[-1].update(sigma=[sigma[0],max(6,w*.05)],
+                               max_lab_shift=[60,0,0])
+        if face in ('left','right','top','bottom') and (name=='main_surface' or name.startswith('hardware_')):
+            # Final gamut clipping can flatten bright texture on every frame
+            # face. Propagate actual gamut caps through the correction field,
+            # never smooth source RGB or let paper seed the metal correction.
+            domains[-1].update(gamut_continuity_step_L=(.2 if face in ('top','bottom') else .6),
+                              gamut_continuity_opaque_seeds=True)
+        if face=='back' and name in ('camera_surround','main_surface'):
+            # Saturated source highlights can make the final per-pixel gamut
+            # limiter discontinuous well away from a material-domain seam.
+            domains[-1]['gamut_continuity_step_L']=REAR_GAMUT_CONTINUITY_STEP_L
         if name=='rear_perimeter' or (face=='front' and name=='main_surface'):
             domains[-1].update(field='contour',sigma=[max(18,h*.012),max(5,w*.006)])
-        if name=='rear_perimeter':domains[-1].update(reference_profile='contour_depth_lift',strength=[.92,0,0],max_lab_shift=[48,0,0],contour_alpha_mask=body_path,source_body_contour=body_proof)
+        if name=='rear_perimeter':domains[-1].update(reference_profile='contour_depth_lift',strength=[.92,0,0],max_lab_shift=[48,0,0],contour_alpha_mask=body_path,source_body_contour=body_proof,
+            correction_smoothing='source_fit_coverage')
         if face=='front':
             reliable=region&(a[...,3]>=240)
-            shoulder=float(ndimage.distance_transform_edt(~reliable)[region&(a[...,3]>=128)].max())
-            if shoulder>max(8,w*.045):raise ValueError('Front rim lacks nearby opaque material support')
-            domains[-1].update(reference_profile='contour_depth',contour_inset_depth=max(3.,shoulder+1),
+            distances=ndimage.distance_transform_edt(~reliable)[region&(a[...,3]>=128)]
+            shoulder=float(distances.max());shoulder_limit=max(8,w*.045)
+            # 2026-11-09: a stand contact can thin the rim to a few soft pixels
+            # far from opaque metal. Tolerate the same isolated count used for
+            # unsupported contour pixels; a real missing rim stays rejected.
+            stray=int((distances>shoulder_limit).sum())
+            if stray>32:raise ValueError('Front rim lacks nearby opaque material support')
+            if stray:
+                proof['front_shoulder_stray_pixels']=stray
+                shoulder=float(distances[distances<=shoulder_limit].max())
+            domains[-1].update(reference_profile='contour_depth',contour_source_inset_limit=max(8.,w*.045),
                 sigma=[max(18,h*.012),2.])
             proof['front_opaque_shoulder_px']=shoulder
     if not domains:raise ValueError('No reliable material domains')
-    required=save_mask(folder/'required-editable.png',allowed)
+    required_pixels=allowed.copy()
+    if face=='back':
+        # Independent source silhouette coverage must not inherit holes from
+        # the material classifier being checked. Both metal and plastic at the
+        # outer rim are editable; only actual paper is protected.
+        required_pixels |= visible&~paper&(distance<=max(8,w*.035))
+    required=save_mask(folder/'required-editable.png',required_pixels)
     view=dict(name=face,source=str(Path(source).resolve()),source_sha256=digest(source),
-        protection_policy='sticker_only',sticker_mask=paper_path,protected_mask=paper_path,
+        protection_policy=protection_policy,sticker_mask=paper_path,protected_mask=paper_path,
         required_editable_mask=required,reference_boxes=domains[0]['reference_boxes'],domains=domains)
+    if protection_policy=='none':
+        label_path=save_mask(folder/'source-label-fit-exclusion.png',label_fit)
+        view['source_label_fit_exclusion_mask']=label_path
+        proof['protection_policy']='none';proof['protected_zone_pixels']=0
+        proof['source_label_fit_exclusion']=dict(path=label_path,pixels=int(label_fit.sum()),source_analysis=label_fit_proof,
+            editable_label_pixels=int((label_fit&allowed).sum()),hard_pixel_protection=False)
+        if label_hint is not None:
+            view['source_label_location_hint_mask']=save_mask(folder/'source-label-location-hint.png',label_hint)
+            view['source_label_material_evidence']=label_fit_proof
+            proof['released_label_hint_metal_pixels']=int((label_hint&~label_fit).sum())
     if face=='back':
         view['correction_blends']=[dict(domains=['rear_perimeter','camera_surround','main_surface'],
             boundary_domain='rear_perimeter',sigma=max(3.,w*.008))]
+    if face in ('left','right'):
+        # Source photo edges contain mixed-material sensor pixels. Blend only
+        # their additive fields, keeping both materials' independent targets
+        # and every original RGB detail; do not blur the resulting photograph.
+        view['correction_blends']=[dict(domains=[name,'main_surface'],
+            boundary_domain=name,sigma=1.25,kind='source_material_transition')
+            for name in ('antenna_0','antenna_1')]
+        view['antenna_boundary_bands']=[0,1]
+    if label_components:
+        masks={d['name']:np.array(Image.open(d['mask']).convert('L'))>0 for d in domains}
+        for key,region,_ in label_components:
+            for other,other_mask in masks.items():
+                if other==key or other.startswith('label_component_'):continue
+                if np.any(ndimage.binary_dilation(region)&other_mask):
+                    view.setdefault('correction_blends',[]).append(dict(domains=[key,other],boundary_domain=key,sigma=1.25,kind='source_material_transition'))
+        proof['independent_label_illumination_components']=[dict(name=name,pixels=int(region.sum()),source_fit_support_threshold=.008,hard_pixel_protection=False) for name,region,_ in label_components]
+    if face=='back':
+        perimeter=next(d for d in domains if d['name']=='rear_perimeter')
+        contour=perimeter.get('source_body_contour',{})
+        region=np.zeros((h,w),bool);metal=np.array(Image.open(perimeter['mask']).convert('L'))>0
+        for side,entry in contour.get('sides',{}).items():
+            for lo,hi in entry.get('protrusion_rows',[]):
+                witness=metal&(a[...,3]>=240);padding=max(20,int(h*.015))
+                witness[:max(0,lo-padding)]=False;witness[min(h,hi+padding):]=False
+                if side=='left':witness[:,w//2:]=False
+                else:witness[:,:w//2]=False
+                region|=witness
+        if region.any():
+            view['quantization_continuity']=[dict(mask=save_mask(folder/'source-button-quantization.png',region),max_added_step_L=1.25,
+                basis='Current source protrusions and opaque rear metal; adjacent RGB code values only; fitted field unchanged')]
     job=dict(color_mode='source_lightness',defaults=dict(max_lab_shift=[35,0,0],feather=0),views=[view])
     proof.update(materials=[dict(name=d['name'],reference_boxes=d['reference_boxes'],mask=d['mask']) for d in domains],source_sha256=digest(source),source=str(source))
     return job,proof,allowed,paper
@@ -556,10 +942,15 @@ def lighting_scope(source,face,job,folder):
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=False)
     view=job['views'][0];domains={d['name']:d for d in view['domains']}
     spec=dict(source_sha256=digest(source),action='aluminum',reason='Fresh source-derived aluminum QC studio profile',
-        mode='perimeter' if face in ('front','back') else 'regional',protection_policy='sticker_only',sticker_mask=view['sticker_mask'],local_checks={})
-    def domain_mask(name):return np.array(Image.open(domains[name]['mask']).convert('L'))>0
+        mode='perimeter' if face in ('front','back') else 'regional',protection_policy=view.get('protection_policy','sticker_only'),sticker_mask=view['sticker_mask'],local_checks={})
+    label_fit=(np.array(Image.open(view['source_label_fit_exclusion_mask']).convert('L'))>0 if view.get('source_label_fit_exclusion_mask') else np.zeros((h,w),bool))
+    def domain_mask(name):
+        result=np.array(Image.open(domains[name]['mask']).convert('L'))>0
+        return result&~label_fit if view.get('protection_policy')=='none' else result
     def target(name):
-        boxes=domains[name]['reference_boxes'];values=[]
+        # A conservative rendering proposal cannot weaken its independently
+        # source-bound acceptance target (for example the V2 rear perimeter).
+        boxes=domains[name].get('acceptance_reference_boxes',domains[name]['reference_boxes']);values=[]
         for x0,y0,x1,y1 in boxes:values.append(float(np.median(lightness(a[y0:y1,x0:x1,:3]))))
         return float(np.median(values))
     normal_target=None
@@ -655,10 +1046,160 @@ def lighting_scope(source,face,job,folder):
             spec['local_checks'][key]=dict(mask=save_mask(folder/(key+'.png'),edge&(nearest==index)),
                 boundary_peer_mask=peer_path,min_L=0,max_L=100,percentile=10,max_boundary_step_L=2.,
                 bounds_basis='99th percentile of added L step across source-defined metal-domain interfaces; both axes, peak <= 3 L')
+    if face=='bottom' and view.get('source_label_location_hint_mask'):
+        # A full-height label locator must not leave a rectangular low-lift
+        # material region on the source-confirmed metal beneath actual paper.
+        # Freeze witnesses from source masks, before inspecting output RGB.
+        hint=np.array(Image.open(view['source_label_location_hint_mask']).convert('L'))>0
+        material_evidence=view.get('source_label_material_evidence',{})
+        spec['source_paper_material_boundary']=material_evidence
+        if material_evidence.get('material_boundary_resolution') in ('original_source_closure','source_aligned_metal_window','source_contour_frame_domain'):
+            from .resolved_bottom_material import validate
+            from .normal_review_state import CONTEXT_POLICY
+            spec['normal_material_binding']=validate(view,material_evidence)
+            spec['normal_coverage_policy']=CONTEXT_POLICY
+            spec['source_material_view']=dict(view)
+            # Retain the existing independent source-closed validator contract.
+            spec['source_contour_material_view']=dict(view)
+        metal=domain_mask('main_surface')&(a[...,3]>=240)
+        # sigma=.8 source-edge detection has four-pixel support. Exclude only
+        # that actual paper sensor transition, not the old guessed strip edge.
+        pure_distance=ndimage.distance_transform_edt(~label_fit)
+        witness=ndimage.binary_dilation(hint,iterations=12)&metal&(pure_distance>4)
+        path=save_mask(folder/'bottom-paper-surround-metal.png',witness)
+        spec['local_checks']['bottom_paper_metal_horizontal']=dict(mask=path,
+            min_L=0,max_L=100,percentile=10,step_axis=1,max_added_step_L=1.25,
+            bounds_basis='Tangential added L continuity across source-confirmed metal beside and below paper; source texture subtracted, actual sensor transition excluded',
+            source_material_boundary_resolution=material_evidence.get('material_boundary_resolution'))
+        # The cap's normal direction contains the real bright bevel/dark rail.
+        # Compare its added gradient with source-selected metal on the SAME
+        # rows, not with a flat-field requirement that rejects real lighting.
+        # Compact source contours conservatively remove apertures, screws and
+        # ports from peer evidence only; they are not pixel protection masks.
+        gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
+        # Source texture is not hardware. Estimate contours on a one-pixel
+        # source analysis blur and require a compact aperture-scale shape;
+        # the source/candidate image itself is never smoothed.
+        edges=cv2.Canny(cv2.GaussianBlur(gray,(0,0),1.),30,60)
+        edges=cv2.morphologyEx(edges,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
+        contours,_=cv2.findContours(edges,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+        features=np.zeros((h,w),np.uint8)
+        for contour in contours:
+            x,y,cw,ch=cv2.boundingRect(contour)
+            area=cv2.contourArea(contour)
+            if (max(3,h*.07)<=cw<w*.22 and max(3,h*.07)<=ch<h*.65
+                    and .45<cw/ch<6 and area>=max(12,cw*ch*.45)):
+                cv2.drawContours(features,[contour],-1,1,cv2.FILLED)
+        feature_mask=ndimage.binary_dilation(features>0,iterations=3)
+        nearby=ndimage.binary_dilation(hint,iterations=60)&~ndimage.binary_dilation(hint,iterations=16)
+        candidates=nearby&metal&~feature_mask
+        # Normal peers concern the newly released paper-tail metal. The
+        # upper cap bevel beside the printed paper is a different location,
+        # already covered by the tangential surround check above.
+        normal_witness=witness&hint
+        normal_path=save_mask(folder/'bottom-paper-tail-normal-metal.png',normal_witness)
+        peers=np.zeros((h,w),bool)
+        source_rows=[]
+        for y in range(h):
+            # A source-only RGB envelope supplements the material/contour
+            # evidence. It cannot choose peers based on corrected pixels.
+            values=a[y,normal_witness[y],:3].astype(float)
+            if len(values)<10:continue
+            center=np.median(values,axis=0)
+            radius=max(1.,float(np.percentile(np.linalg.norm(values-center,axis=1),99)))
+            # Continuity is a property of the source metal region, not of
+            # quantized RGB noise. Apply the source colour envelope *within*
+            # continuous metal runs; do not fragment a valid metal run when
+            # a grain pixel falls just outside that envelope. The local check
+            # still demands at least ten matched, same-column normal pairs.
+            matches=np.linalg.norm(a[y,:,:3].astype(float)-center,axis=1)<=radius
+            labels,count=ndimage.label(candidates[y])
+            for index in range(1,count+1):
+                run=labels==index
+                if run.sum()>=10:peers[y]|=run&matches
+            source_rows.append(dict(row=y,source_rgb_radius=radius,peer_pixels=int(peers[y].sum())))
+        peer_path=save_mask(folder/'bottom-paper-normal-metal-peers.png',peers)
+        feature_path=save_mask(folder/'bottom-paper-peer-source-features.png',feature_mask)
+        spec['local_checks']['bottom_paper_metal_normal']=dict(mask=normal_path,
+            normal_peer_mask=peer_path,min_L=0,max_L=100,percentile=10,max_normal_peer_step_L=1.25,
+            bounds_basis='Normal added L gradient relative to same-row source-matched metal; compact source hardware contours excluded, no output-derived peers',
+            source_peer_rows=source_rows,
+            source_sampling=dict(method='existing_bottom_paper_normal_v1',axis=0,
+                alpha_minimum=240,legacy_distance_to_paper_px=4,
+                physical_sensor_transition_width_verified=False,
+                legacy_hint_ring_iterations=[16,60],source_minimum_run=10,
+                feature_exclusion_mask=feature_path,
+                feature_exclusion_is_material_certification=False,
+                hint_mask=view['source_label_location_hint_mask'],
+                mask_pixels=int(normal_witness.sum()),peer_pixels=int(peers.sum()),
+                ring_metal_pixels=int((nearby&metal).sum()),
+                ring_pixels_excluded_by_features=int((nearby&metal&feature_mask).sum()),
+                original_normal_masks_unchanged=True))
     if face in ('left','right'):
+        from .local_effect_review import POLICY as PIXEL_REVIEW_POLICY
+        spec['local_review_policy']=PIXEL_REVIEW_POLICY
+        # True material transitions may change the added field rapidly. Check
+        # every pixel in the adjoining pure metal, excluding exactly the
+        # declared source transition support rather than a guessed wider box.
+        metal=domain_mask('main_surface')
+        for band in view.get('antenna_boundary_bands',[]):
+            name=f'antenna_{band}';material=domain_mask(name)
+            config=next(c for c in view['correction_blends'] if c['boundary_domain']==name)
+            seam=(material&ndimage.binary_dilation(metal))|(metal&ndimage.binary_dilation(material))
+            transition=ndimage.distance_transform_edt(~seam)<3*config['sigma']
+            transition_path=save_mask(folder/(name+'-source-transition.png'),transition&(material|metal))
+            yy=np.arange(h)[:,None];band_y=np.nonzero(material)[0]
+            for edge,columns in [('left',np.arange(w)<w*.22),('right',np.arange(w)>=w*.78)]:
+                witness=metal&(a[...,3]>=240)&~transition&columns[None,:]
+                witness &= (yy>=int(band_y.min())-18)&(yy<=int(band_y.max())+18)
+                key=name+'_'+edge+'_metal'
+                spec['local_checks'][key]=dict(mask=save_mask(folder/(key+'.png'),witness),
+                    min_L=0,max_L=100,max_added_step_L=1.25,max_pixel_added_step_L=1.25,
+                    step_axis=0,percentile=10,source_transition_mask=transition_path,
+                    bounds_basis='Paired source antenna endpoint pure metal; actual mixed-material field support excluded, every remaining pair checked')
         for name in ('antenna_0','antenna_1'):
             material=domain_mask(name);yy,xx=np.nonzero(material&(a[...,3]>=240));middle=float(np.median(yy))
             for end,x in [('left',w*.12),('right',w*.88)]:
                 key=name+'_'+end;spec['local_checks'][key]=point_witness(material,x,middle,key,target(name))
+        # Full components, including both caps and rails, must be checked in
+        # both directions. A clean surrounding strip cannot certify a button.
+        for name in domains:
+            if not name.startswith('hardware_'):continue
+            material=domain_mask(name)&(a[...,3]>=240)
+            path=save_mask(folder/(name+'-complete.png'),material)
+            for axis,direction in ((0,'length'),(1,'width')):
+                key=name+'_'+direction
+                spec['local_checks'][key]=dict(mask=path,min_L=0,max_L=100,
+                    percentile=10,max_added_step_L=1.25,max_pixel_added_step_L=1.25,step_axis=axis,
+                    bounds_basis='Complete source-supported hardware component; added L continuity with source texture subtracted')
+            fit=np.asarray(Image.open(domains[name]['fit_mask']).convert('L'))>0
+            fit &= material
+            source_median=float(np.median(lightness(a[...,:3])[fit]));reference=target(name)
+            spec['local_checks'][name+'_reference']=dict(mask=save_mask(folder/(name+'-reference.png'),fit),
+                percentile=50,min_L=max(0.,min(source_median,reference)-5.),
+                max_L=min(100.,max(source_median,reference)+5.),
+                source_before_L=source_median,source_reference_L=reference,
+                bounds_basis='Independent component interior source/reference envelope plus 5 L quantization/field tolerance; never a shared hardware target')
+        # Source-only witnesses for the old false hardware rectangles. Every
+        # component is checked separately; a whole-side median hides small blocks.
+        from .auto_structure import hardware_ranges
+        _,boxes=hardware_ranges(image)
+        fragments=np.zeros((h,w),bool)
+        for x0,y0,x1,y1 in boxes:fragments[y0:y1,x0:x1]=True
+        metal=domain_mask('main_surface')&(a[...,3]>=240)
+        fragments &= metal
+        labels,count=ndimage.label(fragments)
+        for label in range(1,count+1):
+            sample=labels==label
+            # Inspect each fragment's horizontal ends in the tangent direction.
+            # A steep but smooth normal correction across the narrow metal rim
+            # is legitimate and must not be confused with a rectangular jump.
+            sample=ndimage.binary_dilation(sample,structure=np.ones((5,7),bool))&metal
+            pairs=sample[1:]&sample[:-1]
+            if pairs.sum()<20 or not np.any(pairs.sum(axis=1)>=10):continue
+            key=f'side_metal_fragment_{label:02d}'
+            spec['local_checks'][key]=dict(mask=save_mask(folder/(key+'.png'),sample),
+                min_L=0,max_L=100,percentile=10,max_added_step_L=1.25,step_axis=0,
+                bounds_basis='Source edge fragment is ordinary metal; tangent added L step at each artificial rectangle end, source texture subtracted')
     validate_spec(spec,source)
     return spec

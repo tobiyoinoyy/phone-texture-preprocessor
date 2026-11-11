@@ -13,6 +13,7 @@ from texture_alignment.align_textures import anchor_matrix, warp_rows
 from texture_alignment.image_reference_targets import rows_from_view
 from .pipeline import batch_files, separate_paths, fresh, overview
 from .geometry_review import digest, write
+from . import source_body_reference as sbr
 
 TOLERANCE = 2.5
 CHECKS = ('upper_edges_and_width', 'lower_edges_and_width', 'both_endpoints',
@@ -39,8 +40,8 @@ def intervals(value, height):
     return a.astype(int)
 
 
-def detect(path, x_range, windows, signs):
-    a = pixels(path); h, w = a.shape[:2]
+def _measurement_window(a, x_range, windows, signs):
+    h, w = a.shape[:2]
     if len(x_range) != 2 or any(type(v) is not int for v in x_range):
         raise ValueError('Integer measurement columns required')
     x0, x1 = x_range
@@ -54,6 +55,12 @@ def detect(path, x_range, windows, signs):
         raise ValueError('Boundary search windows must be ordered, nonoverlapping and inside image')
     if len(signs) != 4 or any(v not in (-1, 1) for v in signs):
         raise ValueError('Reviewed edge polarities required')
+    return x0, x1, boxes
+
+
+def detect(path, x_range, windows, signs):
+    a = pixels(path)
+    x0, x1, boxes = _measurement_window(a, x_range, windows, signs)
     signal = np.median(a[:, x0:x1, :3].astype(float).mean(axis=2), axis=1)
     g = np.gradient(gaussian_filter1d(signal, 1.0))
     rows = []
@@ -64,6 +71,41 @@ def detect(path, x_range, windows, signs):
         rows.append(row)
     return np.asarray(rows, float)
 
+
+
+def _has_paired_source(cfg):
+    proof=cfg.get('source_boundary_detection',{})
+    return (proof.get('method') in ('paired_source_material_edges_v2','paired_source_material_edges_v3')
+            and proof.get('revision_bands')==[0,1]
+            and [b.get('band') for b in proof.get('bands',[])]==[0,1])
+
+
+def _paired_final_measurements(path, targets, measurements):
+    """Measure actual final pixels before comparing them with desired rows.
+
+    The central target rows only initialize the search. Both source edges
+    must be rediscovered in the final image; frozen/source curves never
+    supply a measured row. Each witness retains its own bounds and checks.
+    """
+    from .antenna_material import trace_boundaries
+    a=pixels(path)
+    lines,proof=trace_boundaries(Image.fromarray(a),np.median(targets,axis=1))
+    measured={}
+    for name,m in measurements.items():
+        x0,x1,boxes=_measurement_window(a,m['x_range'],m['search_windows'],m['signs'])
+        rows=[]
+        for band,item in enumerate(proof['bands']):
+            cols=np.asarray(item['support_columns'],int)
+            cols=cols[(cols>=x0)&(cols<x1)]
+            if len(cols)<max(3,int(np.ceil((x1-x0)*.6))):
+                raise ValueError('Insufficient final paired antenna evidence: '+name)
+            # Unsupported/interpolated columns cannot vote in a witness.
+            rows.extend(np.median(lines[band*2:band*2+2,cols],axis=1))
+        rows=np.asarray(rows)
+        if np.any(rows<=boxes[:,0]) or np.any(rows>=boxes[:,1]-1):
+            raise ValueError('Ambiguous antenna edge; review native pixels/search region')
+        measured[name]=rows
+    return measured
 
 def measurement_path(current, binding):
     if not binding:return current
@@ -81,7 +123,14 @@ def reference(files, ref, side_height, body, coordinate_mode='body_endpoints'):
         raise ValueError('Reference must bind this SKU current front/back image')
     view = dict(ref, path=str(files[face]))
     target = rows_from_view(view, side_height, body)
-    if coordinate_mode=='canvas_pixel_centers':
+    if coordinate_mode==sbr.MODE:
+        if face!='back':raise ValueError('Source body reference requires own back image')
+        proof=ref.get('source_body_reference')
+        if proof is None:raise ValueError('Missing source body review evidence')
+        source_body=sbr.validate(proof,measurement_path(files[face],ref.get('measurement_source')))
+        if ref['body_y']!=source_body:raise ValueError('Reference body differs from source rail evidence')
+        target=np.asarray(sbr.targets(proof,ref['antenna_rows'],body,side_height),float)
+    elif coordinate_mode=='canvas_pixel_centers':
         target=(np.asarray(ref['antenna_rows'],float)+.5)/Image.open(files[face]).height*side_height-.5
     elif coordinate_mode!='body_endpoints':raise ValueError('Unknown image alignment coordinates')
     measured = detect(measurement_path(files[face],ref.get('measurement_source')), ref['x_range'], ref['search_windows'], ref['signs'])
@@ -103,6 +152,8 @@ def mapping(files, side, cfg):
     indices = cfg['antenna_indices']
     if len(indices) != 4 or any(type(v) is not int for v in indices) or sorted(set(indices)) != indices or indices[0] < 0 or indices[-1] >= len(source):
         raise ValueError('Four ordered antenna indices required')
+    if cfg.get('coordinate_mode')==sbr.MODE and cfg.get('reference_review_required') is not True:
+        raise ValueError('Source body reference review warning is required')
     back = cfg['back']
     if back.get('face') != 'back':
         raise ValueError('Each side requires its own SKU back reference')
@@ -158,12 +209,15 @@ def verify(before, after, spec):
             measurements = cfg['measurements']
             if set(measurements) != {'left_end', 'center', 'right_end'}:
                 raise ValueError('Both endpoints and center need pixel checks')
+            paired = (_paired_final_measurements(after[sku][side],targets,measurements)
+                      if _has_paired_source(cfg) else None)
             checks = {}
             for name, m in measurements.items():
                 x0, x1 = m['x_range']
                 if (name == 'left_end' and x1 > w*.25) or (name == 'right_end' and x0 < w*.75) or (name == 'center' and not x0 <= w/2 <= x1):
                     raise ValueError('Endpoint/center witness in wrong location')
-                measured = detect(after[sku][side], m['x_range'], m['search_windows'], m['signs'])
+                measured = (paired[name] if paired is not None else
+                            detect(after[sku][side], m['x_range'], m['search_windows'], m['signs']))
                 desired = np.median(targets[:, x0:x1], axis=1)
                 error = np.abs(measured-desired)
                 width = np.abs(np.diff(measured.reshape(2, 2), axis=1)-np.diff(desired.reshape(2, 2), axis=1)).ravel()
@@ -172,10 +226,16 @@ def verify(before, after, spec):
                 checks[name] = dict(measured_rows=measured.tolist(), target_rows=desired.tolist(), error_px=error.tolist(), width_error_px=width.tolist())
             result[sku][side] = dict(input_sha256=digest(files[side]), output_sha256=digest(after[sku][side]),
                                      checks=checks, button_pixels_unchanged=True,
+                                     pixel_measurement_method=('final_paired_source_edges' if paired is not None
+                                                               else 'window_median_signed_gradient'),
                                      alignment_basis=cfg.get('basis', 'back_image'),
                                      coordinate_mode=cfg.get('coordinate_mode','body_endpoints'),
                                      rounded_endcaps_unchanged=bool(cfg.get('outline_ranges')),
                                      back_reference_sha256=digest(files['back']))
+            if cfg.get('coordinate_mode')==sbr.MODE:
+                result[sku][side].update(reference_supported=True,reference_review_required=True,
+                    remap_verified=True,reference_certified=False,visual_approved=False,publishable=False,
+                    source_body_reference_sha256=cfg['back']['source_body_reference']['evidence_sha256'])
     return result
 
 

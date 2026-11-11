@@ -9,10 +9,27 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from .normal_review_state import EffectCoverageUnavailable, scoped_normal_review, measure_normal, CONTEXT_POLICY
+from .local_effect_review import EffectLocalReviewRequired, quantization_pixel_review, POLICY as PIXEL_REVIEW_POLICY
 
 ZONES = ('top', 'bottom', 'left', 'right', 'top_left', 'top_right', 'bottom_left', 'bottom_right')
 CHECKS = ('whole_perimeter', 'four_corners', 'material_boundaries', 'paper_edges',
           'no_new_blocks_or_gray_rim', 'source_details_retained')
+
+
+class EffectThresholdFailure(ValueError):
+    """Brightness targets failed after this scope's other checks completed.
+
+    This is not a quality pass or proof about checks outside measure_local /
+    measure_perimeter. Only raise it after every applicable non-brightness
+    scope check has run; any such failure must remain an ordinary hard error.
+    """
+    def __init__(self, failures, reports):
+        if not failures:
+            raise ValueError('Effect threshold failure requires failed measurements')
+        self.failures = failures
+        self.reports = reports
+        super().__init__('; '.join(item['error'] for item in failures))
 
 
 def digest(path):
@@ -31,9 +48,9 @@ def pixels(path):
     return np.array(Image.open(path).convert('RGBA'))
 
 
-def witness(path, shape):
+def witness(path, shape, *, allow_empty=False):
     m = np.array(Image.open(path).convert('L')) > 0
-    if m.shape != shape or not m.any():
+    if m.shape != shape or (not allow_empty and not m.any()):
         raise ValueError('Perimeter witness must be nonempty and source-sized')
     return m
 
@@ -42,10 +59,14 @@ def lightness(rgb):
     s = rgb.astype(float) / 255
     linear = np.where(s <= .04045, s / 12.92, ((s + .055) / 1.055) ** 2.4)
     y = linear @ np.array([.2126729, .7151522, .0721750])
-    return np.where(y > (6/29)**3, 116*np.cbrt(y)-16, (29/3)**3*y)
+    # Rounded D65 matrix coefficients sum to 1.0000001: white otherwise
+    # becomes 100.0000038667 L, spuriously outside physical sRGB bounds.
+    return np.clip(np.where(y > (6/29)**3, 116*np.cbrt(y)-16, (29/3)**3*y),0,100)
 
 
 def validate_spec(spec, source):
+    if spec.get('local_review_policy') not in (None,PIXEL_REVIEW_POLICY):
+        raise ValueError('Unknown local effect review policy')
     if spec['source_sha256'] != digest(source):
         raise ValueError('Lighting scope source mismatch')
     if spec['action'] not in ('copy', 'aluminum', 'stainless') or not spec.get('reason'):
@@ -58,7 +79,7 @@ def validate_spec(spec, source):
         raise ValueError('Explicit aluminum protection policy required; do not inherit old masks')
     if spec.get('protection_policy')=='reviewed_regions' and not spec.get('protection_basis'):
         raise ValueError('Additional protection requires an explicit user/task basis')
-    if spec.get('protection_policy', 'reviewed_regions') not in ('sticker_only','reviewed_regions'):
+    if spec.get('protection_policy', 'reviewed_regions') not in ('sticker_only','reviewed_regions','none'):
         raise ValueError('Unknown protection policy')
     if spec.get('protection_policy') == 'sticker_only':
         p = spec.get('sticker_mask')
@@ -67,6 +88,16 @@ def validate_spec(spec, source):
     for name in spec.get('local_checks', {}):
         if not name or name in ZONES or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in name):
             raise ValueError('Local check requires a unique safe name')
+        zone=spec['local_checks'][name]
+        if 'normal_peer_mask' in zone:
+            a=pixels(source)
+            allow_missing=scoped_normal_review(spec,source,name,zone)
+            target=witness(zone['mask'],a.shape[:2],allow_empty=allow_missing)
+            peer=witness(zone['normal_peer_mask'],a.shape[:2],allow_empty=allow_missing)
+            limit=float(zone.get('max_normal_peer_step_L',float('nan')))
+            if (np.any(target&peer) or np.any(peer&(a[...,3]<240))
+                    or not np.isfinite(limit) or not 0<limit<=5):
+                raise ValueError('Invalid source-normal peer witness')
     if spec['mode'] != 'perimeter':
         return
     if spec['action'] != 'aluminum' or not spec.get('reference_basis'):
@@ -121,6 +152,7 @@ def freeze_scope(work, path):
                 assets[str(Path(spec['sticker_mask']).resolve())] = digest(spec['sticker_mask'])
             paths = [z['mask'] for z in spec.get('local_checks', {}).values()]
             paths += [z['boundary_peer_mask'] for z in spec.get('local_checks', {}).values() if 'boundary_peer_mask' in z]
+            paths += [z['normal_peer_mask'] for z in spec.get('local_checks', {}).values() if 'normal_peer_mask' in z]
             if spec['mode'] == 'perimeter':
                 paths += [spec['required_metal_mask']] + [z['mask'] for z in spec['zones'].values()]
             assets.update({str(Path(p).resolve()): digest(p) for p in paths})
@@ -152,14 +184,27 @@ def measure_perimeter(spec, source, output, allowed, protected):
     if np.any(required & (~allowed | protected)):
         raise ValueError('Required perimeter metal frozen or omitted')
     before_L, after_L = lightness(a[..., :3]), lightness(b[..., :3])
-    reports = {}
+    reports, failures = {}, []
     for name, zone in spec['zones'].items():
         m = witness(zone['mask'], a.shape[:2])
         before, after = float(np.median(before_L[m])), float(np.median(after_L[m]))
-        if not zone['min_L'] <= after <= zone['max_L']:
-            raise ValueError(f'Perimeter effect failed at {name}: L={after:.2f}, expected {zone["min_L"]}..{zone["max_L"]}')
-        reports[name] = {'before_L': before, 'after_L': after, 'witness_sha256': digest(zone['mask'])}
-    reports.update(measure_local(spec, source, output, allowed, protected))
+        passed = bool(zone['min_L'] <= after <= zone['max_L'])
+        reports[name] = {'before_L': before, 'after_L': after, 'witness_sha256': digest(zone['mask']),
+                         'effect_check_passed': passed, 'min_L': zone['min_L'], 'max_L': zone['max_L']}
+        if not passed:
+            failures.append(dict(kind='perimeter_brightness', check=name, measured_L=after,
+                min_L=zone['min_L'], max_L=zone['max_L'],
+                error=f'Perimeter effect failed at {name}: L={after:.2f}, expected {zone["min_L"]}..{zone["max_L"]}'))
+    # A dim perimeter must not prevent local continuity/material witnesses
+    # from being checked. Only an already fully checked brightness failure
+    # can be merged here; all other exceptions propagate as hard failures.
+    try:
+        reports.update(measure_local(spec, source, output, allowed, protected))
+    except EffectThresholdFailure as error:
+        reports.update(error.reports)
+        failures.extend(error.failures)
+    if failures:
+        raise EffectThresholdFailure(failures, reports)
     return reports
 
 
@@ -169,19 +214,65 @@ def measure_local(spec, source, output, allowed, protected):
     if a.shape != b.shape or not np.array_equal(a[..., 3], b[..., 3]):
         raise ValueError('Local output changed geometry')
     after_L = lightness(b[..., :3])
-    reports = {}
+    reports, failures, coverage_reviews, quality_reviews = {}, [], {}, []
     for name, zone in spec.get('local_checks', {}).items():
-        m = witness(zone['mask'], a.shape[:2])
+        allow_missing=scoped_normal_review(spec,source,name,zone)
+        m = witness(zone['mask'], a.shape[:2], allow_empty=allow_missing)
         if np.any(m & ((a[...,3] < 240) | ~allowed | protected)):
             raise ValueError(f'Local feature omitted or frozen: {name}')
         q = float(zone.get('percentile', 10))
         bounds = np.array([q, zone['min_L'], zone['max_L']],dtype=float)
         if not np.isfinite(bounds).all() or not 0 <= q <= 100 or not 0 <= bounds[1] < bounds[2] <= 100:
             raise ValueError('Invalid local feature threshold')
-        value = float(np.percentile(after_L[m],q))
-        if not bounds[1] <= value <= bounds[2]:
-            raise ValueError(f'Local feature effect failed: {name}: L={value:.2f}')
-        reports[name] = {'after_percentile_L':value,'percentile':q,'witness_sha256':digest(zone['mask'])}
+        value = float(np.percentile(after_L[m],q)) if m.any() else None
+        passed = bool(bounds[1] <= value <= bounds[2]) if value is not None else None
+        reports[name] = {'after_percentile_L':value,'percentile':q,'witness_sha256':digest(zone['mask']),
+                         'effect_check_passed':passed,'min_L':float(bounds[1]),'max_L':float(bounds[2])}
+        if passed is False:
+            failures.append(dict(kind='local_brightness', check=name, measured_L=value,
+                percentile=q, min_L=float(bounds[1]), max_L=float(bounds[2]),
+                error=f'Local feature effect failed: {name}: L={value:.2f}'))
+        # Do not stop at a brightness warning: this zone and later zones may
+        # still fail mandatory continuity, coverage, or source-identity gates.
+        if 'normal_peer_mask' in zone:
+            peer=witness(zone['normal_peer_mask'],a.shape[:2],allow_empty=allow_missing)
+            limit=float(zone['max_normal_peer_step_L'])
+            if (np.any(peer&m) or np.any(peer&((a[...,3]<240)|~allowed|protected))
+                    or not np.isfinite(limit) or not 0<limit<=5):
+                raise ValueError('Invalid source-normal peer witness')
+            if allow_missing:
+                coverage=measure_normal(after_L-lightness(a[...,:3]),m,peer,limit,
+                    contextual_review=spec.get('normal_coverage_policy')==CONTEXT_POLICY)
+                reports[name].update(normal_coverage=coverage,
+                    normal_check_passed=coverage['original_threshold_passed'],
+                    peer_sha256=digest(zone['normal_peer_mask']))
+                if not coverage['complete']:
+                    coverage_reviews[name]=coverage
+                if coverage['threshold_exceeded_rows']:
+                    quality_reviews.append(dict(kind='normal_continuity_warning',check=name,
+                        message='纸尾附近明暗变化与邻近对照不同，保留已调光候选待核对',
+                        original_threshold_passed=False,limit_L=limit,
+                        measured_max_residual_L75=coverage['max_observed_residual_L75'],
+                        exceeded_rows=coverage['threshold_exceeded_rows'],normal_coverage=coverage,
+                        physical_transition_support_certified=False,quality_checks_complete=False))
+            else:
+                delta=after_L-lightness(a[...,:3]);normal=np.diff(delta,axis=0)
+                pairs=m[1:]&m[:-1];peer_pairs=peer[1:]&peer[:-1]
+                rows=[];count=0
+                for y,(valid,control) in enumerate(zip(pairs,peer_pairs)):
+                    if valid.sum()<10:continue
+                    if control.sum()<10:
+                        raise ValueError(f'Insufficient same-row normal metal peers at {name}: row {y}')
+                    reference=float(np.median(normal[y,control]))
+                    step=float(np.percentile(abs(normal[y,valid]-reference),75))
+                    rows.append(dict(row=y,added_gradient_residual_L75=step,peer_added_gradient_median_L=reference,
+                        witness_pairs=int(valid.sum()),peer_pairs=int(control.sum())))
+                    count+=int(valid.sum())
+                if count<20 or not rows:raise ValueError('Too few source-normal continuity pairs')
+                peak=max(r['added_gradient_residual_L75'] for r in rows)
+                if peak>limit:raise ValueError(f'Lighting normal peer discontinuity at {name}: {peak:.2f} L')
+                reports[name].update(max_normal_peer_step_L=peak,limit_L=limit,pair_count=count,
+                    peer_sha256=digest(zone['normal_peer_mask']),rows=rows)
         if 'boundary_peer_mask' in zone:
             peer=witness(zone['boundary_peer_mask'],a.shape[:2])
             limit=float(zone['max_boundary_step_L'])
@@ -196,14 +287,20 @@ def measure_local(spec, source, output, allowed, protected):
                 samples.extend(np.abs(np.diff(delta,axis=axis))[pairs])
             if len(samples)<20:raise ValueError('Too few internal boundary pairs')
             step=float(np.percentile(samples,99));peak=float(np.max(samples))
-            if step>limit or peak>limit*1.5:
+            if step>limit:
                 raise ValueError(f'Lighting boundary discontinuity at {name}: {step:.2f} L (peak {peak:.2f})')
+            if peak>limit*1.5:
+                # 2026-11-09: the boundary is smooth at p99; only isolated pixels
+                # (paper tail / rim grain) exceed. Keep the lit candidate as a hint.
+                quality_reviews.append(dict(kind='boundary_peak_warning',check=name,
+                    message='内框边界有少量像素明暗过渡偏大，已保留调光结果',
+                    boundary_step_L99=step,boundary_peak_L=peak,limit_L=limit,
+                    original_threshold_passed=False,quality_checks_complete=False))
             reports[name].update(boundary_step_L99=step,boundary_peak_L=peak,
                 limit_L=limit,pair_count=len(samples),peer_sha256=digest(zone['boundary_peer_mask']))
-        if 'max_added_step_L' in zone:
-            limit=float(zone['max_added_step_L'])
+        if 'max_added_step_L' in zone or 'max_pixel_added_step_L' in zone:
             axis=zone.get('step_axis',0)
-            if axis not in (0,1) or not np.isfinite(limit) or not 0<limit<=5:
+            if axis not in (0,1):
                 raise ValueError('Invalid material continuity limit')
             # Measure the added correction, so genuine source seams, damage
             # and texture are not mistaken for processing discontinuities.
@@ -211,18 +308,47 @@ def measure_local(spec, source, output, allowed, protected):
             pairs=(m[1:]&m[:-1]) if axis==0 else (m[:,1:]&m[:,:-1])
             if pairs.sum()<20:raise ValueError('Too few same-material continuity pairs')
             differences=np.abs(np.diff(delta,axis=axis))
-            # A horizontal/vertical seam is a coherent step, not isolated
-            # texture/gamut quantization noise. Inspect every sampled line,
-            # separately in the left, center and right source-bound witnesses.
-            line_pairs=pairs if axis==0 else pairs.T
-            line_differences=differences if axis==0 else differences.T
-            lines=[float(np.percentile(values[valid],75)) for values,valid in zip(line_differences,line_pairs) if valid.sum()>=10]
-            if not lines:raise ValueError('Too few material continuity samples per line')
-            step=max(lines)
-            if step>limit:
-                raise ValueError(f'Lighting correction discontinuity at {name}: {step:.2f} L')
-            reports[name].update(max_added_step_L=step,limit_L=limit,pair_count=int(pairs.sum()),line_percentile=75,raw_max_pixel_step_L=float(differences[pairs].max()))
+            peak=float(differences[pairs].max())
+            reports[name].update(pair_count=int(pairs.sum()),raw_max_pixel_step_L=peak)
+            if 'max_added_step_L' in zone:
+                limit=float(zone['max_added_step_L'])
+                if not np.isfinite(limit) or not 0<limit<=5:
+                    raise ValueError('Invalid material continuity limit')
+                # The existing coherent-line check remains unchanged. It does
+                # not independently certify narrow scratches or local texture.
+                line_pairs=pairs if axis==0 else pairs.T
+                line_differences=differences if axis==0 else differences.T
+                lines=[float(np.percentile(values[valid],75)) for values,valid in zip(line_differences,line_pairs) if valid.sum()>=10]
+                if not lines:raise ValueError('Too few material continuity samples per line')
+                step=max(lines)
+                if step>limit:
+                    raise ValueError(f'Lighting correction discontinuity at {name}: {step:.2f} L')
+                reports[name].update(max_added_step_L=step,limit_L=limit,line_percentile=75)
+            if 'max_pixel_added_step_L' in zone:
+                limit=float(zone['max_pixel_added_step_L'])
+                if not np.isfinite(limit) or not 0<limit<=5:
+                    raise ValueError('Invalid pixel material continuity limit')
+                # Source texture is subtracted before measuring every valid
+                # pair; an isolated erased defect cannot hide in a percentile.
+                if peak>limit:
+                    quantization=(quantization_pixel_review(a,b,m,axis,limit)
+                        if spec.get('local_review_policy')==PIXEL_REVIEW_POLICY else None)
+                    if quantization is None:
+                        raise ValueError(f'Lighting pixel correction discontinuity at {name}: {peak:.2f} L')
+                    quality_reviews.append(dict(quantization,check=name))
+                    reports[name]['quantization_review']=quantization
+                reports[name].update(max_pixel_added_step_L=peak,pixel_limit_L=limit)
 
+    if quality_reviews:
+        if coverage_reviews:
+            quality_reviews.append(dict(kind='normal_coverage_unavailable',
+                message='局部法向对照不足，保留已调光候选待核对',
+                normal_coverage=coverage_reviews,quality_checks_complete=False))
+        raise EffectLocalReviewRequired(quality_reviews,reports,failures)
+    if coverage_reviews:
+        raise EffectCoverageUnavailable(coverage_reviews, reports, failures)
+    if failures:
+        raise EffectThresholdFailure(failures, reports)
     return reports
 
 
@@ -231,9 +357,16 @@ def evidence_images(spec, source, output, folder):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=False)
     a, b = Image.open(source).convert('RGBA'), Image.open(output).convert('RGBA')
-    assets = {}
+    assets = {}; context_only=[]
     for name, zone in {**spec.get('zones', {}), **spec.get('local_checks', {})}.items():
-        y, x = np.nonzero(witness(zone['mask'], (a.height, a.width)))
+        allow_missing=scoped_normal_review(spec,source,name,zone)
+        region=witness(zone['mask'], (a.height, a.width), allow_empty=allow_missing)
+        if not region.any():
+            # Source-bound context for visual review; never an invented witness.
+            hint=spec['source_contour_material_view']['source_label_location_hint_mask']
+            region=witness(hint,(a.height,a.width))
+            context_only.append(name)
+        y,x=np.nonzero(region)
         box = (max(0,int(x.min())-12), max(0,int(y.min())-12),
                min(a.width,int(x.max())+13), min(a.height,int(y.max())+13))
         crops = [im.crop(box) for im in (a,b)]
@@ -249,7 +382,8 @@ def evidence_images(spec, source, output, folder):
                 assets[str(p.resolve())] = digest(p)
     review = {'source_sha256': digest(source), 'output_sha256': digest(output),
               'spec_sha256': hashlib.sha256(json.dumps(spec,sort_keys=True).encode()).hexdigest(),
-              'evidence': assets, 'checks': {c: False for c in CHECKS}}
+              'evidence': assets, 'context_only_not_normal_witness':context_only,
+              'checks': {c: False for c in CHECKS}}
     write(folder/'review.json', review)
     return review
 

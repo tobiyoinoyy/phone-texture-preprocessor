@@ -72,7 +72,7 @@ def principal(alpha, threshold=128):
     return labels == sizes.argmax()
 
 
-def plate_axis(rgba,raw_rgb,rows):
+def _plate_axis_strict(rgba,raw_rgb,rows):
     """Deskew from independently visible long sides, never a stand contact."""
     mask=principal(rgba[...,3]);h,w=mask.shape;ys=rows[int(len(rows)*.2):int(len(rows)*.8)];fits=[];proof=[]
     gradients=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(float),.8,axis=1),axis=1),axis=2)
@@ -95,6 +95,61 @@ def plate_axis(rgba,raw_rgb,rows):
             orientation_discrepancy_over_shaft_px=orientation_error,raw_rgb_supported_fraction=float(source_supported.mean())))
     slope=float(np.mean([v[0] for v in fits]));return -slope,dict(method='independent_long_side_axis_v1',sides=proof,
         rotation_ccw_degrees=float(np.degrees(np.arctan(-slope))))
+
+
+
+def plate_axis(rgba,raw_rgb,rows):
+    """Keep ordinary source proof; recover one ragged matte side from raw RGB.
+
+    An independently fitted opposite silhouette and both actual photograph
+    edges are mandatory. This changes the source of the axis proposal, not
+    the 2.5-pixel raw edge residual or the four-degree rotation search.
+    """
+    try:return _plate_axis_strict(rgba,raw_rgb,rows)
+    except ValueError as strict_error:
+        original_error=str(strict_error)
+    mask=principal(rgba[...,3]);h,w=mask.shape
+    ys=rows[int(len(rows)*.2):int(len(rows)*.8)];span=np.ptp(ys)
+    values=[np.argmax(mask[ys],axis=1),w-1-np.argmax(mask[ys,::-1],axis=1)]
+    alpha=[]
+    for value in values:
+        try:
+            line,keep,error=consensus_line(ys+.5,value.astype(float),2.5,np.tan(np.deg2rad(4)))
+            alpha.append((line,keep,error))
+        except ValueError:alpha.append(None)
+    if sum(v is not None for v in alpha)!=1:raise ValueError(original_error)
+    anchor=next(v[0] for v in alpha if v is not None)
+    gradients=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(float),.8,axis=1),axis=1),axis=2)
+    proof=[];axis=[]
+    for side,value,fit in zip(('left','right'),values,alpha):
+        if fit is None:
+            proposal=np.polyfit(ys+.5,value.astype(float),1)
+            radius=8
+            centers=np.polyval(proposal,ys+.5)
+        else:
+            proposal,_,_=fit;radius=4;centers=value
+        xx=np.rint(centers[:,None]+np.arange(-radius,radius+1)).astype(int);xx=np.clip(xx,0,w-1)
+        strength=gradients[ys[:,None],xx]
+        observed=xx[np.arange(len(ys)),np.argmax(strength,axis=1)]
+        rgb,keep,error=consensus_line(ys+.5,observed.astype(float),2.5,np.tan(np.deg2rad(4)))
+        supported=strength.max(axis=1)>3;ends=max(1,int(len(ys)*.2))
+        if min(supported.mean(),supported[:ends].mean(),supported[-ends:].mean())<.6:
+            raise ValueError('Fallback body axis lacks two-ended raw RGB edge support')
+        agreement=float(abs(rgb[0]-anchor[0])*span)
+        if agreement>3:raise ValueError('Raw body axis disagrees with independent opposite silhouette')
+        alpha_distance=float(np.percentile(abs(np.polyval(rgb,ys+.5)-value),95))
+        if fit is None and alpha_distance>radius+1:
+            raise ValueError('Raw body axis exceeds bounded matte neighborhood')
+        axis.append(rgb if fit is None else fit[0])
+        proof.append(dict(side=side,alpha_consensus_available=fit is not None,alpha_proposal=proposal.tolist(),
+            raw_rgb_line=rgb.tolist(),raw_rgb_residual_p95_px=error,raw_rgb_supported_fraction=float(supported.mean()),
+            source_consensus_fraction=float(keep.mean()),source_search_radius_px=radius,
+            opposite_alpha_axis_disagreement_over_shaft_px=agreement,alpha_distance_p95_px=alpha_distance))
+    slope=float(np.mean([v[0] for v in axis]))
+    return -slope,dict(method='one_opposite_silhouette_and_two_raw_sides_v1',sides=proof,
+        original_failure=original_error,rotation_ccw_degrees=float(np.degrees(np.arctan(-slope))),
+        raw_source_residual_limit_px=2.5,independent_opposite_axis_limit_over_shaft_px=3,
+        source_RGB_edited=False,alpha_edited_for_axis=False)
 
 
 def fixed_slope_consensus(x,y,slope,tolerance=3):
@@ -153,7 +208,63 @@ def plate_plane_from_own_corners(rgba,raw_rgb,wide_rows):
     return line,dict(method='own_top_bottom_corner_curve_consensus_v1',
         own_corner_support_fractions=fractions,corner_residual_p95_px=residual,
         raw_rgb_supported_fraction=float(np.mean(edge>3)),body_u=[uleft,uright],top_v=vtop,bottom_v=plane,
-        symmetric_body_assumption=True,samples=int(keep.sum()))
+        symmetric_body_assumption=True,samples=int(keep.sum()),axis_slope=slope,
+        upper_curve_u=curve_u.tolist(),upper_curve_v=curve_v.tolist())
+
+
+def plate_corner_contact_limit(rgba, raw_rgb, line, corner, support_columns, paper=None):
+    """Remove a supported contact outside the curved body, not a rectangle.
+
+    The existing two-corner fit supplies a geometric search neighbourhood.
+    Independent raw RGB edges validate each affected corner before its local
+    silhouette can change. Exposed corners, body reflections and paper stay
+    unchanged. A poor correspondence is a failure, never a smaller body.
+    """
+    a=np.asarray(rgba);h,w=a.shape[:2];mask=principal(a[...,3]);x=np.arange(w,dtype=float)
+    base=np.polyval(line,x+.5);curve=base.copy()
+    slope=float(corner['axis_slope']);normal=np.sqrt(1+slope*slope)
+    u0,u1=corner['body_u'];width=u1-u0
+    for _ in range(4):
+        u=(x-slope*curve)/normal
+        curve=normal*(corner['bottom_v']-np.interp(u,corner['upper_curve_u'],corner['upper_curve_v']))-slope*x
+    present=a[...,3]>0
+    bottom=h-1-np.argmax(present[::-1],axis=0)
+    # A real exposed corner follows the fitted curve. Only a clearly attached
+    # projection extends farther, so do not recut every already good corner.
+    corner_columns=((u>u0+.025*width)&(u<u0+.23*width))|((u>u1-.23*width)&(u<u1-.025*width))
+    support_columns=np.asarray(support_columns,dtype=bool).reshape(-1)
+    if support_columns.shape!=(w,):raise ValueError('Stand projection columns differ from source width')
+    affected=corner_columns&(bottom>curve+4)&(base>curve+4)&support_columns&present.any(axis=0)
+    if paper is not None:
+        affected &= ~np.any(np.asarray(paper,dtype=bool)&(np.arange(h)[:,None]>=curve[None,:]-3),axis=0)
+    limit=base.copy();details=[]
+    if not affected.any():return limit,dict(method='raw_supported_local_corner_contact',changed_columns=[],corners=[])
+    gradient=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(np.float32),.8,axis=0),axis=0),axis=2)
+    for name,side in [('left',u<(u0+u1)/2),('right',u>=(u0+u1)/2)]:
+        cols=np.flatnonzero(affected&side)
+        if not len(cols):continue
+        # Validate a full local neighbourhood, including exposed witnesses on
+        # both sides of the contact. Do not fit the stand's distant white rail.
+        check=np.arange(max(0,cols.min()-8),min(w,cols.max()+9))
+        ys=np.rint(curve[check,None]+np.arange(-3,4)).astype(int)
+        values=gradient[np.clip(ys,0,h-1),check[:,None]]
+        peak=np.argmax(values,axis=1);strength=values[np.arange(len(check)),peak]
+        measured=ys[np.arange(len(check)),peak].astype(float)
+        supported=(strength>3)&(peak>0)&(peak<6)
+        if supported.mean()<.6 or supported.sum()<12:
+            raise ValueError('Corner contact lacks independent raw RGB boundary support: '+name)
+        displacement=measured[supported]-curve[check[supported]]
+        offset=float(np.median(displacement));residual=float(np.percentile(np.abs(displacement-offset),95))
+        if abs(offset)>2.5 or residual>2.5:
+            raise ValueError('Corner contact raw RGB disagrees with own body curve: '+name)
+        # Retain a full source pixel beyond the independently measured edge.
+        # This is a conservative alpha-only trim, never synthesized RGB.
+        local=curve[cols]+max(0.,offset)+1.
+        limit[cols]=np.minimum(base[cols],local)
+        details.append(dict(side=name,columns=[int(cols.min()),int(cols.max())],
+            rgb_support_fraction=float(supported.mean()),rgb_offset_px=offset,
+            rgb_residual_p95_px=residual,source_samples=int(supported.sum())))
+    return limit,dict(method='raw_supported_local_corner_contact',changed_columns=np.flatnonzero(limit<base).tolist(),corners=details)
 
 
 def line_samples(alpha, lo, hi):
@@ -255,7 +366,23 @@ def frame_geometry(matte, face, stage_sink=None,source_image=None):
     # Preserve native curved endcaps with their segmentation alpha. Rail
     # masking removes only projections/support, with an outward allowance.
     upper=np.ceil(np.polyval(top,x)) if face == 'top' else np.polyval(top,x)-1.
-    lower=np.polyval(bottom,x)+1.
+    # The old extra outward pixel can retain the stand's white contact seam.
+    # Use the independently agreed physical lower edge on side strips only;
+    # retain fractional pixel coverage rather than eroding the photographed
+    # body. Ambiguous source/alpha agreement keeps the conservative proposal
+    # and remains explicitly unresolved for geometry review.
+    lower_allowance = 1.
+    if face in ('left', 'right'):
+        agreed = (proof['rgb_boundary_error_px'] <= 1. and
+                  proof['rgb_boundary_residual_p95_px'] <= 1.)
+        if agreed:
+            lower_allowance = 0.
+        proof['support_edge_separation'] = dict(
+            method='independently_agreed_side_lower_edge_fractional_coverage',
+            status='candidate_requires_geometry_review' if agreed else 'unresolved_source_alpha_disagreement',
+            outward_allowance_px=lower_allowance,
+            source_rgb_painted=False, phone_core_inward_offset_px=0.)
+    lower=np.polyval(bottom,x)+lower_allowance
     coverage=np.clip(np.minimum(y+1,lower)-np.maximum(y,upper),0,1)
     a[...,3]=np.minimum(a[...,3],np.rint(255*coverage).astype(np.uint8))
     if face == 'top':
@@ -313,7 +440,74 @@ def exposed_lower_plane(mask, raw_gradient, x0, x1, last_body_row, paper=None):
     return min(options,key=lambda item:item[0])
 
 
-def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
+def front_support_coverage(alpha,limit,support_columns):
+    """Keep measured source coverage, without a second outer safety margin."""
+    yy=np.arange(alpha.shape[0])[:,None]
+    coverage=np.clip(np.asarray(limit)-yy,0,1)
+    selected=np.broadcast_to(support_columns,alpha.shape)
+    result=np.array(alpha,copy=True)
+    result[selected]=np.minimum(result[selected],np.rint(255*coverage[selected]).astype(np.uint8))
+    return result
+
+
+def front_lower_closure(mask,raw_rgb,x0,x1,last_body_row,source_alpha=None):
+    """Conserve the observed alpha rail; independently verify glass closure.
+
+    Chrome can have several stronger internal RGB transitions. This fallback
+    does not select an inward reflection as the silhouette or paint a rim.
+    """
+    h,w=mask.shape;bw=x1-x0
+    x=np.r_[np.arange(int(x0+.30*bw),int(x0+.45*bw)),
+            np.arange(int(x0+.55*bw),int(x0+.70*bw))]
+    edge=h-np.argmax(mask[::-1,x],axis=0)
+    valid=(edge<h-16)&(abs(edge-last_body_row)<=.04*bw)
+    x,edge=x[valid],edge[valid]
+    halves=[x<(x0+x1)/2,x>=(x0+x1)/2]
+    if min(int(s.sum()) for s in halves)<20:raise ValueError('Front lower closure lacks two exposed alpha gaps')
+    line,kept,residual=consensus_line(x+.5,edge.astype(float),3,np.tan(np.deg2rad(4)))
+    if min(float(kept[s].mean()) for s in halves)<.8:raise ValueError('Front lower alpha gaps disagree')
+    # Retain every near-body opaque source row rather than cutting at a
+    # stronger inner glass/chrome reflection. Far support projections cannot
+    # authorize the rail position.
+    xx=np.arange(int(x0+.1*bw),int(x1-.1*bw));bottom=h-np.argmax(mask[::-1,xx],axis=0)
+    witnesses=abs(bottom-np.polyval(line,xx+.5))<=6
+    if witnesses.sum()<.4*bw:raise ValueError('Front lower conservation witnesses are insufficient')
+    core=mask if source_alpha is None else np.asarray(source_alpha)>=240
+    core_bottom=h-np.argmax(core[::-1,xx],axis=0)
+    outward=max(0.,float(np.max(core_bottom[witnesses]-np.polyval(line,xx[witnesses]+.5))))
+    if outward>3:raise ValueError('Front lower contour needs unsupported outward extension')
+    line[1]+=outward
+    body_row=int(round(np.polyval(line,(x0+x1)/2)-10))
+    body_width_fraction=float(mask[body_row,x0:x1].mean())
+    if body_width_fraction<.6:raise ValueError('Front lower closure is a narrow support rather than the phone')
+    sample=np.arange(int(x0+.2*bw),int(x1-.2*bw));yy=np.rint(np.polyval(line,sample+.5)).astype(int)
+    if yy.min()<26 or yy.max()+16>=h:raise ValueError('Front lower RGB closure is clipped')
+    gray=np.mean(raw_rgb.astype(float),axis=2)
+    inside=np.median(gray[yy[:,None]+np.arange(-25,-14),sample[:,None]],axis=1)
+    outside=np.median(gray[yy[:,None]+np.arange(5,16),sample[:,None]],axis=1)
+    groups=np.array_split(outside-inside,2);fractions=[float(np.mean(v>40)) for v in groups]
+    if min(fractions)<.90:raise ValueError('Front lower lacks independent dark glass to background closure')
+    proof=dict(method='front_alpha_plateau_with_independent_dark_glass_closure',
+        alpha_residual_p95_px=residual,alpha_samples=len(x),source_conservation_outward_px=outward,source_core_alpha_threshold=240,
+        glass_background_contrast_medians=[float(np.median(v)) for v in groups],
+        dark_glass_closure_fractions=fractions,observed_body_width_fraction=body_width_fraction,
+        RGB_does_not_set_inward_cut=True)
+    return 2*residual,line,line,len(x),[.30,.45],proof
+
+
+def paper_without_stand(paper, limit):
+    """A sticker tail ends just past the body; white paper-like pixels beyond
+    the lower body edge that run on to the photograph's bottom border are the
+    stand (paper detection can flood into it) and get no paper protection."""
+    if paper is None or not paper.any():return paper
+    h=paper.shape[0];yy=np.arange(h)[:,None]
+    beyond=paper&(yy>np.broadcast_to(limit,paper.shape)+1)
+    labels,n=ndimage.label(beyond)
+    stand=np.isin(labels,np.unique(labels[-1][labels[-1]>0]))
+    return paper&~stand
+
+
+def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image=None,reconstruct_paper_tail=True,_front_closure_evidence=False):
     """Remove the attached stand locally, preserving the segmented round corners."""
     a=np.array(matte.convert('RGBA'));mask=principal(a[...,3]);h,w=mask.shape
     widths=mask.sum(axis=1);wide=widths>widths.max()*.8
@@ -353,7 +547,9 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
     lower_plane_proof=None
     if not clear_options:
         try:
-            score,al,rl,n,bands,lower_plane_proof=exposed_lower_plane(mask,raw_gradient,x0,x1,rows[-1],paper)
+            if _front_closure_evidence:
+                score,al,rl,n,bands,lower_plane_proof=front_lower_closure(mask,raw_rgb,x0,x1,rows[-1],a[...,3])
+            else:score,al,rl,n,bands,lower_plane_proof=exposed_lower_plane(mask,raw_gradient,x0,x1,rows[-1],paper)
             clear_options.append((score,al,rl,n,bands))
         except ValueError:pass
     if clear_options:
@@ -362,15 +558,34 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
         # alpha retained at both exposed, already segmented round corners.
         line=rgb_line;residual=corner_proof['corner_residual_p95_px'] if bands is None else score/2;inlier_fraction=1.
         yy=np.arange(h)[:,None];xx=np.arange(w)[None,:]+.5;limit=np.polyval(line,xx)
+        paper_tail_proof=None
+        if reconstruct_paper_tail and face=='back' and paper is not None and paper.any():
+            from .auto_material import source_paper_tail
+            paper,tail_info=source_paper_tail(np.dstack([raw_rgb,a[...,3]]),paper,{},physical_end=limit[0])
+            paper_tail_proof=tail_info.get('source_paper_tail')
         far_start=min(h-1,max(0,int(np.min(limit))+12))
         support_columns=ndimage.binary_dilation((a[far_start:,:,3]>0).any(axis=0),iterations=8)[None,:]
-        outside=(yy>limit+1)&support_columns
-        if paper is not None:outside &= ~paper
-        a[...,3][outside]=0
-        contact=(yy>=limit-2)&(yy<=limit+1)&mask&support_columns
-        if paper is not None:contact &= ~paper
-        coverage=np.clip((limit+1-yy)/3.,0,1)
-        a[...,3][contact]=np.minimum(a[...,3][contact],np.rint(255*coverage[contact]).astype(np.uint8))
+        contact_curve_proof=None
+        if bands is None:
+            # With a tilted body, a single global far-start row can still
+            # intersect the phone at the opposite end. This new corner-only
+            # projection must be genuinely beyond each column's body plane.
+            remote=(yy>limit+12)&(a[...,3]>0)
+            corner_support=ndimage.binary_dilation(remote.any(axis=0),iterations=8)
+            local_limit,contact_curve_proof=plate_corner_contact_limit(a,raw_rgb,line,corner_proof,corner_support,paper)
+            limit=local_limit[None,:]
+        if lower_plane_proof and lower_plane_proof.get('method')=='front_alpha_plateau_with_independent_dark_glass_closure':
+            a[...,3]=front_support_coverage(a[...,3],limit,support_columns)
+            lower_plane_proof['source_cut']='fractional_coverage_at_exclusive_alpha_rail_no_extra_stand_pixel'
+        else:
+            paper=paper_without_stand(paper,limit)
+            outside=(yy>limit+1)&support_columns
+            if paper is not None:outside &= ~paper
+            a[...,3][outside]=0
+            contact=(yy>=limit-2)&(yy<=limit+1)&mask&support_columns
+            if paper is not None:contact &= ~paper
+            coverage=np.clip((limit+1-yy)/3.,0,1)
+            a[...,3][contact]=np.minimum(a[...,3][contact],np.rint(255*coverage[contact]).astype(np.uint8))
         if stage_sink:stage_sink('source_matte',matte);stage_sink('after_support',Image.fromarray(a))
         angle=axis_proof['rotation_ccw_degrees'];rotated=Image.fromarray(rotate_alpha_safe(a,angle))
         if stage_sink:stage_sink('after_rotation',rotated);stage_sink('after_crop',rotated)
@@ -379,9 +594,11 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
             output_size=list(result.size),body_x=[x0,x1],bottom_rail=line.tolist(),alpha_lower_rail=alpha_line.tolist(),
             clear_bands=bands,exposed_samples=n_clear,lower_edge_residual_p95_px=residual,
             own_corner_evidence=corner_proof if bands is None else None,axis_evidence=axis_proof,
+            corner_contact_evidence=contact_curve_proof,
+            source_paper_tail=paper_tail_proof,
             lower_plane_evidence=lower_plane_proof,
             rotation_ccw_degrees=angle,canvas_trim_xyxy=list(box),rgb_painted=False,
-            review_reasons=['heuristic_support_cut','complete_outline_requires_review'])
+            review_reasons=['heuristic_support_cut','complete_outline_requires_review']+(['source_contact_appearance_unverified'] if lower_plane_proof and lower_plane_proof.get('method')=='front_alpha_plateau_with_independent_dark_glass_closure' else []))
     x=np.arange(int(x0+.1*bw),int(x1-.1*bw));bottom=h-np.argmax(mask[::-1,x],axis=0)
     exposed=(bottom<h-8)&(bottom>rows[-1]-bw*.12)
     if exposed.sum()<.08*bw:raise ValueError('Insufficient exposed plate edge')
@@ -428,9 +645,15 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
         raise ValueError('Plate lower boundary is uncertain')
     _,line,residual,inlier_fraction=max(options,key=lambda v:v[0])
     yy=np.arange(h)[:,None];xx=np.arange(w)[None,:]+.5;limit=np.polyval(line,xx)+1.
+    paper_tail_proof=None
+    if reconstruct_paper_tail and face=='back' and paper is not None and paper.any():
+        from .auto_material import source_paper_tail
+        paper,tail_info=source_paper_tail(np.dstack([raw_rgb,a[...,3]]),paper,{},physical_end=np.polyval(line,xx)[0])
+        paper_tail_proof=tail_info.get('source_paper_tail')
     far=mask[int(np.polyval(line,(x0+x1)/2)+12):]
     support_columns=ndimage.binary_dilation(far.any(axis=0),iterations=8)
     support=ndimage.binary_fill_holes(np.broadcast_to(support_columns,(h,w))) & (yy>=limit)
+    paper=paper_without_stand(paper,limit)
     if paper is not None:support &= ~paper
     a[...,3][support]=0
     if stage_sink:stage_sink('source_matte',matte);stage_sink('after_support',Image.fromarray(a))
@@ -443,5 +666,24 @@ def plate_geometry(matte, face, paper=None, stage_sink=None,source_image=None):
     return result,dict(method='local_stand_removal_from_exposed_plate_edges_v1',
         source_size=list(matte.size),output_size=list(result.size),body_x=[x0,x1],
         bottom_rail=line.tolist(),lower_edge_residual_p95_px=residual,exposed_samples=int(valid.sum()),
+        source_paper_tail=paper_tail_proof,
         rotation_ccw_degrees=angle,canvas_trim_xyxy=list(box),removed_support_pixels=int(support.sum()),
         rgb_painted=False,axis_evidence=axis_proof,review_reasons=['heuristic_support_cut','complete_outline_requires_review'])
+
+
+def plate_geometry(matte,face,paper=None,stage_sink=None,source_image=None,reconstruct_paper_tail=True):
+    """Keep accepted geometry unchanged; recover a different exposed source gap."""
+    try:
+        return _plate_geometry_strict(matte,face,paper,stage_sink,source_image,reconstruct_paper_tail)
+    except ValueError as original:
+        if str(original)!='Plate lower boundary is uncertain' or face!='front':raise
+        try:
+            image,proof=_plate_geometry_strict(matte,face,paper,stage_sink,source_image,reconstruct_paper_tail,
+                _front_closure_evidence=True)
+        except ValueError:
+            raise original
+        if not proof.get('lower_plane_evidence'):
+            raise original
+        proof['lower_plane_evidence']['recovery']='independent_exposed_gap_between_attached_support_contacts'
+        proof['lower_plane_evidence']['original_failure']=str(original)
+        return image,proof

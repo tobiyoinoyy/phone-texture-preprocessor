@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import numpy as np
 from PIL import Image
+from scipy.ndimage import gaussian_filter1d
 from harmonize_aluminum import rgb_to_lab, lab_to_rgb, gaussian, digest, inward_weight
 from extract_uv_seams import build as extract_chains
 
@@ -34,21 +35,47 @@ def resample_side(side,arc,ss):
 
 
 def apply_band(shape, side, arc, ss, offset, slope, width_units, guard):
-    h,w=shape;pts=side['points'];width=width_units*side['px_per_unit']
-    # Locate each image pixel relative to its closest actual UV edge segment.
-    pad=int(np.ceil(max(width,guard)))+2
+    """Extend the correction continuously across a monotone UV cross-section.
+
+    Closest-segment projection is multivalued on the inside of a curved seam.
+    Its arc coordinate jumps across the curve's medial axis, creating diagonal
+    color blocks even for perfectly smooth input. Frame seams are graphs over
+    their long axis: intersecting each transverse image line with that graph
+    gives one continuous correspondence. This changes only the correction
+    field, never the UV coordinates, source texture, or material masks.
+    """
+    h,w=shape;pts=np.asarray(side['points']);arc=np.asarray(arc)
+    normals=np.asarray(side['normals']);width=width_units*side['px_per_unit']
+    if width <= 0 or guard <= 0:
+        raise ValueError('Seam width and guard must be positive')
+    axis=int(np.argmax(np.ptp(pts,axis=0)));cross=1-axis
+    along=pts[:,axis];differences=np.diff(along)
+    if np.all(differences < 0):
+        pts=pts[::-1];arc=arc[::-1];normals=normals[::-1]
+    elif np.all(differences > 0):
+        pass
+    else:
+        raise ValueError('UV seam must be a monotone cross-section; split the turning chain')
+    along=pts[:,axis]
+    if np.any(np.abs(normals[:,cross]) < .1) or np.any(normals[:,cross]*normals[0,cross] <= 0):
+        raise ValueError('UV seam normals do not define a consistent cross-section')
+    # The band width is a normal distance. Its transverse image extent grows
+    # at a curved end; a width-sized rectangular crop would cut the field off
+    # before the cubic taper reaches zero and create a new straight boundary.
+    pad=np.full(2,int(np.ceil(guard))+2)
+    pad[cross]=int(np.ceil(max(width,guard)/np.min(np.abs(normals[:,cross]))+guard))+2
     lo=np.maximum(np.floor(pts.min(0)-pad).astype(int),[0,0]);hi=np.minimum(np.ceil(pts.max(0)+pad).astype(int),[w,h])
     yy,xx=np.mgrid[lo[1]:hi[1],lo[0]:hi[0]];grid=np.stack([xx,yy],axis=-1)
-    best=np.full(xx.shape,np.inf);coord=np.zeros_like(xx,dtype=float);dist=np.zeros_like(coord)
-    endpoint_excess=np.zeros_like(coord)
-    for i,(a,b) in enumerate(zip(pts[:-1],pts[1:])):
-        v=b-a;raw=np.sum((grid-a)*v,axis=-1)/np.dot(v,v);t=np.clip(raw,0,1)
-        near=a+t[...,None]*v;delta=grid-near;d2=np.sum(delta*delta,axis=-1);sel=d2<best
-        normal=(1-t[...,None])*side['normals'][i]+t[...,None]*side['normals'][i+1]
-        normal/=np.linalg.norm(normal,axis=-1)[...,None]
-        best[sel]=d2[sel];coord[sel]=(arc[i]+t*(arc[i+1]-arc[i]))[sel]
-        dist[sel]=np.sum(delta*normal,axis=-1)[sel]
-        endpoint_excess[sel]=(np.abs(raw-t)*np.linalg.norm(v))[sel]
+    tangent=grid[...,axis];clamped=np.clip(tangent,along[0],along[-1])
+    coord=np.interp(clamped,along,arc)
+    normal=np.stack([np.interp(clamped,along,normals[:,i]) for i in range(2)],axis=-1)
+    normal/=np.linalg.norm(normal,axis=-1)[...,None]
+    boundary=np.interp(clamped,along,pts[:,cross])
+    # Continue the end tangent only beyond the two genuine chain endpoints.
+    # Capping every constituent segment also introduced artificial wedges.
+    boundary-=normal[...,axis]/normal[...,cross]*(tangent-clamped)
+    dist=(grid[...,cross]-boundary)*normal[...,cross]
+    endpoint_excess=np.abs(tangent-clamped)/np.abs(normal[...,cross])
     t=np.clip(dist/width,0,1)
     delta=np.stack([np.interp(coord,ss,offset[:,c]) for c in range(3)],axis=-1)
     deriv=np.stack([np.interp(coord,ss,slope[:,c]) for c in range(3)],axis=-1)
@@ -63,6 +90,28 @@ def apply_band(shape, side, arc, ss, offset, slope, width_units, guard):
     full=np.zeros((h,w,3));full[lo[1]:hi[1],lo[0]:hi[0]]=correction
     mask=np.zeros((h,w),bool);mask[lo[1]:hi[1],lo[0]:hi[0]]=active&(cap>0)
     return full,mask
+
+
+def correction_continuity(field, valid):
+    """Measure the added field, not photographic grain or material edges."""
+    maximum=0.;maximum_l=0.;location=None;count=0
+    for axis in (0,1):
+        adjacent=(valid[1:]&valid[:-1]) if axis==0 else (valid[:,1:]&valid[:,:-1])
+        delta=np.diff(field,axis=axis)
+        values=np.linalg.norm(delta,axis=-1)
+        if not np.isfinite(delta[adjacent]).all():
+            raise ValueError('Nonfinite UV seam correction field')
+        count+=int(adjacent.sum())
+        if not adjacent.any():
+            continue
+        maximum_l=max(maximum_l,float(np.abs(delta[...,0])[adjacent].max()))
+        values=np.where(adjacent,values,0.)
+        y,x=np.unravel_index(values.argmax(),values.shape)
+        if values[y,x]>maximum:
+            maximum=float(values[y,x]);location=[int(x),int(y),axis]
+    return dict(max_step_deltaE76=maximum,max_step_L=maximum_l,
+                max_step_xy_axis=location,adjacent_pairs=count,
+                scope='added floating Lab field within opaque editable material')
 
 
 def run(job_path):
@@ -110,57 +159,109 @@ def run(job_path):
         for side in chain['sides']:
             if side.get('image_size') and tuple(side['image_size'])!=ims[side['name']].size:
                 raise ValueError('Seam UV pixel coordinates refer to a different image size')
-    fields={n:np.zeros_like(l)for n,l in labs.items()};bands={n:np.zeros(a.shape[:2],bool)for n,a in originals.items()}
-    info=[]
-    for chain in paired:
-        arc=chain['arc'];ss=np.linspace(0,arc[-1],192);samples=[];derivatives=[]
-        metric_valid=np.ones(len(ss),bool)
-        for side in chain['sides']:
-            p,n=resample_side(side,arc,ss);step=job.get('derivative_step_units',.015)*side['px_per_unit']
-            values=sample(low[side['name']],p)
-            derivative=(sample(low[side['name']],p+n*step)-values)/job.get('derivative_step_units',.015)
-            samples.append(values);derivatives.append(derivative)
-            metric_valid &= sample(weights[side['name']][...,None],p)[:,0]>.98
-        target=(samples[0]+samples[1])/2
-        desired=[(derivatives[0]-derivatives[1])/2,(derivatives[1]-derivatives[0])/2]
-        for k,side in enumerate(chain['sides']):
-            offset=np.clip(target-samples[k],-np.array(job.get('max_lab_shift',[18,12,12])),np.array(job.get('max_lab_shift',[18,12,12])))
-            slope=desired[k]-derivatives[k]
-            # Limit derivative corrections so the transition cannot overshoot heavily.
-            lim=np.array(job.get('max_slope_effect',[16,10,10]))/job.get('width_units',.20)
-            slope=np.clip(slope,-lim,lim)
-            field,mask=apply_band(originals[side['name']].shape[:2],side,arc,ss,offset,slope,job.get('width_units',.20),job.get('guard_pixels',6))
-            if np.any(bands[side['name']]&mask):raise ValueError('Overlapping seam bands need joint solve')
-            fields[side['name']]+=field;bands[side['name']]|=mask
-        before=np.linalg.norm(samples[0]-samples[1],axis=-1)[metric_valid]
-        if not len(before):raise ValueError('Seam contains no jointly editable samples')
-        if metric_valid.mean() < job.get('minimum_joint_coverage',0):
-            raise ValueError('UV seam lacks required jointly editable material coverage')
-        info.append({'pair':chain['names'],'edge_ids':chain['edges'],'before_mean_deltaE76':float(before.mean()),'before_p95_deltaE76':float(np.quantile(before,.95)),
-                     'metric_samples':int(metric_valid.sum()),'total_samples':len(ss),
-                     'joint_coverage':float(metric_valid.mean()),'width_pixels':{s['name']:job.get('width_units',.20)*s['px_per_unit']for s in chain['sides']}})
-    # Evaluate the finite sampling footprint, not only the ideal seam line.
-    # Accumulate bounded residual fields against the original pixels; do not
-    # blur/reprocess already quantized outputs or alter the detail residual.
-    refinements=job.get('sampling_refinements',0)
-    if type(refinements) is not int or not 0<=refinements<=3:
-        raise ValueError('sampling_refinements must be an integer from 0 to 3')
-    for _ in range(refinements):
-        predicted={}
-        for name,src in originals.items():
-            lab=rgb_to_lab(lab_to_rgb(labs[name]+fields[name]*weights[name][...,None]))
-            fit=allows[name]&(src[...,3]>=240)
-            den=gaussian(fit.astype(float),job.get('sigma',3))
-            predicted[name]=gaussian(lab*fit[...,None],job.get('sigma',3))/np.maximum(den[...,None],1e-8)
+    limit=job.get('maximum_correction_step_deltaE76',float('inf'))
+    if np.isnan(limit) or limit<=0:
+        raise ValueError('Correction continuity limit must be positive')
+    def solve(along_sigma):
+        fields={n:np.zeros_like(l)for n,l in labs.items()};bands={n:np.zeros(a.shape[:2],bool)for n,a in originals.items()}
+        info=[]
         for chain in paired:
-            arc=chain['arc'];ss=np.linspace(0,arc[-1],192)
-            samples=[sample(predicted[s['name']],resample_side(s,arc,ss)[0]) for s in chain['sides']]
+            arc=chain['arc'];ss=np.linspace(0,arc[-1],192);samples=[];derivatives=[]
+            metric_valid=np.ones(len(ss),bool)
+            for side in chain['sides']:
+                p,n=resample_side(side,arc,ss);step=job.get('derivative_step_units',.015)*side['px_per_unit']
+                values=sample(low[side['name']],p)
+                derivative=(sample(low[side['name']],p+n*step)-values)/job.get('derivative_step_units',.015)
+                samples.append(values);derivatives.append(derivative)
+                metric_valid &= sample(weights[side['name']][...,None],p)[:,0]>.98
             target=(samples[0]+samples[1])/2
+            desired=[(derivatives[0]-derivatives[1])/2,(derivatives[1]-derivatives[0])/2]
             for k,side in enumerate(chain['sides']):
-                residual=np.clip(target-samples[k],-2.,2.)
-                field,_=apply_band(originals[side['name']].shape[:2],side,arc,ss,residual,
-                    np.zeros_like(residual),job.get('width_units',.20),job.get('guard_pixels',6))
-                fields[side['name']]+=field
+                offset=np.clip(target-samples[k],-np.array(job.get('max_lab_shift',[18,12,12])),np.array(job.get('max_lab_shift',[18,12,12])))
+                if along_sigma:offset=gaussian_filter1d(offset,along_sigma,axis=0,mode='nearest')
+                slope=desired[k]-derivatives[k]
+                # Limit derivative corrections so the transition cannot overshoot heavily.
+                lim=np.array(job.get('max_slope_effect',[16,10,10]))/job.get('width_units',.20)
+                slope=np.clip(slope,-lim,lim)
+                if along_sigma:slope=gaussian_filter1d(slope,along_sigma,axis=0,mode='nearest')
+                field,mask=apply_band(originals[side['name']].shape[:2],side,arc,ss,offset,slope,job.get('width_units',.20),job.get('guard_pixels',6))
+                if np.any(bands[side['name']]&mask):raise ValueError('Overlapping seam bands need joint solve')
+                fields[side['name']]+=field;bands[side['name']]|=mask
+            before=np.linalg.norm(samples[0]-samples[1],axis=-1)[metric_valid]
+            if not len(before):raise ValueError('Seam contains no jointly editable samples')
+            if metric_valid.mean() < job.get('minimum_joint_coverage',0):
+                raise ValueError('UV seam lacks required jointly editable material coverage')
+            info.append({'pair':chain['names'],'edge_ids':chain['edges'],'before_mean_deltaE76':float(before.mean()),'before_p95_deltaE76':float(np.quantile(before,.95)),
+                         'metric_samples':int(metric_valid.sum()),'total_samples':len(ss),
+                         'joint_coverage':float(metric_valid.mean()),'width_pixels':{s['name']:job.get('width_units',.20)*s['px_per_unit']for s in chain['sides']}})
+        # Evaluate the finite sampling footprint, not only the ideal seam line.
+        # Accumulate bounded residual fields against the original pixels; do not
+        # blur/reprocess already quantized outputs or alter the detail residual.
+        refinements=job.get('sampling_refinements',0)
+        if type(refinements) is not int or not 0<=refinements<=3:
+            raise ValueError('sampling_refinements must be an integer from 0 to 3')
+        for _ in range(refinements):
+            predicted={}
+            for name,src in originals.items():
+                lab=rgb_to_lab(lab_to_rgb(labs[name]+fields[name]*weights[name][...,None]))
+                fit=allows[name]&(src[...,3]>=240)
+                den=gaussian(fit.astype(float),job.get('sigma',3))
+                predicted[name]=gaussian(lab*fit[...,None],job.get('sigma',3))/np.maximum(den[...,None],1e-8)
+            for chain in paired:
+                arc=chain['arc'];ss=np.linspace(0,arc[-1],192)
+                samples=[sample(predicted[s['name']],resample_side(s,arc,ss)[0]) for s in chain['sides']]
+                target=(samples[0]+samples[1])/2
+                for k,side in enumerate(chain['sides']):
+                    residual=np.clip(target-samples[k],-2.,2.)
+                    field,_=apply_band(originals[side['name']].shape[:2],side,arc,ss,residual,
+                        np.zeros_like(residual),job.get('width_units',.20),job.get('guard_pixels',6))
+                    fields[side['name']]+=field
+        continuity={}
+        for n,src in originals.items():
+            effective=allows[n]&bands[n]
+            applied=np.where(effective[...,None],fields[n]*weights[n][...,None],0.)
+            continuity[n]=correction_continuity(applied,allows[n]&(src[...,3]>=240))
+        return fields,bands,info,continuity
+    def worst(continuity):
+        return max(continuity.items(),key=lambda item:item[1]['max_step_deltaE76'])
+    def predicted_p95(fields,bands):
+        values=[]
+        for chain in paired:
+            arc=chain['arc'];ss=np.linspace(0,arc[-1],192);samples=[];metric_valid=np.ones(len(ss),bool)
+            for side in chain['sides']:
+                name=side['name'];effective=allows[name]&bands[name]
+                lab=np.where(effective[...,None],rgb_to_lab(lab_to_rgb(labs[name]+fields[name]*weights[name][...,None])),labs[name])
+                fit=allows[name]&(originals[name][...,3]>=240);den=gaussian(fit.astype(float),job.get('sigma',3))
+                normalized=gaussian(lab*fit[...,None],job.get('sigma',3))/np.maximum(den[...,None],1e-8)
+                p,_=resample_side(side,arc,ss);samples.append(sample(normalized,p))
+                metric_valid &= sample(weights[name][...,None],p)[:,0]>.98
+            values.append(float(np.quantile(np.linalg.norm(samples[0]-samples[1],axis=-1)[metric_valid],.95)))
+        return max(values)
+    fields,bands,info,continuity=solve(0.)
+    continuity_resolution=None
+    name,check=worst(continuity)
+    if check['max_step_deltaE76']>limit:
+        # A steep correction is usually a few unreliable samples at a rounded
+        # rim end. Retry with mild along-seam smoothing of the same targets.
+        attempts=[dict(along_sigma=0.,max_step_deltaE76=check['max_step_deltaE76'],face=name)]
+        accepted=None
+        for along_sigma in job.get('continuity_retry_sigmas',[]):
+            trial=solve(float(along_sigma))
+            tname,tcheck=worst(trial[3]);p95=predicted_p95(trial[0],trial[1])
+            attempts.append(dict(along_sigma=float(along_sigma),max_step_deltaE76=tcheck['max_step_deltaE76'],face=tname,predicted_p95_deltaE76=p95))
+            if tcheck['max_step_deltaE76']<=limit and p95<=job.get('maximum_p95_deltaE76',float('inf')):
+                accepted=trial;break
+        if accepted is not None:
+            fields,bands,info,continuity=accepted
+            continuity_resolution=dict(method='along_seam_smoothing',attempts=attempts,along_sigma=attempts[-1]['along_sigma'])
+        else:
+            fields,bands,info,continuity=solve(0.)
+            warn=job.get('continuity_warning_limit_deltaE76')
+            if warn is None or check['max_step_deltaE76']>warn:
+                raise ValueError('UV seam correction field discontinuity on '+name+': '+
+                                 str(check['max_step_deltaE76'])+' exceeds '+str(limit))
+            continuity_resolution=dict(method='applied_with_steep_step_warning',attempts=attempts,
+                face=name,max_step_deltaE76=check['max_step_deltaE76'],limit=limit,warning_limit=warn)
     output.mkdir(parents=True,exist_ok=True);records.mkdir(parents=True,exist_ok=True)
     checks={};outputs={}
     for n,src in originals.items():
@@ -174,7 +275,7 @@ def run(job_path):
         assert digest(job['views'][n]['source'])==hashes[n]
         outputs[n]=rgb_to_lab(saved[...,:3])
         Image.fromarray(effective.astype(np.uint8)*255).save(records/(n+'-seam-mask.png'))
-        checks[n]={'source':job['views'][n]['source'],'source_sha256':hashes[n],'output':str(output/(n+'.png')),'size':list(ims[n].size),'alpha_changed':0,'protected_changed':0,'outside_changed':0,'changed_pixels':int(np.any(saved!=src,axis=-1).sum())}
+        checks[n]={'source':job['views'][n]['source'],'source_sha256':hashes[n],'output':str(output/(n+'.png')),'size':list(ims[n].size),'alpha_changed':0,'protected_changed':0,'outside_changed':0,'changed_pixels':int(np.any(saved!=src,axis=-1).sum()),'correction_continuity':continuity[n]}
     for chain,entry in zip(paired,info):
         arc=chain['arc'];ss=np.linspace(0,arc[-1],192);samples=[]
         metric_valid=np.ones(len(ss),bool)
@@ -187,7 +288,9 @@ def run(job_path):
             metric_valid &= sample(weights[name][...,None],p)[:,0]>.98
         diff=np.linalg.norm(samples[0]-samples[1],axis=-1)[metric_valid]
         entry.update(after_mean_deltaE76=float(diff.mean()),after_p95_deltaE76=float(np.quantile(diff,.95)))
-    report={'seams':info,'checks':checks,'validation_scope':'actual paired mesh UV samples; render separately'}
+    report={'seams':info,'checks':checks,'field_coordinates':'monotone_uv_cross_sections',
+            'continuity_resolution':continuity_resolution,
+            'validation_scope':'actual paired mesh UV samples; render separately'}
     (records/'validation.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
     (records/'job.json').write_text(json.dumps(job,ensure_ascii=False,indent=2))
     if any(s['after_p95_deltaE76'] > job.get('maximum_p95_deltaE76',float('inf')) for s in info):

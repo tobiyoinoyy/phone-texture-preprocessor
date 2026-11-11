@@ -1,6 +1,6 @@
 {
   "name": "phone-texture-preprocessor",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "手机六面贴图完整工作流：标准化、摆正、结构对齐、铝金属光照与不锈钢高光修复。",
   "author": {
     "name": "tobiyoinoyy"

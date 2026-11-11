@@ -13,6 +13,34 @@ class TopCalibrationError(ValueError):
     pass
 
 
+def _fast_lower_plateau(distance, observed, width, gradients, xx):
+    """Validate a resolved flat rail when the corner decay itself is subpixel.
+
+    This does not reconstruct a round corner. The original alpha keeps it;
+    only the independently visible lower plateau is used to cut the stand.
+    """
+    tail=distance>=.02*width
+    if tail.sum()<8:raise TopCalibrationError('TOP_LOWER_PLATEAU_TOO_SHORT')
+    values=observed[tail].astype(float)
+    left,right=values[::2],values[1::2]
+    plateau=float(np.median(left))
+    if (abs(float(np.median(right))-plateau)>.5 or
+            np.percentile(np.abs(values-plateau),95)>1):
+        raise TopCalibrationError('TOP_LOWER_PLATEAU_UNSTABLE')
+    yy=np.clip(observed[:,None]+np.arange(-3,4),0,gradients.shape[0]-1)
+    strengths=gradients[yy,xx[:,None]];peak=np.argmax(strengths,axis=1)
+    offsets=peak-3;valid=(strengths.max(axis=1)>3)&(peak>0)&(peak<6)
+    # observed lower y is an exclusive alpha row; a central RGB gradient
+    # is integer-sampled on either side of that half-pixel transition.
+    if valid.mean()<.8 or np.percentile(np.abs(offsets[valid]),95)>2:
+        raise TopCalibrationError('TOP_LOWER_PLATEAU_RGB_UNSUPPORTED')
+    return dict(method='held_out_flat_lower_rail_and_independent_RGB',tail_samples=int(tail.sum()),
+        alternating_tail_median_delta_px=abs(float(np.median(right))-plateau),
+        alpha_tail_residual_p95_px=float(np.percentile(np.abs(values-plateau),95)),
+        raw_rgb_support_fraction=float(valid.mean()),
+        raw_rgb_alpha_offset_p95_px=float(np.percentile(np.abs(offsets[valid]),95)),plateau=plateau)
+
+
 def calibrate_top(rgba, raw_rgb):
     if raw_rgb is None or raw_rgb.shape != rgba[..., :3].shape:
         raise TopCalibrationError('TOP_SOURCE_REQUIRED: original RGB required')
@@ -50,10 +78,16 @@ def calibrate_top(rgba, raw_rgb):
                         [float(yy.max()) + 25, 100, .03 * width]))
             errors = np.abs(residual(fit.x))
             if (not fit.success or fit.x[1] < 3 or
-                    not .0031 * width < fit.x[2] < .0299 * width or
                     np.percentile(errors[train], 95) > 1.5 or
                     np.percentile(errors[~train], 95) > 2):
                 raise TopCalibrationError('TOP_CORNER_AMBIGUOUS: unsupported body corner shape')
+            fast_proof=None
+            if not .0031*width < fit.x[2] < .0299*width:
+                if edge!='lower' or fit.x[2]>.0031*width:
+                    raise TopCalibrationError('TOP_CORNER_AMBIGUOUS: unsupported body corner shape')
+                fast_proof=_fast_lower_plateau(distance,yy,width,gradients,xx)
+                if abs(float(fit.x[0])-fast_proof['plateau'])>1:
+                    raise TopCalibrationError('TOP_LOWER_PLATEAU_FIT_DISAGREES')
             sample_y = np.clip(yy[:, None] + np.arange(-3, 4), 0, len(mask)-1)
             support = gradients[sample_y, xx[:, None]].max(axis=1) > 3
             if support.mean() < .8:
@@ -63,13 +97,16 @@ def calibrate_top(rgba, raw_rgb):
                 source_x=xx.tolist(), source_y=yy.tolist(), plateau=float(fit.x[0]),
                 decay_px=float(fit.x[2]), residual_p95_px=float(np.percentile(errors[train], 95)),
                 held_out_error_p95_px=float(np.percentile(errors[~train], 95)),
-                raw_rgb_supported_fraction=float(support.mean())))
+                raw_rgb_supported_fraction=float(support.mean()),fast_lower_plateau=fast_proof))
         levels.append(edge_levels)
     upper = np.polyfit([x0+.5, x1-.5], [v[0] for v in levels], 1)
     lower = np.polyfit([x0+.5, x1-.5], [v[1] for v in levels], 1)
     thickness = np.array([v[1]-v[0] for v in levels])
+    rail_angles=np.degrees(np.arctan([upper[0],lower[0]]))
+    rotation=float(np.degrees(np.mean(np.arctan([upper[0],lower[0]]))))
+    residual=np.abs(rail_angles-rotation)
     if (np.min(thickness) < .07*width or np.max(thickness) > .17*width or
-            abs(np.diff(thickness)[0]) > 4 or
+            residual.max() > .15 or
             max(abs(upper[0]), abs(lower[0])) > np.tan(np.deg2rad(4))):
         raise TopCalibrationError('TOP_BODY_RAILS_DISAGREE')
     # Raw surface transition across the body is independent of the silhouette
@@ -83,6 +120,9 @@ def calibrate_top(rgba, raw_rgb):
     return upper, lower, dict(method='top_body_exposed_corners_v1',
         capture_profile='iphone17-studio', x_extent=[x0,x1], corners=corners,
         raw_body_transition_support=halves, top_rail=upper.tolist(), bottom_rail=lower.tolist(),
+        rail_agreement=dict(method='same_angular_residual_as_post_rotation_guard',
+            maximum_residual_degrees=.15,measured_residual_degrees=residual.tolist(),
+            thickness_delta_px=float(abs(np.diff(thickness)[0]))),
         camera_policy='exclude_entire_camera_island_and_lenses', agent_required=False)
 
 
