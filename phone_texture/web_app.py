@@ -6,6 +6,7 @@ in an isolated process group. Only complete, checked batches get an export ZIP.
 import argparse
 import datetime as dt
 import fcntl
+from functools import lru_cache
 import hashlib
 import io
 import json
@@ -255,6 +256,41 @@ def read(path, default=None):
         return json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return {} if default is None else default
+
+
+def file_signature(path):
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@lru_cache(maxsize=1024)
+def cached_report(path, signature):
+    return json.loads(path.read_text())
+
+
+def read_status(path):
+    """Reuse unchanged reports; a concurrent write is retried on the next poll."""
+    try:
+        signature = file_signature(path)
+        report = cached_report(path, signature)
+        return report if file_signature(path) == signature else {}
+    except (OSError, ValueError):
+        return {}
+
+
+@lru_cache(maxsize=128)
+def cached_digest(path, signature):
+    return w.sha(path)
+
+
+def status_digest_matches(path, expected):
+    """Cache display checks only. Downloads always hash the file again."""
+    try:
+        signature = file_signature(path)
+        digest = cached_digest(path, signature)
+        return digest == expected and file_signature(path) == signature
+    except OSError:
+        return False
 
 
 def save(path, data):
@@ -949,7 +985,7 @@ class App:
             self.update(job, ended=time.time(), elapsed=elapsed, active_elapsed=max(0., elapsed-paused),
                         worker_returncode=proc.returncode if proc is not None else None)
 
-    def snapshot(self, job):
+    def snapshot(self, job, *, compact=False):
         with self.lock:
             result = dict(job)
         # Older batches keep their original on-disk layout and retry destination.
@@ -957,9 +993,18 @@ class App:
         rows = []; units = 0
         for name in result['names']:
             case = Path(result['work'])/'cases'/name
-            done = read(case/'result.json'); live = read(case/'live-progress.json')
+            reader = read_status if compact else read
+            done = reader(case/'result.json'); live = reader(case/'live-progress.json')
             complete = bool(done.get('six_faces_generated',done.get('six_faces_processed'))) and done.get('status')!='failed'
             processing = processing_state(done)
+            if compact:
+                # The browser uses the summary and per-face lighting state.
+                # Full diagnostics remain available through the default API.
+                processing.pop('bottom_alignment', None)
+                processing['per_face_stages'] = {
+                    face: dict(lighting=details.get('lighting'))
+                    for face, details in processing['per_face_stages'].items()
+                }
             # Effect warnings no longer hold a full-stage row back; only unfinished steps stay amber.
             retained=complete and (not processing['all_stages_complete'] or done.get('status')=='source_preserved_needs_review')
             status = 'review' if retained else 'complete' if complete else 'failed' if done.get('status') == 'failed' else 'running' if case.exists() and result['status'] in ACTIVE else 'waiting' if result['status'] in ACTIVE else 'unfinished'
@@ -969,7 +1014,7 @@ class App:
             bundle_digest=result.get('artifact_sha256',{}).get('bundle:'+name)
             bundle_available=(complete and result['status'] in ('complete','partial','review')
                 and isinstance(bundle_digest,str) and bundle_digest==bundle.get('zip_sha256')
-                and bundle_path.is_file() and w.sha(bundle_path)==bundle_digest)
+                and status_digest_matches(bundle_path, bundle_digest))
             rows.append(dict(name=name, status=status, stage=live.get('stage', 'loading'), face=live.get('face'),
                              seconds=done.get('seconds'), error=done.get('error'), error_hint=failure_hint(done.get('error')),
                              preview=complete, portable_review_available=bundle_available, **processing))
@@ -986,10 +1031,10 @@ class App:
             result.update(status='complete', message='六面图片已生成。')
         return result
 
-    def state(self):
+    def state(self, *, compact=False):
         with self.lock:
             jobs = list(self.jobs.values())
-        return dict(default_output=str(self.default_output), jobs=[self.snapshot(j) for j in reversed(jobs)],
+        return dict(default_output=str(self.default_output), jobs=[self.snapshot(j, compact=compact) for j in reversed(jobs)],
                     host=host_sample(), profile='iPhone 17 系列 · 铝金属 · 标准六面原图')
 
     def cancel(self, id):
@@ -1099,7 +1144,7 @@ def handler(app):
                     p = ASSETS/url.path[1:]
                     return self.respond(p.read_bytes(), mime='text/javascript; charset=utf-8' if p.suffix=='.js' else 'text/css; charset=utf-8')
                 if url.path == '/api/state':
-                    return self.respond(app.state())
+                    return self.respond(app.state(compact=q.get('compact') == '1'))
                 if url.path == '/api/health':
                     return self.respond(dict(app='phone-six-view-browser', version=__app_version__, home=str(app.home)))
                 if url.path == '/api/scan-image':

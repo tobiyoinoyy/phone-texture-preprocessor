@@ -73,11 +73,62 @@ $('start').onclick=()=>startBatch();
 function stageText(r){if(['review','complete'].includes(r.status))return '已生成 · '+(r.stage_summary||'处理阶段待核对')+' · '+seconds(r.seconds);if(r.status==='failed')return r.error_hint||r.error||'处理失败，请查看日志';if(r.status==='waiting')return '排队中';if(r.status==='unfinished')return '未完成';return ({loading:'准备中',geometry:'抠图摆正',geometry_resume:'校验并复用几何结果',lighting:'优化光照',alignment:'结构对齐',checking:'检查保存',preserving:'保存已完成阶段并记录待核对项'}[r.stage]||'正在处理')+(r.face?' · '+labels[r.face]:'');}
 function faceText(row,face){const stage=row?.face_processing?.[face],lighting=row?.per_face_stages?.[face]?.lighting;const label={geometry:'几何已完成，未应用调光',geometry_source:'几何已完成，未应用调光',lighting:'已调光',verified_lighting:'已调光',independently_verified_lighting:'已调光',pixel_verified_lighting_effect_warning:'已调光',lighting_review:'已应用调光候选，待核对',structure_review:'已调光并调整天线位置，待核对',structure:lighting==='failed'?'天线已对齐，调光未完成':'天线已对齐',seam:'调光与接缝已处理'}[stage]||'该面处理阶段待核对';return label;}
 function currentJob(){return jobs.find(j=>j.id===selectedJob);}
+function drawTaskRows(job) {
+ const container = $('taskRows');
+ if (container.dataset.job !== job.id) {
+  container.replaceChildren();
+  container.dataset.job = job.id;
+ }
+ const existing = new Map(Array.from(container.children, row => [row.dataset.name, row]));
+ const names = new Set(job.rows.map(row => row.name));
+ for (const row of Array.from(container.children)) {
+  if (!names.has(row.dataset.name)) row.remove();
+ }
+ job.rows.forEach((result, index) => {
+  const previous = existing.get(result.name);
+  const signature = JSON.stringify(result);
+  let row = previous;
+  if (!previous || previous.dataset.signature !== signature) {
+   row = node('div', undefined, 'task-row ' + result.status);
+   row.dataset.name = result.name;
+   row.dataset.signature = signature;
+   const description = node('div', undefined, 'description');
+   description.append(node('span', stageText(result)));
+   if (result.review_reasons?.length) {
+    const details = node('details', undefined, 'review-reasons');
+    details.open = previous?.querySelector('details')?.open || false;
+    details.append(node('summary', result.status === 'complete' ? '查看处理提示' : '查看待核对原因'));
+    for (const reason of result.review_reasons) {
+     const text = (labels[reason.face] ? labels[reason.face] + '：' : '') + (reason.message || '请核对过程记录');
+     const item = node('p', text);
+     if (reason.detail && reason.detail !== reason.message) item.append(node('small', reason.detail));
+     details.append(item);
+    }
+    description.append(details);
+   }
+   if (result.review_continuation_ready && result.status === 'review') {
+    description.append(node('small', '处理候选已生成，需人工核对；接缝处理未完成。'));
+   } else if (result.review_only && result.status === 'review') {
+    description.append(node('small', '处理步骤已完成，请复核候选效果。'));
+   }
+   if (result.portable_review_available) {
+    const bundle = node('a', '带复核记录下载');
+    bundle.href = asset(job.id, 'bundle', result.name, null, {download: 1});
+    description.append(bundle);
+   }
+   row.append(node('span', undefined, 'state-dot'), node('span', result.name), description);
+   if (previous) previous.replaceWith(row);
+  }
+  if (container.children[index] !== row) {
+   container.insertBefore(row, container.children[index] || null);
+  }
+ });
+}
 function drawJob(){
  const j=currentJob();$('jobPanel').hidden=!j;if(!j){$('resultPanel').hidden=true;return;}
  $('jobTitle').textContent=active.has(j.status)?'处理中':'本批结果';if($('taskDetails').dataset.job!==j.id){$('taskDetails').open=active.has(j.status);$('taskDetails').dataset.job=j.id;}$('jobBadge').textContent=statusLabels[j.status]||j.status;$('jobBadge').className='badge push '+(j.status==='complete'?'success':['review','partial','failed','stopped','interrupted'].includes(j.status)?'warn':'');
  $('jobId').textContent=new Date(j.created*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});$('jobId').title=j.id;$('jobConcurrency').textContent=`${j.total} 台 · ${j.concurrency} 并发${j.model==='iphone17promax'?' · Pro Max':j.model==='iphone17pro'?' · Pro':''}`;$('jobMessage').hidden=active.has(j.status)||j.status==='complete';$('jobMessage').textContent=j.message;$('doneCount').textContent=`${j.completed} / ${j.total}`;$('elapsed').textContent=seconds(j.elapsed);$('failedCount').textContent=j.failed;$('failedStat').hidden=!j.failed;$('progress').value=j.progress;$('progress').hidden=!active.has(j.status);
- $('taskRows').replaceChildren(...j.rows.map(r=>{const row=node('div',undefined,'task-row '+r.status),description=node('div',undefined,'description');description.append(node('span',stageText(r)));if(r.review_reasons?.length){const details=node('details',undefined,'review-reasons');details.append(node('summary',r.status==='complete'?'查看处理提示':'查看待核对原因'));for(const reason of r.review_reasons){const text=(labels[reason.face]?labels[reason.face]+'：':'')+(reason.message||'请核对过程记录');const item=node('p',text);if(reason.detail&&reason.detail!==reason.message)item.append(node('small',reason.detail));details.append(item);}description.append(details);}if(r.review_continuation_ready&&r.status==='review')description.append(node('small','处理候选已生成，需人工核对；接缝处理未完成。'));else if(r.review_only&&r.status==='review')description.append(node('small','处理步骤已完成，请复核候选效果。'));if(r.portable_review_available){const bundle=node('a','带复核记录下载');bundle.href=asset(j.id,'bundle',r.name,null,{download:1});description.append(bundle);}row.append(node('span',undefined,'state-dot'),node('span',r.name),description);return row;}));
+ drawTaskRows(j);
  $('stop').hidden=!active.has(j.status);$('stop').disabled=['stopping','packaging'].includes(j.status);$('retry').hidden=active.has(j.status)||!j.retry_count;$('retry').textContent=`继续未完成步骤 · ${j.retry_count||0} 台`;$('retry').disabled=jobs.some(x=>active.has(x.status));$('log').href=asset(j.id,'log');
  $('resultPanel').hidden=!j.completed;
  if(j.completed){$('overview').hidden=!j.downloadable;$('download').hidden=!j.downloadable;$('overview').href=asset(j.id,'overview');$('download').href=asset(j.id,'zip',null,null,{download:1});drawGallery(j);}
@@ -93,7 +144,7 @@ $('openFolder').onclick=async()=>{try{await api('open',{id:selectedJob});}catch(
 $('retry').onclick=async()=>{const j=currentJob();if(!j)return;$('retry').disabled=true;try{const next=await api('retry',{id:j.id,concurrency:1});selectedJob=next.id;localStorage.setItem('sixview-job',next.id);galleryKey='';await refresh();notice('已创建续接批次；校验后复用几何结果，继续未完成步骤。');}catch(e){notice(e.message,true);$('retry').disabled=false;}};
 let historyKey='';
 function drawHistory(){const key=jobs.map(j=>j.id+j.status+j.completed).join('|')+selectedJob;if(key===historyKey)return;historyKey=key;if(!jobs.length)return;$('history').replaceChildren(...jobs.slice(0,20).map(j=>{const b=node('button',undefined,'history-item'+(j.id===selectedJob?' selected':'')),info=node('span',undefined,'history-name');info.append(document.createTextNode(j.source.split('/').pop()+' · '+j.total+' 台'),node('small',new Date(j.created*1000).toLocaleString('zh-CN')+' · '+j.concurrency+' 并发'));b.append(info,node('span',statusLabels[j.status]||j.status,'badge'));b.onclick=()=>{selectedJob=j.id;localStorage.setItem('sixview-job',j.id);galleryKey='';drawJob();drawHistory();$('jobPanel').scrollIntoView({behavior:'smooth'});};return b;}));}
-async function refresh(){try{const state=await api('state');jobs=state.jobs;if(!$('output').value)$('output').value=state.default_output;const m=state.host;$('available').textContent=(m.available/1024**3).toFixed(1)+' GB';$('memoryTotal').textContent=(m.total/1024**3).toFixed(0)+' GB';$('memoryBadge').textContent=m.pressure>=4?'压力较高':m.pressure===2?'稍有压力':'正常';$('memoryBadge').className='badge '+(m.pressure>=2?'warn':'success');$('connectionDot').classList.remove('offline');$('connectionText').textContent='本地运行';if(!jobs.find(j=>j.id===selectedJob))selectedJob=jobs[0]?.id;drawJob();drawHistory();updateStart();}catch(e){$('connectionDot').classList.add('offline');$('connectionText').textContent='未连接，请重新启动';$('start').disabled=true;}}
+async function refresh(){try{const state=await api('state?compact=1');jobs=state.jobs;if(!$('output').value)$('output').value=state.default_output;const m=state.host;$('available').textContent=(m.available/1024**3).toFixed(1)+' GB';$('memoryTotal').textContent=(m.total/1024**3).toFixed(0)+' GB';$('memoryBadge').textContent=m.pressure>=4?'压力较高':m.pressure===2?'稍有压力':'正常';$('memoryBadge').className='badge '+(m.pressure>=2?'warn':'success');$('connectionDot').classList.remove('offline');$('connectionText').textContent='本地运行';if(!jobs.find(j=>j.id===selectedJob))selectedJob=jobs[0]?.id;drawJob();drawHistory();updateStart();}catch(e){$('connectionDot').classList.add('offline');$('connectionText').textContent='未连接，请重新启动';$('start').disabled=true;}}
 async function poll(){await refresh();setTimeout(poll,1500);}poll();
 
 $('shutdown').onclick=async()=>{try{await api('shutdown',{});notice('服务已退出');}catch(e){notice(e.message,true);}};

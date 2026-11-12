@@ -19,7 +19,11 @@ from phone_texture.lighting_review import freeze_scope, load_scope, measure_peri
 
 
 def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def save(path, data):
