@@ -613,7 +613,7 @@ def rear_camera_glass(a, remaining):
     n,labels,stats,_=cv2.connectedComponentsWithStats(dark.astype(np.uint8),8)
     glass=np.zeros((h,w),bool)
     interior=ndimage.binary_erosion(a[...,3]>=240,border_value=0)
-    accepted=[];outer_fragments=[]
+    accepted=[];outer_fragments=[];shadow_arcs=[]
     for i in range(1,n):
         x,y,bw,bh,area=map(int,stats[i])
         if .025*w<bw<.35*w and .025*w<bh<.35*w and .5<bw/max(1,bh)<2 and area>40:
@@ -624,9 +624,17 @@ def rear_camera_glass(a, remaining):
             if outer:
                 outer_fragments.append(evidence)
                 continue
+            # A cast-shadow crescent can have a round box (and even enclose
+            # a complete hole). Its SOURCE occupancy is not a glass disk.
+            # Test before hole filling; otherwise a thin closed ring passes.
+            occupancy=area/max(1,bw*bh)
+            if occupancy < .50:
+                shadow_arcs.append(dict(evidence,source_box_occupancy=occupancy))
+                continue
             glass|=component;accepted.append(evidence)
-    return glass,dict(method='source_interior_camera_components_v2',
-                      accepted=accepted,rejected_outer_fragments=outer_fragments)
+    return glass,dict(method='source_interior_camera_components_v3',
+                      accepted=accepted,rejected_outer_fragments=outer_fragments,
+                      rejected_shadow_arcs=shadow_arcs)
 
 
 def _independent_rear_material_reference(image,side,edge,source):
@@ -790,6 +798,12 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
         proof['rear_plastic_materials']=rear_proof
         if rim.sum()>=30:materials.append(('rear_perimeter',rim,[max(6,h*.012),max(2,w*.004)]));remaining &= ~rim
         panel,panel_proof=rear_panel(image);proof['rear_panel']=panel_proof
+        from .rear_lighting_features import dark_rear_mark
+        mark,mark_proof=dark_rear_mark(a,panel&~label_fit)
+        proof['rear_mark_fit_exclusion']=mark_proof
+        if mark.any():
+            fit_masks['main_surface']=panel&remaining&~mark
+            mark_path=save_mask(folder/'rear-mark-fit-exclusion.png',mark)
         camera=remaining&~panel
         if camera.sum()>=30:materials.append(('camera_surround',camera,[max(6,h*.015),max(6,w*.02)]));remaining &= ~camera
     if remaining.sum()>=30 and face=='bottom' and protection_policy=='none':
@@ -857,6 +871,8 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
             # Saturated source highlights can make the final per-pixel gamut
             # limiter discontinuous well away from a material-domain seam.
             domains[-1]['gamut_continuity_step_L']=REAR_GAMUT_CONTINUITY_STEP_L
+        if face=='back' and name=='main_surface' and mark.any():
+            domains[-1].update(field='feature_excluded_gaussian',feature_mask=mark_path)
         if name=='rear_perimeter' or (face=='front' and name=='main_surface'):
             domains[-1].update(field='contour',sigma=[max(18,h*.012),max(5,w*.006)])
         if name=='rear_perimeter':domains[-1].update(reference_profile='contour_depth_lift',strength=[.92,0,0],max_lab_shift=[48,0,0],contour_alpha_mask=body_path,source_body_contour=body_proof,

@@ -199,6 +199,14 @@ def apply(job, face, folder, profile=NAME):
     closed_paper = apply_closed_paper(view, face)
     if closed_paper is not None:
         changes.append(dict(source_closed_paper_illumination=closed_paper))
+    if profile==NAME and face=='back':
+        from .rear_shadow import prepare
+        camera=next((d for d in view['domains'] if d['name']=='camera_surround'),None)
+        if camera is not None:
+            material=np.array(Image.open(camera['mask']).convert('L'))>0
+            plan=prepare(a,material,view['source_sha256'],render.digest(camera['mask']))
+            view['rear_shadow_correction']=dict(plan,material_mask=camera['mask'])
+            changes.append(dict(rear_shadow_correction=plan))
     view['reference_boxes'] = view['domains'][0]['reference_boxes']
     result['lighting_profile'] = profile
     return result, dict(profile=profile,

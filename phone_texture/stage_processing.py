@@ -284,10 +284,13 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                     from .bottom_quality_selection import bind_inputs
                     attempt_bindings = bind_inputs(job, scope, path, assets/'lighting-scope.json')
                 attempt_phase = 'render'
-                lighting.run('aluminum', path)
+                lighting_report = lighting.run('aluminum', path)
                 candidate = output/(face+'.png')
                 attempt_phase = 'pixel_integrity'
                 checked = measure_masks(source, candidate, allowed, paper)
+                if any('rear_shadow_correction' in v for v in job.get('views', [])):
+                    rear_shadow = lighting_report['views'][face]['rear_shadow_correction']
+                    checked['rear_shadow_correction'] = rear_shadow
                 if protection_policy == 'none':
                     checked['actual_no_zone_effects'] = no_zone_effects(source, candidate, analysis)
                 attempt_phase = 'effect'
@@ -571,6 +574,10 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
     review = [dict(face=b.get('face') or 'all', code=b['stage']+'_blocked', message=b['error']) for b in blocked]
     review.extend(item_effect_warnings)
     for face, checked in checks.items():
+        shadow = checked.get('rear_shadow_correction') or {}
+        if any(x.get('unsupported_reference_angles', 0) for x in shadow.get('lenses', [])):
+            review.append(dict(face=face, code='rear_shadow_reference_partial',
+                message='镜头周边部分方向缺少同材质参考，保留原调光；这些方向未强制去投影'))
         if checked.get('actual_no_zone_effects', {}).get('review_warnings'):
             review.append(dict(face=face, code='identifier_readability_unconfirmed', message='标识可读性待核对'))
     result = dict(status=status, six_faces_generated=True, six_faces_processed=processed,

@@ -71,6 +71,7 @@ def fake_stages(monkeypatch, failed_faces=(), failed_side=None, seam_failure=Fal
         Image.fromarray(image).save(target)
         if job['face'] in failed_faces:
             raise ValueError('Lighting correction discontinuity at test')
+        return {'views': {job['face']: {}}}
     monkeypatch.setattr(stages.lighting, 'run', light)
     monkeypatch.setattr(stages, 'measure_effect', lambda *args: {'passed': True})
     monkeypatch.setattr(stages.lighting_review, 'evidence_images', lambda *args: {})

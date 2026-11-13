@@ -328,6 +328,32 @@ def supported_field(lab, fit, editable, sigma, alpha=None):
     return low, support, reliable
 
 
+def feature_excluded_field(lab, fit, editable, sigma, feature, alpha=None):
+    """Estimate illumination around a confirmed albedo mark, not from its ink.
+
+    Enlarge the normalized source convolution only where the excluded feature
+    removes local support. Both scales use real surrounding material samples;
+    the same 0.008 support gate applies. No median/nearest fill or RGB blur.
+    """
+    from scipy.ndimage import distance_transform_edt
+    if feature.shape != fit.shape or not feature.any() or np.any(feature&fit):
+        raise ValueError('Feature field needs a nonempty excluded source feature')
+    radius=float(distance_transform_edt(feature).max())
+    wide_sigma=np.maximum(np.asarray(sigma,dtype=float),radius*.8).tolist()
+    wide,wide_support,_=supported_field(lab,fit,editable,wide_sigma,alpha)
+    support=gaussian(fit.astype(float),sigma)
+    low,_,_=supported_field(lab,fit,editable&(support>=.008),sigma,alpha)
+    t=np.clip((.65-support)/.5,0,1);weight=t*t*(3-2*t)
+    # At unrelated domain edges preserve the established field exactly.
+    taper=np.clip(4-distance_transform_edt(~feature)/max(wide_sigma),0,1)
+    weight*=taper*taper*(3-2*taper)
+    low=low*(1-weight[...,None])+wide*weight[...,None]
+    support=support*(1-weight)+wide_support*weight
+    if np.any(editable&(support<.008)):
+        raise ValueError('Unsupported feature-excluded illumination')
+    return low,support,support>=.008
+
+
 def component_offset(source, accepted, component, reference, feather=2):
     """Repair one reviewed component from source texture with a constant Lab offset.
 
@@ -689,6 +715,10 @@ def process_view(item, target, defaults):
             low, support, reliable = supported_contour_field(field_lab, fit, allowed, contour_alpha, sigma,domain.get('contour_inset_depth',5.),domain.get('contour_source_inset_limit'))
         elif field == 'gaussian':
             low, support, reliable = supported_field(lab, fit, allowed, sigma, src[...,3])
+        elif field == 'feature_excluded_gaussian':
+            if mode!='source_lightness':raise ValueError('Feature field requires source lightness')
+            feature=np.array(Image.open(domain['feature_mask']).convert('L'))>0
+            low,support,reliable=feature_excluded_field(lab,fit,allowed,sigma,feature,src[...,3])
         else:
             raise ValueError('Unknown illumination field')
         strengths = np.array(domain.get('strength', defaults.get('strength', [.78,.72,.72])))
@@ -790,6 +820,23 @@ def process_view(item, target, defaults):
                 gamut_continuity.append(dict(name=name, **proof))
     elif any('gamut_continuity_step_L' in domain for domain in item['domains']):
         raise ValueError('Gamut continuity requires source_lightness')
+    rear_shadow=None
+    if item.get('rear_shadow_correction'):
+        from phone_texture.rear_shadow import correction
+        plan=item['rear_shadow_correction']
+        if item.get('name')!='back' or mode!='source_lightness':
+            raise ValueError('Rear shadow correction requires a source-lightness back')
+        if plan['source_sha256']!=before_hash or digest(plan['material_mask'])!=plan['material_sha256']:
+            raise ValueError('Rear shadow source/material binding changed')
+        material=np.array(Image.open(plan['material_mask']).convert('L'))>0
+        if material.shape!=(h,w) or np.any(material&~allowed_union):
+            raise ValueError('Rear shadow material is outside the editable source')
+        extra,scope,rear_shadow=correction(out_lab[...,0],lab[...,0],material,plan)
+        desired=out_lab.copy();desired[...,0]+=extra
+        safe,limited=preserve_chroma_in_gamut(desired,lab)
+        # Preserve every other material/field exactly, including the logo.
+        out_lab[scope]=safe[scope]
+        rear_shadow.update(gamut_limited_pixels=limited,scope_outside_material_pixels=int(np.count_nonzero(scope&~material)))
     dst = src.copy()
     converted = lab_to_rgb(out_lab)
     quantization=[]
@@ -807,7 +854,7 @@ def process_view(item, target, defaults):
         raise RuntimeError('Source changed during processing')
     return dst, allowed_union, protect, {'source':str(path),'source_sha256':before_hash,
         'size':[w,h], 'domains':domains, 'color_mode':mode,
-        'gamut_limited_pixels':gamut_limited,'correction_blends':blends,
+        'gamut_limited_pixels':gamut_limited,'correction_blends':blends,'rear_shadow_correction':rear_shadow,
         'gamut_continuity':gamut_continuity,'quantization_continuity':quantization,
         'required_editable_pixels':int(required.sum()),
         'required_editable_missing':0,

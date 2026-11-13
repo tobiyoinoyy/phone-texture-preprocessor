@@ -1,4 +1,4 @@
-# 六面工坊 0.2.0
+# 六面工坊 0.2.1
 
 本地浏览器批量处理手机六面照片。选择机型、原图文件夹、导出文件夹和并发数，即可处理并预览六面透明贴图。支持 iPhone 17 Pro / Pro Max 本项目铝材标准拍摄照片，包含方向识别、一键命名副本、光照优化、按本机背面对齐天线及固定模型四角接缝校色。
 
@@ -7,7 +7,7 @@
 需要 Python 3.9 以上。首次安装联网下载依赖与抠图权重，后续图片处理在本机完成。
 
 ```bash
-git clone --branch v0.2.0 https://github.com/tobiyoinoyy/phone-texture-preprocessor.git
+git clone --branch v0.2.1 https://github.com/tobiyoinoyy/phone-texture-preprocessor.git
 cd phone-texture-preprocessor
 python3 -m venv .venv
 source .venv/bin/activate
@@ -22,9 +22,9 @@ phone-texture web --home "$HOME/Documents/六面工坊"
 
 可选：执行 `python scripts/package_browser.py "$HOME/Documents/六面工坊"` 创建本机双击启动器。它复用当前源码与环境，并非独立安装包。无需安装 Codex 或 Agent。
 
-[浏览器使用说明](docs/browser-app.md) · [0.2.0 更新记录](CHANGELOG.md)
+[浏览器使用说明](docs/browser-app.md) · [0.2.1 更新记录](CHANGELOG.md)
 
-六面工坊使用独立产品版本 **0.2.0**；同库处理引擎与 Codex 插件版本为 **1.6.0**。发布包不包含原始照片、业务模型、运行记录或模型权重；包含运行所需的方向特征库、固定 UV 接缝配置及测试夹具。结果仍需检查裁切、材质与所用模型的匹配效果。
+六面工坊使用独立产品版本 **0.2.1**；同库处理引擎与 Codex 插件版本为 **1.6.1**。发布包不包含原始照片、业务模型、运行记录或模型权重；包含运行所需的方向特征库、固定 UV 接缝配置及测试夹具。结果仍需检查裁切、材质与所用模型的匹配效果。
 
 ## 处理引擎
 

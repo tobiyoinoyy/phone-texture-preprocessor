@@ -123,9 +123,10 @@ def reject_attempts(monkeypatch, names, *, phase='material', exception=ValueErro
         original = stages.lighting.run
 
         def light(engine, path):
-            original(engine, path)  # Keep the rejected output as diagnostic.
+            result = original(engine, path)  # Keep the rejected output as diagnostic.
             if path.parent.name in names:
                 raise exception('Lighting correction discontinuity: ' + path.parent.name)
+            return result
 
         monkeypatch.setattr(stages.lighting, 'run', light)
 

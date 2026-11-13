@@ -52,3 +52,23 @@ def test_lens_outside_remaining_material_not_reintroduced():
     a,lens=scene();remaining=a[...,3]>0;remaining[lens]=False
     mask,_=rear_camera_glass(a,remaining)
     assert not mask.any()
+
+
+def test_thin_closed_shadow_ring_is_not_filled_into_a_glass_disk():
+    a,lens=scene();yy,xx=np.indices(a.shape[:2])
+    radius=(xx-90)**2+(yy-85)**2
+    ring=(radius>=38**2)&(radius<=41**2)
+    a[ring,:3]=15
+    mask,proof=rear_camera_glass(a,a[...,3]>0)
+    np.testing.assert_array_equal(mask,lens)
+    assert proof['rejected_shadow_arcs']
+
+
+def test_separate_cast_shadow_crescent_stays_editable():
+    a,lens=scene();yy,xx=np.indices(a.shape[:2])
+    radius=(xx-90)**2+(yy-85)**2
+    shadow=(radius>=33**2)&(radius<=42**2)&(xx>95)
+    a[shadow,:3]=15
+    mask,_=rear_camera_glass(a,a[...,3]>0)
+    assert not mask[shadow].any()
+    assert mask[lens].all()
