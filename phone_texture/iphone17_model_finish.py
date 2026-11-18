@@ -1,0 +1,198 @@
+"""Model-calibrated standard 17 frame ends and dual-lens texture registration."""
+import contextlib
+import io
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image
+from scipy import ndimage
+
+from . import workspace as w
+from .frame_seams import resized_chains, seam_engine
+from . import lighting
+
+PROFILE = Path(__file__).with_name('seam_profiles')/'iphone17.json'
+FRAMES = ('top','bottom','left','right')
+
+
+def ease(value):
+    t = np.clip(value,0,1)
+    return t*t*(3-2*t)
+
+
+def aligned_metal(work, face, size):
+    material = work/'material-inputs'/face
+    mask = np.asarray(Image.open(material/'main_surface.png').convert('L'))
+    if mask.shape != size[::-1]:
+        raise ValueError('Metal mask dimensions differ from the aligned frame')
+    if face == 'bottom':
+        mx = np.load(work/'bottom-source-x.npy', allow_pickle=False)
+        if mx.shape != (size[0],):
+            raise ValueError('Missing aligned bottom mask mapping')
+        mask = ndimage.map_coordinates(mask.astype(float),
+            np.broadcast_arrays(np.arange(size[1])[:,None], mx[None,:]),order=1)
+    elif face in ('left','right'):
+        spec = w.read(work/'structure-proposal.json')[face]
+        checks = w.read(work/'structure-checks.json')[face]
+        source, target = np.array(spec['source']), np.array(spec['target'])
+        source[[1,2,5,6]] += np.array(checks['sampling_correction'])[[1,2,5,6]]
+        rows = np.arange(size[1])
+        mask = np.stack([np.interp(np.interp(rows,target[:,x],source[:,x]),rows,mask[:,x])
+                         for x in range(size[0])],axis=1)
+    return mask >= 254
+
+
+def finish_frames(files, work, output, records):
+    # Use the same source-bound domains and registration as the approved images.
+    # Only terminal metal participates. Buttons, paper, holes and antennas are
+    # separated from the blend even where they approach an end.
+    profile = w.read(PROFILE)
+    records.mkdir(parents=True,exist_ok=False)
+    helper = lighting.engine('aluminum')
+    match_uv_seams = seam_engine()
+    views, references = {}, []
+    arrays, masks, coords = {}, {}, {}
+    for face in FRAMES:
+        a = np.asarray(Image.open(files[face]).convert('RGBA'))
+        h,width = a.shape[:2]
+        mask = aligned_metal(work,face,(width,h)) & (a[...,3]>0)
+        y,x = np.ogrid[:h,:width]
+        along,across,length,thickness = (x,y,width,h) if width>h else (y,x,h,width)
+        distance = np.minimum(along,length-1-along)/thickness
+        # Sample nearby uniform metal after the corner darkening on both ends.
+        samples = (distance>1.05)&(distance<1.65)&(across>.25*thickness)&(across<.75*thickness)&mask&(a[...,3]>=240)
+        lab = helper.rgb_to_lab(a[...,:3])
+        for end in (along<length/2,along>=length/2):
+            values=lab[...,0][samples&end]
+            if len(values)<60:
+                raise ValueError('Insufficient plain metal beside frame end: '+face)
+            references.append(float(np.median(values)))
+        arrays[face],masks[face],coords[face] = (a,lab),mask,distance
+    target=float(np.median(references))
+    for face in FRAMES:
+        a,lab = arrays[face]
+        mask,distance = masks[face],coords[face]
+        fit=mask&(a[...,3]>=240)
+        den=ndimage.gaussian_filter(fit.astype(float),3.)
+        low=ndimage.gaussian_filter(lab[...,0]*fit,3.)/np.maximum(den,1e-8)
+        blend=ease((1.45-distance)/.72)
+        active=mask&(blend>0)
+        if np.any(den[active]<.06):
+            broad_den=ndimage.gaussian_filter(fit.astype(float),9.)
+            if np.any((den[active]<.06)&(broad_den[active]<.008)):
+                raise ValueError('Frame end lacks metal lighting support: '+face)
+            broad=ndimage.gaussian_filter(lab[...,0]*fit,9.)/np.maximum(broad_den,1e-8)
+            low=broad+(low-broad)*ease((den-.008)/.052)
+        corrected=lab.copy()
+        corrected[...,0]+=np.clip((target-low)*.94,-30,65)*blend
+        out=a.copy()
+        out[active,:3]=helper.lab_to_rgb(corrected)[active]
+        src=records/(face+'-ends.png')
+        Image.fromarray(out).save(src)
+        mp=records/(face+'-metal.png')
+        Image.fromarray((mask*255).astype('uint8')).save(mp)
+        pp=records/(face+'-excluded.png')
+        Image.fromarray((~mask*255).astype('uint8')).save(pp)
+        views[face]=dict(source=str(src),editable_mask=str(mp),protected_mask=str(pp))
+    w.save(records/'chains.json',dict(chains=resized_chains(profile,files)))
+    w.save(records/'scene.json',{})
+    job=dict(scene=str(records/'scene.json'),seam_chains=str(records/'chains.json'),views=views,
+             output_dir=str(output),records_dir=str(records/'engine'),width_units=.18,
+             guard_pixels=18,sigma=2,protection_feather=0,max_lab_shift=[28,16,16],
+             minimum_joint_coverage=.98,maximum_p95_deltaE76=2.,sampling_refinements=2,
+             maximum_correction_step_deltaE76=3.,continuity_retry_sigmas=[2,4],
+             continuity_warning_limit_deltaE76=8.)
+    w.save(records/'job.json',job)
+    with contextlib.redirect_stdout(io.StringIO()):
+        report=match_uv_seams.run(records/'job.json')
+    for face in FRAMES:
+        a,_=arrays[face]
+        out=np.asarray(Image.open(output/(face+'.png')))
+        if not np.array_equal(out[...,3],a[...,3]) or not np.array_equal(out[~masks[face]],a[~masks[face]]):
+            raise ValueError('Frame finish changed geometry or nonmetal: '+face)
+    return dict(seams=report['seams'],reference_L=target,model_sha256=profile['model_sha256'],
+                profile_sha256=w.sha(PROFILE))
+
+
+def lens_pair(a):
+    h,width=a.shape[:2]
+    gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
+    roi=gray[:round(.27*h),:round(.38*width)]
+    readings=[]
+    for t in (30,36,43,50,57,64,72,80,88):
+        dark=(roi<t)&(a[:roi.shape[0],:roi.shape[1],3]>=240)
+        contours,_=cv2.findContours(dark.astype('uint8'),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        pair=[]
+        for c in contours:
+            if len(c)<5:
+                continue
+            (x,y),(dx,dy),_=cv2.fitEllipse(c)
+            rad=(dx+dy)/4
+            if (.073*width<rad<.112*width and .86<dx/dy<1.16 and .10*width<x<.27*width
+                    and .035*h<y<.24*h and .94<cv2.contourArea(c)/(np.pi*rad**2)<1.05):
+                pair.append([x,y,rad])
+        if len(pair)==2:
+            readings.append(sorted(pair,key=lambda v:v[1]))
+    # Select a consistent cluster, rejecting ring/step contours when a higher
+    # threshold merges the lens glass with its surround.
+    samples=np.array(readings)
+    if len(samples)<3:
+        raise ValueError('Two separate standard lenses lack source support')
+    groups=[samples[(np.max(abs(samples-s),axis=(1,2))<=1.4*width/988)] for s in samples]
+    group=max(groups,key=len)
+    if len(group)<3:
+        raise ValueError('Standard lens centers/radii disagree across thresholds')
+    result=np.median(group,axis=0)
+    if abs(result[1,0]-result[0,0])>.15*result[0,2] or not 2.2<(result[1,1]-result[0,1])/result[:,2].mean()<2.8:
+        raise ValueError('Standard vertical lens layout is unresolved')
+    return result
+
+
+def register_camera(image):
+    profile=w.read(PROFILE)['camera']
+    a=np.asarray(image.convert('RGBA'));h,width=a.shape[:2]
+    scale=np.array([width,h])/profile['reference_size']
+    target=(np.array(profile['centers_px'])+.5)*scale-.5
+    measured=lens_pair(a)
+    radius=np.asarray(profile['radii_px'])*scale[0]
+    shift=measured[:,:2]-target
+    if np.max(np.linalg.norm(shift,axis=1)/radius)>.23 or np.max(abs(measured[:,2]/radius-1))>.06:
+        raise ValueError('Lens correction exceeds supported local registration')
+    if (np.max(np.linalg.norm(shift,axis=1))/np.mean(scale)<=.65
+            and np.max(abs(measured[:,2]-radius))/scale[0]<=.9):
+        return image.copy(),dict(before=measured.tolist(),after=measured.tolist(),
+            target=target.tolist(),model_reference_error_px=(np.linalg.norm(shift,axis=1)/np.mean(scale)).tolist(),
+            jacobian=[1.,1.])
+    # Both disks move with their photographed rings. Smoothly join the shifts
+    # between the two lenses, keeping the outer body and flash fixed.
+    y,x=np.mgrid[:int(.32*h),:int(.405*width)]
+    blend=ease((y-(target[0,1]+radius[0]))/(target[1,1]-radius[1]-target[0,1]-radius[0]))
+    dx=np.zeros_like(x,dtype=float);dy=dx.copy()
+    for i,k in enumerate((1-blend,blend)):
+        ratio=measured[i,2]/radius[i]-1
+        dx+=k*(shift[i,0]+ratio*(x-target[i,0]))
+        dy+=k*(shift[i,1]+ratio*(y-target[i,1]))
+    cy=np.clip(y,target[0,1],target[1,1])
+    cx=np.interp(cy,target[:,1],target[:,0])
+    dist=np.hypot(x-cx,y-cy)
+    weight=ease((1.74-dist/radius.mean())/.47)
+    body=ndimage.distance_transform_edt(np.pad(a[...,3]>=250,1))[1:-1,1:-1]
+    weight*=ease((body[:y.shape[0],:y.shape[1]]-18*scale[0])/(52*scale[0]))
+    mx=(x+dx*weight).astype('float32');my=(y+dy*weight).astype('float32')
+    jac=np.gradient(mx,axis=1)*np.gradient(my,axis=0)-np.gradient(mx,axis=0)*np.gradient(my,axis=1)
+    if jac.min()<.50 or jac.max()>1.55:
+        raise ValueError('Camera warp would distort the glass transition')
+    changed=weight>0
+    sample=cv2.remap(a,mx,my,cv2.INTER_CUBIC)
+    if not (sample[changed,3]==255).all() or not (a[:y.shape[0],:y.shape[1]][changed,3]==255).all():
+        raise ValueError('Camera correction would touch transparent body contour')
+    out=a.copy()
+    out[:y.shape[0],:y.shape[1]][changed]=sample[changed]
+    actual=lens_pair(out)
+    residual=np.linalg.norm(actual[:,:2]-target,axis=1)/np.mean(scale)
+    if residual.max()>.65 or np.max(abs(actual[:,2]-radius))/scale[0]>.9:
+        raise ValueError('Rendered standard lenses fail model UV reference check')
+    return Image.fromarray(out),dict(before=measured.tolist(),target=target.tolist(),
+                  after=actual.tolist(),model_reference_error_px=residual.tolist(),
+                  jacobian=[float(jac.min()),float(jac.max())])

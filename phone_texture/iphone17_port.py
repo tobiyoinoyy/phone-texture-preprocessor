@@ -17,11 +17,11 @@ WIDTH_MM=71.45
 DRAWING_HOLES=np.array([19.71,21.965,24.22,47.23,49.485,51.74,53.995,56.25])
 
 
-def measure(image):
+def _measure(image, thresholds, filter_print=False):
     a=np.asarray(image.convert('RGBA'));h,w=a.shape[:2]
     gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
     readings=[]
-    for threshold in (80,100,120):
+    for threshold in thresholds:
         n,labels,stats,centers=cv2.connectedComponentsWithStats(((gray<threshold)&(a[...,3]>=128)).astype('uint8'),8)
         ports=[];circles=[]
         for box,centroid in zip(stats[1:],centers[1:]):
@@ -30,8 +30,16 @@ def measure(image):
                 ports.append([cx,cy,int(x),int(y),int(bw),int(bh)])
             if (.17*w<cx<.85*w and .3*h<cy<.7*h and .011*w<bw<.03*w and
                 .08*h<bh<.3*h and .65<bw/bh<1.5 and area>40):
-                circles.append([cx,cy])
+                circles.append([cx,cy,bw,bh])
         if len(ports)!=1:raise ValueError('Standard USB-C port has no threshold consensus')
+        if filter_print and circles:
+            # Eight collinear bores share a diameter. Ink fragments on the nearby
+            # label can cross the same threshold, but lack this joint support.
+            diameter = float(np.median([min(c[2:]) for c in circles]))
+            axis = float(np.median([c[1] for c in circles]))
+            circles = [c for c in circles if min(c[2:]) >= diameter*.82
+                       and abs(c[1]-axis) <= diameter*.20]
+        circles = [c[:2] for c in circles]
         pc=ports[0];left=sorted([p for p in circles if p[0]<pc[0]-.12*w]);right=sorted([p for p in circles if p[0]>pc[0]+.12*w])
         if sorted([len(left),len(right)])!=[3,5]:raise ValueError('Standard bottom requires the complete asymmetric 3/5-hole groups')
         holes=np.asarray(left+right)
@@ -48,6 +56,20 @@ def measure(image):
     nominal=np.sort(WIDTH_MM-DRAWING_HOLES) if mirrored else DRAWING_HOLES.copy()
     screw=np.median(np.asarray([r['screw'][0] for r in readings if len(r['screw'])==1]),axis=0) if any(len(r['screw'])==1 for r in readings) else None
     return dict(holes=holes,nominal=nominal,port=port,screw=screw,mirrored=mirrored)
+
+
+def measure(image):
+    try:
+        return _measure(image, (80,100,120))
+    except ValueError as original:
+        for start in (80,90,100,70,60,110):
+            try:
+                measured = _measure(image, (start,start+10,start+20), filter_print=True)
+                if measured['screw'] is not None:
+                    return measured
+            except ValueError:
+                continue
+        raise original
 
 
 def mapping(image):

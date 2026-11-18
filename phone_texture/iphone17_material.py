@@ -35,7 +35,8 @@ def paper(image, face):
     baseline=float(np.median(side_response[int(h*.58):int(h*.72)]))
     absent=ndimage.uniform_filter1d((side_response<baseline*.4).astype(float),3)>=.99
     candidates=np.flatnonzero(absent&(np.arange(h)>h*.6)&(np.arange(h)<h*.9))
-    if baseline<3 or not len(candidates):raise ValueError('Paper side endings are unresolved')
+    if baseline<3 or not len(candidates):
+        return cross_strip_end(proposal, proof, gray, cols, side_responses)
     side_end=int(candidates[0])
     rows = np.arange(max(int(h*.56),side_end-7),min(h-2,side_end+1))
     response = np.median(gy[rows[:,None],interior[None,:]],axis=1)
@@ -55,6 +56,50 @@ def paper(image, face):
         source_end_y_by_column=boundary[cols].tolist(),source_end_columns=cols.tolist(),
         end_support_fraction=float(supported.mean()),end_response=float(response[peak]))
     return result,proof
+
+
+def cross_strip_end(proposal, proof, gray, cols, side_responses):
+    """Find a paper end bounded by its two measured sides, excluding metal rails."""
+    h,w = gray.shape
+    if not .44*h <= len(cols) <= .73*h:
+        raise ValueError('Paper side endings are unresolved')
+    interior = cols[4:-4]
+    signed = -np.gradient(ndimage.gaussian_filter1d(gray,.7,axis=0),axis=0)
+    rows = np.arange(int(.58*h),int(.96*h))
+    responses = np.median(signed[:,interior],axis=1)
+    from scipy.signal import find_peaks
+    peaks, _ = find_peaks(responses[rows], height=5, distance=4)
+    accepted = []
+    for y in rows[peaks]:
+        width = np.arange(y-2,y+3)
+        field = signed[width[:,None],interior[None,:]]
+        ends = width[np.argmax(field,axis=0)]
+        if (field.max(axis=0)>4).mean()<.9 or np.percentile(abs(ends-y),90)>1:
+            continue
+        lo,hi = (round(np.polyval(line,y+.5)) for line in proof['source_strip_edges'])
+        # A body bevel continues through both exterior holdouts. A label edge
+        # must stop at both measured paper sides and have support at each end.
+        probes = [np.arange(lo+2,lo+7),np.arange(hi-6,hi-1),
+                  np.arange(lo-8,lo-3),np.arange(hi+4,hi+9)]
+        if min(lo, w-hi)<10:
+            continue
+        left,right,out_l,out_r = [np.median(signed[width[:,None],x].max(axis=0)) for x in probes]
+        if min(left,right)<5 or max(out_l,out_r)>min(left,right)*.4:
+            continue
+        # Compare each side to itself in neighbouring rows, avoiding a global
+        # brightness threshold for pale metal.
+        if any(np.median(side[y-8:y-2])<2 or
+               np.median(side[y+3:y+7])>np.median(side[y-8:y-2])*.65 for side in side_responses):
+            continue
+        accepted.append((y,ends))
+    if len(accepted)!=1:
+        raise ValueError('Paper side endings are unresolved')
+    y,ends = accepted[0]
+    boundary = np.interp(np.arange(w),interior,ndimage.median_filter(ends,size=5))+2
+    mask = proposal & (np.arange(h)[:,None]<=boundary[None,:])
+    return mask, dict(proof, end_method='independent_paper_corners_and_exterior_metal_holdouts',
+                      source_end_columns=cols.tolist(),source_end_y_by_column=boundary[cols].tolist(),
+                      end_response=float(responses[y]))
 
 
 def glass_back_rim(image,sticker=None):
@@ -126,7 +171,7 @@ def job(source,face,folder,structure):
             from .iphone17_structure import capsule_mask
             gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
             for index,box in enumerate(structure[face]['hardware_boxes']):
-                hw=capsule_mask(image,box)&remaining
+                hw=capsule_mask(image,box,face)&remaining
                 cut,_=cv2.threshold(gray[hw].reshape(-1,1),0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
                 dark=hw&(gray<=cut);face_mask=hw&~dark
                 for suffix,mask in [('inset',dark),('face',face_mask)]:

@@ -51,6 +51,13 @@ def resized_chains(data, files):
     return chains
 
 
+def seam_engine():
+    scripts = Path(__file__).resolve().parents[1]/'skills/phone-aluminum-frame-restore/scripts'
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    return importlib.import_module('match_uv_seams')
+
+
 def run(work, sku, model, output, records):
     data, profile_path = profile(model)
     work, output, records = Path(work), Path(output), Path(records)
@@ -86,10 +93,7 @@ def run(work, sku, model, output, records):
         # seam first, else apply with a hint up to 8 (user: effect issues hint).
         continuity_retry_sigmas=[2, 4], continuity_warning_limit_deltaE76=8.0)
     write(records/'job.json', job)
-    scripts = Path(__file__).resolve().parents[1]/'skills/phone-aluminum-frame-restore/scripts'
-    if str(scripts) not in sys.path:
-        sys.path.insert(0, str(scripts))
-    module = importlib.import_module('match_uv_seams')
+    module = seam_engine()
     with contextlib.redirect_stdout(io.StringIO()):
         report = module.run(records/'job.json')
     for face in ('front','back'):

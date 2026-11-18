@@ -52,7 +52,7 @@ def gradient_peak(gradient, target, sign, radius=4):
     return float(k+(.5*(a-c)/den if abs(den)>1e-9 else 0.))
 
 
-def rear_antennas(image, *, refine_bands=('upper','lower')):
+def rear_antennas(image, *, refine_bands=('upper','lower'), sides=('left','right')):
     """Measure bright plastic breaks in the narrow dark rear metal rim.
 
     The glass has no antenna; the outer rim does. Follow the current alpha
@@ -63,6 +63,8 @@ def rear_antennas(image, *, refine_bands=('upper','lower')):
     gray=a[...,:3].mean(2);scale=w/988
     result={}
     for edge_name,side in [('left','right'),('right','left')]:
+        if side not in sides:
+            continue
         edge=np.argmax(a[...,3]>200,axis=1) if edge_name=='left' else w-1-np.argmax(a[:,::-1,3]>200,axis=1)
         edge=ndimage.gaussian_filter1d(ndimage.median_filter(edge.astype(float),max(3,int(h*.01)//2*2+1)),max(1,h*.0025))
         tracks=[]
@@ -136,32 +138,50 @@ def hardware(image,side):
         selected.append(box)
     selected.sort(key=lambda b:b[1])
     expected=4 if side=='left' else 2
-    if len(selected)!=expected:raise ValueError(f'{side}: expected {expected} independent complete capsule contours, found {len(selected)}')
+    if len(selected)!=expected:
+        # Dark rails can merge with the absolute-threshold mask. Use the
+        # same complete capsule, cap and rail witnesses as the workshop intake.
+        from .side_material import hardware_materials
+        try:
+            parts = hardware_materials(image,side)
+        except ValueError:
+            raise ValueError(f'{side}: expected {expected} independent complete capsule contours, found {len(selected)}') from None
+        selected = [part['box'] for _,part in parts]
     return selected
 
 
-def capsule_mask(image,box):
+def capsule_mask(image,box,side=None):
     """Use the actual closed source outline, never the detection box as paint."""
     a=np.asarray(image.convert('RGBA'));gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
     h,w=gray.shape;x0,y0,x1,y1=box
     roi=np.zeros((h,w),np.uint8)
-    roi[max(0,y0-2):min(h,y1+2),max(0,x0-2):min(w,x1+2)]=(gray[max(0,y0-2):min(h,y1+2),max(0,x0-2):min(w,x1+2)]<160).astype('uint8')
+    left,top,right,bottom=max(0,x0-2),max(0,y0-2),min(w,x1+2),min(h,y1+2)
+    roi[top:bottom,left:right]=(gray[top:bottom,left:right]<160).astype('uint8')
     contours,_=cv2.findContours(roi,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
     candidates=[]
     for c in contours:
         x,y,bw,bh=cv2.boundingRect(c)
+        if (x,y,x+bw,y+bh)==(left,top,right,bottom) and cv2.contourArea(c)>=(bw-1)*(bh-1)*.98:
+            continue  # The artificial ROI perimeter on an entirely dark surface.
         if max(abs(np.asarray([x,y,x+bw,y+bh])-box))<=4 and cv2.contourArea(c)>.5*(x1-x0)*(y1-y0):
             candidates.append(c)
-    if not candidates:raise ValueError('Detected capsule lacks a complete source contour')
+    if not candidates:
+        if side is not None:
+            from .side_material import hardware_materials
+            matches = [mask for mask,proof in hardware_materials(image,side)
+                       if np.max(np.abs(np.asarray(proof['box'])-box))<=2]
+            if len(matches)==1:
+                return matches[0]
+        raise ValueError('Detected capsule lacks a complete source contour')
     contour=max(candidates,key=cv2.contourArea);mask=np.zeros((h,w),np.uint8)
     cv2.drawContours(mask,[contour],-1,1,cv2.FILLED)
     return mask>0
 
 
-def propose(files, *, refine_bands=('upper','lower')):
+def propose(files, *, refine_bands=('upper','lower'), sides=('left','right')):
     back=Image.open(files['back']);result={}
-    rear=rear_antennas(back,refine_bands=refine_bands)
-    for side in ('left','right'):
+    rear=rear_antennas(back,refine_bands=refine_bands, sides=sides)
+    for side in sides:
         image=Image.open(files[side]).convert('RGBA');h,w=image.height,image.width
         rows,signs,proof=antenna_rows(image,[int(w*.4),int(w*.6)])
         lines=per_column_boundaries(image,rows)

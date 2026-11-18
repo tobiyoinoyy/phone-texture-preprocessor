@@ -16,7 +16,7 @@ from . import pipeline, workspace as w, geometry_review as gr
 from .auto_geometry import frame_geometry, plate_geometry, trim_visible_canvas
 from .iphone17_material import paper as paper_mask
 
-PROFILE = 'iphone17-glass-back-studio-v4-button-perspective'
+PROFILE = 'iphone17-glass-back-studio-v5-model-frame-and-camera'
 
 
 def geometry(source, work, sku, device='auto', cpu_threads=2):
@@ -51,8 +51,7 @@ def geometry(source, work, sku, device='auto', cpu_threads=2):
             if matte_path.exists() and cache_meta.exists() and w.read(cache_meta) == identity:
                 matte = Image.open(matte_path).convert('RGBA')
             else:
-                norm.backend.max_inference_side = identity['max_side']
-                matte, _ = norm.normalize(raw)
+                matte = segment_face(norm, raw, identity['max_side'])
                 matte.save(matte_path)
                 w.save(cache_meta, identity)
             stages = {}
@@ -61,15 +60,7 @@ def geometry(source, work, sku, device='auto', cpu_threads=2):
             # Pro-validated support-edge separation and printed-tail
             # reconstruction stay off: this glass-back sample was reviewed
             # on the earlier geometry, and its label layout differs.
-            if face in pipeline.FRAMES:
-                image, evidence = frame_geometry(matte, face, capture, source_image=raw, separate_support_edge=False)
-            else:
-                paper, info = paper_mask(matte, face)
-                image, evidence = plate_geometry(matte, face, paper, capture, source_image=raw, reconstruct_paper_tail=False)
-                evidence['paper'] = info
-            paper, _ = paper_mask(image, face)
-            image, trim = trim_visible_canvas(image, paper)
-            evidence['visible_canvas_trim'] = trim
+            image, evidence = geometry_face(matte, raw, face, capture)
             path = folder/(face+'.png')
             image.save(path)
             artifacts = gr.make_evidence(item['snapshot'], image, stages, records/'geometry-review'/sku/face)
@@ -79,6 +70,53 @@ def geometry(source, work, sku, device='auto', cpu_threads=2):
     report['candidates_complete'] = True
     w.save(records/'report.json', report)
     return {face: folder/(face+'.png') for face in pipeline.FACES}
+
+
+def segment_face(normalizer, raw, max_side):
+    from .automatic import _INFERENCE_SLOTS
+    with (_INFERENCE_SLOTS if _INFERENCE_SLOTS is not None else contextlib.nullcontext()):
+        normalizer.backend.max_inference_side = max_side
+        matte, _ = normalizer.normalize(raw)
+    return matte
+
+
+def geometry_face(matte, raw, face, capture):
+    if face in pipeline.FRAMES:
+        image, evidence = frame_geometry(matte, face, capture, source_image=raw, separate_support_edge=False)
+    else:
+        paper, info = paper_mask(matte, face)
+        image, evidence = plate_geometry(matte, face, paper, capture, source_image=raw, reconstruct_paper_tail=False)
+        evidence['paper'] = info
+    paper, _ = paper_mask(image, face)
+    image, trim = trim_visible_canvas(image, paper)
+    evidence['visible_canvas_trim'] = trim
+    return image, evidence
+
+
+def light_face(source, face, work, light, structure):
+    from .iphone17_material import job
+    from . import lighting
+    from .automatic import measure_masks
+    from .lighting_review import lightness
+    assets=work/'material-inputs'/face
+    spec,proof,allowed,sticker=job(source,face,assets,structure)
+    records=work/'lighting-records'/face
+    # Existing attempts are retained separately; no stale engine result
+    # is silently accepted after material or parameter changes.
+    if records.exists():
+        records.rename(records.with_name(face+'-previous-'+str(time.time_ns())))
+    spec.update(output_dir=str(light.resolve()),records_dir=str(records.resolve()))
+    jp=assets/'job.json';w.save(jp,spec);w.save(assets/'analysis.json',proof)
+    with (assets/'engine.log').open('w') as log,contextlib.redirect_stdout(log):
+        lighting.run('aluminum',jp)
+    dest=light/(face+'.png')
+    check=measure_masks(source,dest,allowed,sticker)
+    before=np.asarray(Image.open(source).convert('RGBA'));after=np.asarray(Image.open(dest).convert('RGBA'))
+    delta=lightness(after[...,:3])-lightness(before[...,:3])
+    if abs(delta[allowed]).max()>35.5:raise ValueError('Standard illumination exceeded the frozen source correction limit')
+    check.update(visual_approved=False,max_lightness_shift=float(abs(delta[allowed]).max()),
+        material_domains=[d['name'] for d in spec['views'][0]['domains']])
+    return check
 
 
 def run(source, work=None, output=None, *, single_name='SKU_01', device='auto', cpu_threads=2, **kwargs):
@@ -95,11 +133,7 @@ def run(source, work=None, output=None, *, single_name='SKU_01', device='auto', 
     try:
         files = geometry(source, work/'work', single_name, device, cpu_threads)
         from .iphone17_structure import propose,apply as align
-        from .iphone17_material import job
         from .iphone17_port import mapping as port_mapping,apply as port_apply,measure as port_measure
-        from . import lighting
-        from .automatic import measure_masks
-        from .lighting_review import lightness
         structure=propose(files)
         w.save(work/'structure-proposal.json',structure)
         port_map,port_proof=port_mapping(Image.open(files['bottom']))
@@ -109,24 +143,7 @@ def run(source, work=None, output=None, *, single_name='SKU_01', device='auto', 
         lighting_checks={}
         for face in pipeline.FACES:
             print('lighting: '+face,flush=True)
-            assets=work/'material-inputs'/face
-            spec,proof,allowed,sticker=job(files[face],face,assets,structure)
-            records=work/'lighting-records'/face
-            # Existing attempts are retained separately; no stale engine result
-            # is silently accepted after material or parameter changes.
-            if records.exists():
-                records.rename(records.with_name(face+'-previous-'+str(time.time_ns())))
-            spec.update(output_dir=str(light.resolve()),records_dir=str(records.resolve()))
-            jp=assets/'job.json';w.save(jp,spec);w.save(assets/'analysis.json',proof)
-            with (assets/'engine.log').open('w') as log,contextlib.redirect_stdout(log):
-                lighting.run('aluminum',jp)
-            dest=light/(face+'.png')
-            check=measure_masks(files[face],dest,allowed,sticker)
-            before=np.asarray(Image.open(files[face]).convert('RGBA'));after=np.asarray(Image.open(dest).convert('RGBA'))
-            delta=lightness(after[...,:3])-lightness(before[...,:3])
-            if abs(delta[allowed]).max()>35.5:raise ValueError('Standard illumination exceeded the frozen source correction limit')
-            check.update(visual_approved=False,max_lightness_shift=float(abs(delta[allowed]).max()),
-                material_domains=[d['name'] for d in spec['views'][0]['domains']])
+            check = light_face(files[face], face, work, light, structure)
             lighting_checks[face]=check
             w.save(work/'lighting-checks.json',lighting_checks)
         staged=work/'final-candidates'/single_name;staged.mkdir(parents=True,exist_ok=True)
@@ -153,7 +170,17 @@ def run(source, work=None, output=None, *, single_name='SKU_01', device='auto', 
                 shutil.copy2(light/(face+'.png'),staged/(face+'.png'));continue
             im.save(staged/(face+'.png'))
         w.save(work/'structure-checks.json',structural)
+        from .iphone17_model_finish import finish_frames, register_camera
+        baseline={face:staged/(face+'.png') for face in pipeline.FACES}
+        finish_dir=work/('model-finish-'+str(time.time_ns()))
+        finished=finish_dir/'candidates'/single_name
+        frame_finish=finish_frames(baseline,work,finished,finish_dir/'records')
+        aligned_camera,camera_finish=register_camera(Image.open(baseline['back']))
+        aligned_camera.save(finished/'back.png')
+        shutil.copy2(baseline['front'],finished/'front.png')
+        staged=finished
         final={face:staged/(face+'.png') for face in pipeline.FACES}
+        report.update(model_frame_finish=frame_finish,model_camera_registration=camera_finish)
         pipeline.overview({single_name:files},{single_name:final},work/'overview.png',faces=pipeline.FACES)
         manifest=w.read(work/'work/intake.json');w.check_sources(manifest)
         report.update(status='processed_needs_visual_review',processed=1,six_faces_processed=True,

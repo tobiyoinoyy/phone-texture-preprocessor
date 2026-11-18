@@ -297,7 +297,7 @@ def test_model_buttons_expose_pro_and_promax_as_one_radio_group():
                 assert attrs['type']=='radio'
                 self.options[attrs['value']]=attrs['aria-label']
     models=Models();models.feed((web.ASSETS/'index.html').read_text())
-    assert models.options=={'iphone17pro':'iPhone 17 Pro','iphone17promax':'iPhone 17 Pro Max'}
+    assert models.options=={'iphone17':'iPhone 17','iphone17pro':'iPhone 17 Pro','iphone17promax':'iPhone 17 Pro Max'}
     assert 'model' not in models.selects
 
 

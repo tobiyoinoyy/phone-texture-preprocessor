@@ -31,7 +31,7 @@ async function scanFolder(){
  clearTimeout(scanTimer);
  const path=$('source').value.trim();if(!path)return;
  const version=++scanVersion;busy=true;updateStart();$('scan').disabled=true;$('scan').textContent='…';$('scanCount').textContent='识别中…';
- try{const data=await api('scan',{path});if(version!==scanVersion)return;scanData=data;$('source').value=data.source;selected=new Set(data.rows.filter(r=>r.valid).map(r=>r.name));drawScan();}
+ try{const data=await api('scan',{path,model:selectedModel()});if(version!==scanVersion)return;scanData=data;$('source').value=data.source;selected=new Set(data.rows.filter(r=>r.valid).map(r=>r.name));drawScan();}
  catch(e){if(version!==scanVersion)return;scanData=null;selected.clear();$('scanContent').hidden=true;$('emptyInput').hidden=false;$('scanCount').textContent='读取失败';notice(e.message,true);}
  finally{if(version===scanVersion){busy=false;$('scan').disabled=false;$('scan').textContent='↻';updateStart();}}
 }
@@ -68,10 +68,10 @@ $('pickInput').onclick=()=>pick('input');$('pickOutput').onclick=()=>pick('outpu
 $('selectAll').onchange=()=>{selected=new Set($('selectAll').checked?scanData.rows.filter(r=>r.valid).map(r=>r.name):[]);drawScan();};
 async function startBatch(skus=Array.from(selected)){busy=true;updateStart();try{const j=await api('start',{scan_id:scanData.id,model:selectedModel(),skus,concurrency:+$('concurrency').value,output:$('output').value.trim()});selectedJob=j.id;localStorage.setItem('sixview-job',j.id);galleryKey='';await refresh();$('jobPanel').scrollIntoView({behavior:'smooth',block:'start'});}catch(e){notice(e.message,true);}finally{busy=false;updateStart();}}
 setModel(localStorage.getItem('sixview-model')||'');
-$('model').onchange=()=>{localStorage.setItem('sixview-model',selectedModel());updateStart();};
+$('model').onchange=()=>{localStorage.setItem('sixview-model',selectedModel());scanData=null;selected.clear();updateStart();if($('source').value.trim())scanFolder();};
 $('start').onclick=()=>startBatch();
 function stageText(r){if(['review','complete'].includes(r.status))return '已生成 · '+(r.stage_summary||'处理阶段待核对')+' · '+seconds(r.seconds);if(r.status==='failed')return r.error_hint||r.error||'处理失败，请查看日志';if(r.status==='waiting')return '排队中';if(r.status==='unfinished')return '未完成';return ({loading:'准备中',geometry:'抠图摆正',geometry_resume:'校验并复用几何结果',lighting:'优化光照',alignment:'结构对齐',checking:'检查保存',preserving:'保存已完成阶段并记录待核对项'}[r.stage]||'正在处理')+(r.face?' · '+labels[r.face]:'');}
-function faceText(row,face){const stage=row?.face_processing?.[face],lighting=row?.per_face_stages?.[face]?.lighting;const label={geometry:'几何已完成，未应用调光',geometry_source:'几何已完成，未应用调光',lighting:'已调光',verified_lighting:'已调光',independently_verified_lighting:'已调光',pixel_verified_lighting_effect_warning:'已调光',lighting_review:'已应用调光候选，待核对',structure_review:'已调光并调整天线位置，待核对',structure:lighting==='failed'?'天线已对齐，调光未完成':'天线已对齐',seam:'调光与接缝已处理'}[stage]||'该面处理阶段待核对';return label;}
+function faceText(row,face){const stage=row?.face_processing?.[face],lighting=row?.per_face_stages?.[face]?.lighting;const label={source_matte:'仅抠图，几何未完成',frame_without_paper_check:'已摆正，贴纸边界待确认',antenna:'已调光并校正天线，按钮待确认',antenna_and_buttons:'已调光并校正天线和按钮',bottom_registration:'已调光并校正底面',geometry:'几何已完成，未应用调光',geometry_source:'几何已完成，未应用调光',lighting:'已调光',verified_lighting:'已调光',independently_verified_lighting:'已调光',pixel_verified_lighting_effect_warning:'已调光',lighting_review:'已应用调光候选，待核对',structure_review:'已调光并调整天线位置，待核对',structure:lighting==='failed'?'天线已对齐，调光未完成':'天线已对齐',seam:'调光与接缝已处理'}[stage]||'该面处理阶段待核对';return label;}
 function currentJob(){return jobs.find(j=>j.id===selectedJob);}
 function drawTaskRows(job) {
  const container = $('taskRows');
@@ -127,7 +127,7 @@ function drawTaskRows(job) {
 function drawJob(){
  const j=currentJob();$('jobPanel').hidden=!j;if(!j){$('resultPanel').hidden=true;return;}
  $('jobTitle').textContent=active.has(j.status)?'处理中':'本批结果';if($('taskDetails').dataset.job!==j.id){$('taskDetails').open=active.has(j.status);$('taskDetails').dataset.job=j.id;}$('jobBadge').textContent=statusLabels[j.status]||j.status;$('jobBadge').className='badge push '+(j.status==='complete'?'success':['review','partial','failed','stopped','interrupted'].includes(j.status)?'warn':'');
- $('jobId').textContent=new Date(j.created*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});$('jobId').title=j.id;$('jobConcurrency').textContent=`${j.total} 台 · ${j.concurrency} 并发${j.model==='iphone17promax'?' · Pro Max':j.model==='iphone17pro'?' · Pro':''}`;$('jobMessage').hidden=active.has(j.status)||j.status==='complete';$('jobMessage').textContent=j.message;$('doneCount').textContent=`${j.completed} / ${j.total}`;$('elapsed').textContent=seconds(j.elapsed);$('failedCount').textContent=j.failed;$('failedStat').hidden=!j.failed;$('progress').value=j.progress;$('progress').hidden=!active.has(j.status);
+ $('jobId').textContent=new Date(j.created*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});$('jobId').title=j.id;$('jobConcurrency').textContent=`${j.total} 台 · ${j.concurrency} 并发${j.model==='iphone17promax'?' · Pro Max':j.model==='iphone17pro'?' · Pro':j.model==='iphone17'?' · iPhone 17':''}`;$('jobMessage').hidden=active.has(j.status)||j.status==='complete';$('jobMessage').textContent=j.message;$('doneCount').textContent=`${j.completed} / ${j.total}`;$('elapsed').textContent=seconds(j.elapsed);$('failedCount').textContent=j.failed;$('failedStat').hidden=!j.failed;$('progress').value=j.progress;$('progress').hidden=!active.has(j.status);
  drawTaskRows(j);
  $('stop').hidden=!active.has(j.status);$('stop').disabled=['stopping','packaging'].includes(j.status);$('retry').hidden=active.has(j.status)||!j.retry_count;$('retry').textContent=`继续未完成步骤 · ${j.retry_count||0} 台`;$('retry').disabled=jobs.some(x=>active.has(x.status));$('log').href=asset(j.id,'log');
  $('resultPanel').hidden=!j.completed;

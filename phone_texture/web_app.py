@@ -1,7 +1,7 @@
 """Loopback-only browser shell for the original-only six-face pipeline.
 
-No processing implementation lives here: every batch runs `phone-texture auto`
-in an isolated process group. Only complete, checked batches get an export ZIP.
+Workers run in an isolated process group. Downloads contain verified six-face
+sets and include a stage manifest when any requested item is incomplete.
 """
 import argparse
 import datetime as dt
@@ -126,7 +126,9 @@ def processing_state(done):
         and details.get(face, {}).get('structure') == 'review_required'
         and details.get(face, {}).get('selected_stage') == 'structure_review']
     operation_applied = structure or bool(review_applied_faces)
-    all_stages = all(stages[k] == 'complete' for k in ('geometry', 'lighting', 'structure', 'seam'))
+    standard = done.get('model') == 'iphone17' and stages['seam'] == 'not_applicable'
+    required = ('geometry', 'lighting', 'structure') if standard else ('geometry', 'lighting', 'structure', 'seam')
+    all_stages = all(stages[k] == 'complete' for k in required)
     final_hashes = done.get('final_sha256') or {}
     saved_review = (done.get('saved_candidate_review_assembly') is True
         and done.get('assembly_mode') == SAVED_REVIEW_ASSEMBLY_MODE
@@ -184,7 +186,11 @@ def processing_state(done):
     if generated:
         if all_stages:
             # 2026-11-06 user decision: full-stage results pass directly; warnings stay as notes.
-            summary = '调光、天线对齐和接缝处理已完成'
+            if done.get('model') == 'iphone17':
+                summary = ('六面调光、天线、按钮和底面校正已完成' if standard else
+                           '六面调光、结构校正、镜头配准和四角接缝处理已完成')
+            else:
+                summary = '调光、天线对齐和接缝处理已完成'
         else:
             if len(lighting_faces) == 6 and any(details.get(f, {}).get('lighting') == 'review_applied' for f in FACES):
                 light = '六面已应用调光候选，部分待核对'
@@ -198,7 +204,10 @@ def processing_state(done):
                 alignment = ('左侧' if review_applied_faces[0] == 'left' else '右侧') + '天线位置已调整，另一侧未调整，待核对'
             else:
                 alignment = '天线未对齐'
-            summary = light + ' · ' + alignment + (' · 接缝未完成' if stages['seam'] != 'complete' else '')
+            if standard:
+                summary = light + ' · 部分步骤未完成，详见逐面提示'
+            else:
+                summary = light + ' · ' + alignment + (' · 接缝未完成' if stages['seam'] != 'complete' else '')
     else:
         summary = None
     bottom = done.get('bottom_alignment') or {}
@@ -474,7 +483,7 @@ def stop_group(proc):
     proc.wait(timeout=5)
 
 
-def scan_folder(value):
+def scan_folder(value, model=None):
     source = Path(value).expanduser().resolve(strict=True)
     if not source.is_dir():
         raise ValueError('请选择文件夹。')
@@ -497,7 +506,7 @@ def scan_folder(value):
         missing = [LABELS[f] for f in FACES if f not in files]
         if missing:
             errors.append('缺少：' + '、'.join(missing))
-        recognition = inspect_images(paths)
+        recognition = inspect_images(paths, standard=True) if model == 'iphone17' else inspect_images(paths)
         identified = recognition['complete']
         changes = [dict(source=r['name'], target=r['face']+Path(r['file']).suffix.lower())
                    for r in recognition['images'] if r['face'] and Path(r['file']).stem.lower()!=r['face']]
@@ -667,8 +676,10 @@ class App:
         with self.lock:
             job.update(values); save(self.registry/(job['id']+'.json'), job)
 
-    def scan(self, value):
-        result = scan_folder(value); result['id'] = secrets.token_hex(12)
+    def scan(self, value, model=None):
+        result = scan_folder(value, model) if model else scan_folder(value)
+        result['standard'] = model == 'iphone17'
+        result['id'] = secrets.token_hex(12)
         with self.lock:
             self.scans[result['id']] = result
             if len(self.scans) > 32:
@@ -717,7 +728,7 @@ class App:
             except Exception:
                 shutil.rmtree(pending, ignore_errors=True)
                 raise
-            result = self.scan(final)
+            result = self.scan(final, 'iphone17') if scan.get('standard') else self.scan(final)
             result.update(named_copy=True, skipped=manifest['skipped'])
             scan['normalized_scan_id'] = result['id']
             return result
@@ -745,30 +756,35 @@ class App:
                 raise ValueError('续接范围必须是原批次中处理阶段未完成的项目。')
             # New jobs use only explicitly configured/requested continuation.
             # A retry keeps its original options even if service defaults changed.
+            standard = body.get('model') == 'iphone17'
             default_reference = (resume_job.get('source_body_reference_review', False)
-                                 if resume_job else self.source_body_reference_review)
+                                 if resume_job else self.source_body_reference_review and not standard)
             reference_review = body.get('source_body_reference_review', default_reference)
             if type(reference_review) is not bool:
                 raise ValueError('source_body_reference_review 必须是明确的布尔值')
             if resume_job and reference_review != default_reference:
                 raise ValueError('续接必须保留原批次的本机参考选项')
-            default_side = resume_job.get('side_candidate_review', False) if resume_job else self.side_candidate_review
+            default_side = resume_job.get('side_candidate_review', False) if resume_job else self.side_candidate_review and not standard
             side_review = body.get('side_candidate_review', default_side)
-            default_required = resume_job.get('require_geometry_resume', False) if resume_job else self.require_geometry_resume
+            default_required = resume_job.get('require_geometry_resume', False) if resume_job else self.require_geometry_resume and not standard
             required_resume = body.get('require_geometry_resume', default_required)
             if type(side_review) is not bool or type(required_resume) is not bool:
                 raise ValueError('侧面复核与必需几何续接选项必须是明确布尔值')
             if resume_job and (side_review != default_side or required_resume != default_required):
                 raise ValueError('重试必须保留原批次的侧面复核与几何续接选项')
             default_resume = resume_job['work'] if resume_job else self.resume_geometry_from
+            if standard:
+                default_resume = None
             requested_resume = body.get('resume_geometry_from', default_resume)
             resume_path = geometry_resume_path(requested_resume, required_resume)
-            if resume_job and resume_path != str(Path(default_resume).resolve()):
+            if resume_job and not standard and resume_path != str(Path(default_resume).resolve()):
                 raise ValueError('重试必须使用原批次的几何检查点')
             default_manifest = (resume_job.get('saved_review_manifest') if resume_job
                                 else self.saved_review_manifest)
             default_digest = (resume_job.get('saved_review_manifest_sha256') if resume_job
                               else self.saved_review_manifest_sha256)
+            if standard:
+                default_manifest = default_digest = None
             requested_manifest = body.get('saved_review_manifest', default_manifest)
             requested_digest = body.get('saved_review_manifest_sha256',
                 default_digest if requested_manifest == default_manifest else None)
@@ -777,9 +793,16 @@ class App:
                 raise ValueError('续接必须保留原批次的保存候选清单及其校验值')
             if side_review and (not reference_review or manifest_path is not None):
                 raise ValueError('新侧面复核需显式本机参考，且不能同时选择保存候选清单')
+            if standard and any((reference_review, side_review, required_resume, resume_path, manifest_path)):
+                raise ValueError('标准版使用独立流程，请从六面原图开始。')
             from .frame_seams import profile
             model = body.get('model')
-            profile(model)
+            if model != 'iphone17':
+                profile(model)
+            if scan.get('standard', False) != (model == 'iphone17'):
+                raise ValueError('型号已变更，请重新读取原图目录。')
+            if resume_job and model != resume_job['model']:
+                raise ValueError('续接必须保留原机型。')
             # Recheck the selection just before start, including duplicates and
             # image corruption introduced since the scan.
             source = Path(scan['source'])
@@ -815,7 +838,12 @@ class App:
                        saved_review_manifest_sha256=manifest_digest,
                        root=str(root), output=str(output_base/stamp), output_base=str(output_base), work=str(root/'过程'),
                        message='准备处理', elapsed=0, host=sample)
-            if resume_job:
+            if standard:
+                job.update(protection_policy='sticker_only', lighting_profile='standard_glass_back',
+                           bottom_alignment='standard_3_5_holes')
+            if resume_job and standard:
+                job.update(parent_job_id=resume_job['id'], message='准备从标准版原图重新处理')
+            elif resume_job:
                 job.update(resume_geometry_from=resume_job['work'], parent_job_id=resume_job['id'],
                            message='准备继续未完成步骤；复用已校验的本批几何结果')
             self.jobs[stamp] = job; self.cancel_events[stamp] = threading.Event()
@@ -837,7 +865,7 @@ class App:
             selected = body.get('skus', names)
             if not selected or not isinstance(selected, list) or not set(selected) <= set(names):
                 raise ValueError('没有需要继续的处理阶段；已完成候选仅需复核。')
-            scan = self.scan(job['source'])
+            scan = self.scan(job['source'], 'iphone17') if job['model'] == 'iphone17' else self.scan(job['source'])
             return self.start(dict(scan_id=scan['id'], skus=selected, model=job['model'],
                 concurrency=body.get('concurrency', 1),
                 output=body.get('output') or job.get('output_base') or str(Path(job['output']).parent),
@@ -932,6 +960,12 @@ class App:
                     raise ValueError('保存候选清单缺少批次校验值，未开始处理')
                 cmd += ['--saved-review-manifest', manifest_path,
                         '--saved-review-manifest-sha256', manifest_digest]
+            if job['model'] == 'iphone17':
+                cmd = [sys.executable, '-m', 'phone_texture.iphone17_batch', job['source'],
+                       '--work', job['work'], '--output', job['output'], '--jobs', str(n),
+                       '--skus', *job['names']]
+                if job['single']:
+                    cmd.append('--single')
             env = dict(os.environ, HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', PYTHONUNBUFFERED='1')
             with (Path(job['root'])/'运行日志.txt').open('w') as log:
                 options = dict(cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -1193,7 +1227,7 @@ def handler(app):
                 if not isinstance(body, dict):
                     raise ValueError('请求格式无效')
                 if self.path == '/api/scan':
-                    result = app.scan(body['path'])
+                    result = app.scan(body['path'], body.get('model'))
                 elif self.path == '/api/name':
                     result = app.apply_names(body['scan_id'])
                 elif self.path == '/api/start':

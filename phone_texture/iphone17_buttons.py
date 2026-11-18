@@ -17,7 +17,7 @@ def _edge_track(a,edge,level):
     return -(idx-1+(level-before)/np.maximum(.001,after-before))
 
 
-def rear_buttons(image,side):
+def _rear_buttons(image,side,rail_window=0):
     """Locate independent protrusions; no side-photo positions used as targets.
 
     The contour shoulder is measured at 25% of the protrusion's fitted depth,
@@ -35,7 +35,12 @@ def rear_buttons(image,side):
         for _ in range(15):
             delta=track[ys]-np.polyval(coef,ys)
             coef=np.polyfit(ys,track[ys],2,w=np.where(delta>0,.1,1.))
-        base=np.polyval(coef,np.arange(h));res=track-base
+        base=np.polyval(coef,np.arange(h))
+        if rail_window:
+            # Remove long-wave silhouette curvature before finding protrusions.
+            # The final shoulders still use the bare rail on each side.
+            base = ndimage.grey_opening(track, size=round(h*rail_window))
+        res=track-base
         mask=res>scale;mask[:lo]=False;mask[hi:]=False
         labs,n=ndimage.label(mask);found=[]
         for label in range(1,n+1):
@@ -81,6 +86,23 @@ def rear_buttons(image,side):
     return dict(rear_image_edge=edge,rows=rows.tolist(),alpha_levels=[.35,.5,.65],
                 independent_contour_rows=readings.tolist(),checks=proof,
                 definition='25_percent_protrusion_depth_shoulder_above_current_body_rail')
+
+
+def rear_buttons(image,side):
+    try:
+        return _rear_buttons(image,side)
+    except ValueError as original:
+        # Require agreement between two independent rail lengths, three alpha
+        # contours and each button's own RGB shoulder before accepting a fit.
+        try:
+            a = _rear_buttons(image,side,.105)
+            b = _rear_buttons(image,side,.13)
+        except ValueError:
+            raise original
+        if np.max(abs(np.array(a['rows'])-b['rows']))>1.:
+            raise original
+        return dict(a, rail_method='multi_scale_opening_with_local_bare_rail_refit',
+                    alternate_rail_rows=b['rows'])
 
 
 def button_edges(image,boxes):

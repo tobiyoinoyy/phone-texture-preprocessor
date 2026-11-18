@@ -291,7 +291,44 @@ def recognize(path, exclude_group=None):
     return result
 
 
-def inspect_images(paths):
+@lru_cache(maxsize=1)
+def standard_references():
+    # Frozen edge descriptors of the reviewed standard studio photos.
+    with np.load(DATA/'iphone17_views.npz', allow_pickle=False) as data:
+        return {name:data[name] for name in data.files}
+
+
+def standard_cap_match(path):
+    rgb = read_rgb(path)
+    feature = edge_feature(rgb)
+    mirror = edge_feature(rgb[:,::-1].copy())
+    refs = standard_references()
+    scores = {name:float(feature @ ref) for name,ref in refs.items()}
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    cap = ranked[0]
+    if cap not in ('top','bottom') or scores[cap] < .94 or scores[cap]-scores[ranked[1]] < .04:
+        return None
+    if scores[cap] - float(mirror @ refs[cap]) < .025:
+        return None
+    return dict(face=cap, suggested_face=cap, score=scores[cap], method='standard_cap_atlas',
+                standard_frame_scores=scores, reason=None)
+
+
+def standard_back_match(path):
+    reference = standard_references()['back']
+    feature = edge_feature(read_rgb(path))
+    overall = float(feature @ reference)
+    def camera_patch(vector):
+        patch = vector.reshape(48,48)[6:17,15:23].ravel()
+        return patch / (np.linalg.norm(patch) + 1e-8)
+    camera = float(camera_patch(feature) @ camera_patch(reference))
+    if overall >= .93 and camera >= .92:
+        return dict(face='back', suggested_face='back', score=overall,
+                    camera_score=camera, method='standard_glass_back_atlas', reason=None)
+    return None
+
+
+def inspect_images(paths, standard=False):
     images = []; errors = []
     if len(paths) != 6:
         return dict(images=[], complete=False, errors=[f'需要 6 张原图，当前 {len(paths)} 张'])
@@ -299,6 +336,9 @@ def inspect_images(paths):
         try:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             proof = recognize(path)
+            if standard and proof['face'] is None:
+                match = standard_back_match(path) if proof['suggested_face'] in ('front','back') else standard_cap_match(path)
+                proof.update(match or {})
             if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
                 raise ValueError('Image changed during recognition')
             images.append(dict(file=str(path), name=path.name, sha256=digest, **proof))
