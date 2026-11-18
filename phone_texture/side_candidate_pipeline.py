@@ -1,5 +1,6 @@
 """Current-job side review continuation; no saved experiment selection."""
 import copy
+import json
 from pathlib import Path
 import traceback
 
@@ -56,6 +57,10 @@ def normal_lighting(source, candidate, face, checks, case, folder, sku):
         selected_for_delivery=False, result_path=str(path),
         artifacts=dict(result=str(path), preparation=str(preparation), candidate=str(candidate)),
         lighting_rendered_in_current_job=True, additional_render_performed=False)
+    # Checks may contain coordinate tuples / integer-keyed diagnostic maps.
+    # Return the same JSON value we persist, while still rejecting non-finite
+    # data and letting report() catch any subsequent content/hash mutation.
+    result = json.loads(json.dumps(result, allow_nan=False))
     write(path, result)
     return result
 

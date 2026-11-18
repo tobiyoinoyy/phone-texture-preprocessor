@@ -136,3 +136,23 @@ def test_report_rejects_mismatched_convenience_digest(tmp_path):
     record['result_sha256'] = '0'*64
     with pytest.raises(RuntimeError, match='differs'):
         route.report(record, tmp_path, 'result_path')
+
+
+def test_normal_lighting_returns_its_exact_persisted_json_without_weakening_integrity(tmp_path):
+    case = tmp_path/'case'; folder = case/'side'; folder.mkdir(parents=True)
+    work = case/'work'; work.mkdir()
+    source = case/'source.png'; source.write_bytes(b'source')
+    candidate = case/'candidate.png'; candidate.write_bytes(b'candidate')
+    job = work/'job.json'; job.write_text('{}')
+    (work/'lighting-checks.json').write_text('{}')
+    (work/'lighting-jobs.json').write_text(json.dumps({'sku': {'left': str(job)}}))
+    checks = dict(source_sha256=route.w.sha(source), output_sha256=route.w.sha(candidate),
+                  measured_box=(1, 2, 3, 4), samples={1: (2, 3)})
+    result = route.normal_lighting(source, candidate, 'left', checks, case, folder, 'sku')
+    assert result['checks']['measured_box'] == [1, 2, 3, 4]
+    assert result['checks']['samples'] == {'1': [2, 3]}
+    assert checks['measured_box'] == (1, 2, 3, 4)
+    route.report(result, case, 'result_path')
+    result['checks']['measured_box'][0] = 99
+    with pytest.raises(RuntimeError, match='differs'):
+        route.report(result, case, 'result_path')

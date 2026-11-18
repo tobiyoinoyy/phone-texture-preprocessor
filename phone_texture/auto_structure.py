@@ -157,9 +157,18 @@ def _rear_reference_per_band(image,candidates,minimum_support):
         if None not in own:break
     else:raise ValueError('Rear antenna landmarks lack neighbouring-column consensus')
     rows=[int(v) for pair in own for v in pair]
+    # Consumers require a conservative support count even when the two bands
+    # chose different columns. Recount around the actual returned pairs, not
+    # the nearby seed (three-pixel neighbourhoods are not transitive).
+    support = [sum(any(near(own[b], tuple(p)) for p in c[3]['supported_central_candidates'][b])
+                   for c in candidates) for b in (0, 1)]
+    if min(support) < minimum_support:
+        raise ValueError('Rear antenna landmarks lack neighbouring-column consensus')
     g=np.gradient(gaussian_filter1d(gray_signal(np.array(image.convert('RGBA')),xr),1.))
     signs=[int(np.sign(g[r])) for r in rows]
-    return rows,signs,xr,dict(proof,per_band_selection=method,method='per_band_rear_column_consensus')
+    return rows,signs,xr,dict(proof,per_band_selection=method,
+        agreeing_columns=min(support), agreeing_columns_by_band=support,
+        method='per_band_rear_column_consensus')
 
 
 def windows(rows,h,radius=4):

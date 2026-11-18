@@ -41,7 +41,7 @@ def _fast_lower_plateau(distance, observed, width, gradients, xx):
         raw_rgb_alpha_offset_p95_px=float(np.percentile(np.abs(offsets[valid]),95)),plateau=plateau)
 
 
-def calibrate_top(rgba, raw_rgb):
+def _calibrate_top(rgba, raw_rgb, exposed_lower=False):
     if raw_rgb is None or raw_rgb.shape != rgba[..., :3].shape:
         raise TopCalibrationError('TOP_SOURCE_REQUIRED: original RGB required')
     alpha = rgba[..., 3]
@@ -59,6 +59,7 @@ def calibrate_top(rgba, raw_rgb):
     train = np.arange(len(distance)) % 3 != 0
     gradients = np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(
         raw_rgb.astype(np.float32), .8, axis=0), axis=0), axis=2)
+    lower_fit = _exposed_lower_rail(alpha, raw_rgb, x0, x1, gradients) if exposed_lower else None
     corners = []; levels = []
     for end in (0, 1):
         xx = x0 + distance if end == 0 else x1 - 1 - distance
@@ -68,6 +69,22 @@ def calibrate_top(rgba, raw_rgb):
                     len(mask) - np.argmax(mask[::-1, xx], axis=0)]
         edge_levels = []
         for edge, sign, yy in zip(('upper', 'lower'), (1, -1), observed):
+            if edge == 'lower' and lower_fit is not None:
+                line, evidence = lower_fit
+                # The measured plateau cannot excuse an unrelated protrusion
+                # or a fabricated corner outside the physical lower plane.
+                if np.percentile(yy - np.polyval(line, xx+.5), 95) > 2:
+                    raise TopCalibrationError('TOP_LOWER_CORNER_OUTSIDE_PLATEAU')
+                sample_y = np.clip(yy[:, None] + np.arange(-3, 4), 0, len(mask)-1)
+                support = gradients[sample_y, xx[:, None]].max(axis=1) > 3
+                if support.mean() < .8:
+                    raise TopCalibrationError('TOP_CORNER_RGB_UNSUPPORTED')
+                endpoint = x0 + .5 if end == 0 else x1 - .5
+                level = float(np.polyval(line, endpoint))
+                edge_levels.append(level)
+                corners.append(dict(end='left' if end == 0 else 'right', edge=edge,
+                    plateau=level, exposed_lower_rail=evidence))
+                continue
             # Decay of the rounded end into the flat frame. The island starts
             # farther inward; no island pixels participate in this estimate.
             def residual(v):
@@ -117,13 +134,87 @@ def calibrate_top(rgba, raw_rgb):
     halves = [float(v.mean()) for v in np.array_split(strength > 3, 2)]
     if min(halves) < .8:
         raise TopCalibrationError('TOP_BODY_TRANSITION_UNSUPPORTED')
-    return upper, lower, dict(method='top_body_exposed_corners_v1',
+    return upper, lower, dict(method='top_body_corners_and_exposed_lower_v2' if exposed_lower else 'top_body_exposed_corners_v1',
         capture_profile='iphone17-studio', x_extent=[x0,x1], corners=corners,
         raw_body_transition_support=halves, top_rail=upper.tolist(), bottom_rail=lower.tolist(),
         rail_agreement=dict(method='same_angular_residual_as_post_rotation_guard',
             maximum_residual_degrees=.15,measured_residual_degrees=residual.tolist(),
             thickness_delta_px=float(abs(np.diff(thickness)[0]))),
         camera_policy='exclude_entire_camera_island_and_lenses', agent_required=False)
+
+
+def _exposed_lower_rail(alpha, raw_rgb, x0, x1, gradients):
+    """Measure the visible lower plateau instead of extrapolating its corner.
+
+    Rounded ends keep their original alpha. Both end bands must independently
+    support a straight edge in held-out alpha samples and original RGB; the
+    central stand is never sampled. No outliers or missing bands are filled.
+    """
+    width = x1 - x0
+    groups = [np.arange(int(x0 + lo*width), int(x0 + hi*width))
+              for lo, hi in ((.05, .12), (.88, .95))]
+    xx = np.concatenate(groups)
+    training = np.concatenate([np.arange(len(g)) % 3 != 0 for g in groups])
+    endpoints = np.array([x0 + .5, x1 - .5])
+    estimates = []
+    for threshold in (128, 64, 192):
+        labels, count = ndimage.label(alpha >= threshold)
+        if not count:
+            raise TopCalibrationError('TOP_LOWER_PLATEAU_NOT_FOUND')
+        sizes = np.bincount(labels.ravel()); sizes[0] = 0
+        mask = labels == sizes.argmax()
+        if not mask[:, xx].any(axis=0).all():
+            raise TopCalibrationError('TOP_LOWER_PLATEAU_NOT_VISIBLE')
+        yy = len(mask) - np.argmax(mask[::-1, xx], axis=0)
+        line = np.polyfit(xx[training]+.5, yy[training], 1)
+        error = abs(np.polyval(line, xx+.5) - yy)
+        proofs = []
+        for indices in (np.arange(len(groups[0])), np.arange(len(groups[0]),len(xx))):
+            train_error = float(np.percentile(error[indices[training[indices]]], 95))
+            held_error = float(np.percentile(error[indices[~training[indices]]], 95))
+            if train_error > 1.5 or held_error > 2:
+                raise TopCalibrationError('TOP_LOWER_PLATEAU_UNSTABLE')
+            proofs.append(dict(training_error_p95_px=train_error, held_out_error_p95_px=held_error))
+        estimates.append((line, yy, proofs))
+    line, yy, proofs = estimates[0]
+    spread = max(float(np.max(abs(np.polyval(other[0], endpoints)-np.polyval(line,endpoints))))
+                 for other in estimates[1:])
+    if spread > 1.5:
+        raise TopCalibrationError('TOP_LOWER_PLATEAU_ALPHA_UNSTABLE')
+    rows = np.clip(yy[:,None]+np.arange(-3,4), 0, alpha.shape[0]-1)
+    strength = gradients[rows,xx[:,None]]
+    peak = np.argmax(strength,axis=1)
+    valid = (strength.max(axis=1)>3)&(peak>0)&(peak<6)
+    for indices in (np.arange(len(groups[0])), np.arange(len(groups[0]),len(xx))):
+        if valid[indices].mean() < .8:
+            raise TopCalibrationError('TOP_LOWER_PLATEAU_RGB_UNSUPPORTED')
+    rgb_y = rows[np.arange(len(xx)),peak] + .5
+    rgb_line = np.polyfit(xx[valid]+.5, rgb_y[valid], 1)
+    rgb_error = float(np.percentile(abs(np.polyval(rgb_line,xx[valid]+.5)-rgb_y[valid]),95))
+    discrepancy = float(np.max(abs(np.polyval(rgb_line,endpoints)-np.polyval(line,endpoints))))
+    if rgb_error > 2 or discrepancy > 2:
+        raise TopCalibrationError('TOP_LOWER_PLATEAU_RGB_DISAGREES')
+    return line, dict(method='two_exposed_lower_plateaus_with_heldout_alpha_and_RGB',
+        bands_xy=[[int(g[0]),int(g[-1])+1] for g in groups], end_checks=proofs,
+        alpha_threshold_spread_px=spread, raw_rgb_support_fraction=float(valid.mean()),
+        raw_rgb_residual_p95_px=rgb_error, raw_rgb_alpha_discrepancy_px=discrepancy,
+        lower_rail=line.tolist(), corner_alpha_reconstructed=False)
+
+
+def calibrate_top(rgba, raw_rgb):
+    """Keep accepted results unchanged; recover only with independent lower edges."""
+    try:
+        return _calibrate_top(rgba, raw_rgb)
+    except TopCalibrationError as original:
+        if not str(original).startswith(('TOP_CORNER_AMBIGUOUS', 'TOP_BODY_RAILS_DISAGREE')):
+            raise
+        try:
+            upper, lower, proof = _calibrate_top(rgba, raw_rgb, exposed_lower=True)
+        except TopCalibrationError as retry:
+            original.fallback_failure = str(retry)
+            raise original from retry
+        proof['original_failure'] = str(original)
+        return upper, lower, proof
 
 
 def verify_top_mask(rgba, corrected, upper, lower, proof):
