@@ -36,4 +36,26 @@ def test_profile_has_all_four_corresponding_material_boundaries():
     profile=w.read(PROFILE)
     assert {frozenset(c['names']) for c in profile['chains']}=={
         frozenset((a,b)) for a in ('top','bottom') for b in ('left','right')}
-    assert all(c['arc'][-1]>.28 and np.all(np.diff(c['arc'])>0) for c in profile['chains'])
+    assert all(np.isclose(c['arc'][-1],.2325932,atol=1e-6) and np.all(np.diff(c['arc'])>0) for c in profile['chains'])
+
+
+def test_seam_measurement_uses_current_positions_and_rejects_unobserved_metal(tmp_path):
+    from phone_texture.iphone17_model_finish import _current_seam_readings,FRAMES
+    files={}
+    masks={}
+    for face in FRAMES:
+        a=np.full((44,42,4),128,np.uint8)
+        a[...,3]=255
+        if face=='left':
+            a[24:35,:,:3]=175
+        files[face]=tmp_path/(face+'.png')
+        Image.fromarray(a).save(files[face])
+        masks[face]=np.ones(a.shape[:2],bool)
+    def boundary(y):
+        return dict(names=['top','left'],edges=[0],arc=[0.,1.],
+                    sides=[dict(name=face,points=[[8,y],[33,y]]) for face in ('top','left')])
+    readings=_current_seam_readings(files,[boundary(10),boundary(29)],masks,2)
+    assert readings[0]['after_p95_deltaE76']==0 and readings[1]['after_p95_deltaE76']>2
+    masks['left'][25:32,:]=False
+    with pytest.raises(ValueError,match='jointly editable'):
+        _current_seam_readings(files,[boundary(29)],masks,2)

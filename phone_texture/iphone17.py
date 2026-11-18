@@ -156,7 +156,7 @@ def run(source, work=None, output=None, *, single_name='SKU_01', device='auto', 
                 from .iphone17_buttons import propose as button_propose,apply as button_apply
                 button_dir=work/'button-inputs';button_dir.mkdir(exist_ok=True)
                 button_input=button_dir/(face+'.png');im.save(button_input)
-                button_spec=button_propose(files['back'],button_input,face)
+                button_spec=button_propose(files['back'],button_input,face,work/'work/geometry-records/report.json')
                 w.save(work/(face+'-button-proposal.json'),button_spec)
                 im,structural[face]['button_alignment']=button_apply(im,button_spec)
             elif face=='bottom':

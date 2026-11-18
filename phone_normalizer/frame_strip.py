@@ -146,7 +146,19 @@ def normalize_frame_strip(image: Image.Image, *, face='bottom', deskew=None, sta
             raise ValueError('Top body calibration requires deskew; legacy extraction is not a validated top output')
         from phone_texture.auto_geometry import frame_geometry
         return frame_geometry(image, face, stage_sink, source_image)
-    result, info = extract_frame_strip(image, face=face)
+    try:
+        result, info = extract_frame_strip(image, face=face)
+    except ValueError as original:
+        if source_image is None or not str(original).startswith((
+                'Endcaps do not describe', 'Exposed frame boundaries are inconsistent')):
+            raise
+        from phone_texture.frame_contact import recover_frame
+        try:
+            recovered, info = recover_frame(image, source_image, face, stage_sink, deskew=deskew is not False)
+            info['original_failure'] = str(original)
+            return recovered, info
+        except ValueError as unsupported:
+            raise ValueError(f'{original} (source contact check: {unsupported})') from unsupported
     if stage_sink:
         stage_sink('source_matte', image.copy())
         source_space = Image.new('RGBA', image.size)

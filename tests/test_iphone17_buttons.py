@@ -49,3 +49,57 @@ def test_projective_buttons_keep_antenna_rows_sim_and_alpha(tmp_path):
     assert np.max(abs(np.asarray(check['endpoint_error_rear_px'])))<=1.5
     cfg['rear_detection']['rear_image_edge']='left'
     with pytest.raises(ValueError,match='Wrong rear edge'):apply(im,cfg)
+
+
+def test_button_at_crop_edge_requires_matching_original_neighbours(tmp_path):
+    import json
+    from phone_texture.geometry_review import digest
+    from phone_texture.iphone17_buttons import source_bound_buttons
+
+    original = back()
+    canvas = tmp_path/'after-rotation-canvas.png'
+    original.save(canvas)
+    target = tmp_path/'back.png'
+    box = (4, 0, 996, original.height)
+    cropped = original.crop(box)
+    cropped.save(target)
+    record = dict(face='back', output_sha256=digest(target),
+                  geometry=dict(canvas_trim_xyxy=[0,0,*original.size], visible_canvas_trim=dict(crop_xyxy=box)),
+                  geometry_evidence=[dict(path=str(canvas), sha256=digest(canvas))])
+    report = tmp_path/'report.json'
+    report.write_text(json.dumps(dict(images=[record])))
+    with pytest.raises(ValueError, match='pre-crop evidence required'):
+        source_bound_buttons(target, cropped, 'right', None)
+    actual = source_bound_buttons(target, cropped, 'right', report)
+    expected = rear_buttons(original, 'right')
+    np.testing.assert_allclose(actual['rows'], expected['rows'], atol=.1)
+    assert actual['pre_crop_sha256'] == digest(canvas)
+    record['geometry']['visible_canvas_trim']['crop_xyxy'] = (5,0,997,original.height)
+    report.write_text(json.dumps(dict(images=[record])))
+    with pytest.raises(ValueError, match='pixels disagree'):
+        source_bound_buttons(target, cropped, 'right', report)
+    Image.new('RGBA', original.size).save(canvas)
+    with pytest.raises(ValueError, match='has changed'):
+        source_bound_buttons(target, cropped, 'right', report)
+
+
+def test_button_texture_preserves_near_opaque_interior_but_rejects_actual_edge():
+    from phone_texture.iphone17_buttons import _retain_interior_coverage
+    a = np.full((24, 24, 4), 255, dtype=np.uint8)
+    a[:, :2, 3] = 0
+    a[9:13, 8:14, 3] = 252
+    y, x = np.mgrid[:24, :24].astype(float)
+    sx = x.copy()
+    sx[8:15, 8:15] += .6
+    rendered = np.asarray(_sample_xy(Image.fromarray(a), sx, y))
+    assert not np.array_equal(rendered[..., 3], a[..., 3])
+    out = np.array(_retain_interior_coverage(a, rendered, x, y, sx, y))
+    assert np.array_equal(out[..., 3], a[..., 3])
+    assert np.array_equal(out[..., :3], rendered[..., :3])
+    sx[10, 3] += .5
+    with pytest.raises(ValueError, match='body alpha contour'):
+        _retain_interior_coverage(a, rendered, x, y, sx, y)
+    sx[10, 3] = 3
+    sx[10, 12] = 3.1
+    with pytest.raises(ValueError, match='sample the body alpha contour'):
+        _retain_interior_coverage(a, rendered, x, y, sx, y)

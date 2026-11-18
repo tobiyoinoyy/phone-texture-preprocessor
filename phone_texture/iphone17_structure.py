@@ -52,7 +52,7 @@ def gradient_peak(gradient, target, sign, radius=4):
     return float(k+(.5*(a-c)/den if abs(den)>1e-9 else 0.))
 
 
-def rear_antennas(image, *, refine_bands=('upper','lower'), sides=('left','right')):
+def _rear_antennas(image, *, reflective_rim=False, refine_bands=('upper','lower'), sides=('left','right')):
     """Measure bright plastic breaks in the narrow dark rear metal rim.
 
     The glass has no antenna; the outer rim does. Follow the current alpha
@@ -67,11 +67,27 @@ def rear_antennas(image, *, refine_bands=('upper','lower'), sides=('left','right
             continue
         edge=np.argmax(a[...,3]>200,axis=1) if edge_name=='left' else w-1-np.argmax(a[:,::-1,3]>200,axis=1)
         edge=ndimage.gaussian_filter1d(ndimage.median_filter(edge.astype(float),max(3,int(h*.01)//2*2+1)),max(1,h*.0025))
-        tracks=[]
-        for offset in (1.,2.,3.):
-            xs=edge+(offset*scale if edge_name=='left' else -offset*scale)
-            sig=ndimage.map_coordinates(gray,[np.arange(h),xs],order=1,mode='nearest')
-            tracks.append(ndimage.gaussian_filter1d(sig,max(.7,h/2058)))
+        if reflective_rim:
+            tracks = []
+            orientation = 1 if edge_name=='left' else -1
+            offsets = np.arange(2,round(16*scale)+1)
+            x = edge[:,None]+orientation*offsets
+            yy=np.broadcast_to(np.arange(h)[:,None],x.shape)
+            stack = ndimage.map_coordinates(gray,[yy,x],order=1,mode='nearest')
+            smooth = ndimage.gaussian_filter1d(stack,.7,axis=1)
+            peak = np.argmax(smooth,axis=1)
+            line = ndimage.median_filter(peak.astype(float),size=(round(h*.022)//2*2+1))
+            line = ndimage.gaussian_filter1d(line,2.)
+            for offset in (-1.,0.,1.):
+                xs = edge+orientation*(line+offsets[0]+offset)
+                sig=ndimage.map_coordinates(gray,[np.arange(h),xs],order=1,mode='nearest')
+                tracks.append(-ndimage.gaussian_filter1d(sig,max(.7,h/2058)))
+        else:
+            tracks=[]
+            for offset in (1.,2.,3.):
+                xs=edge+(offset*scale if edge_name=='left' else -offset*scale)
+                sig=ndimage.map_coordinates(gray,[np.arange(h),xs],order=1,mode='nearest')
+                tracks.append(ndimage.gaussian_filter1d(sig,max(.7,h/2058)))
         consensus=np.median(tracks,axis=0)
         rows=[];proof=[]
         for band,(lo,hi) in zip(('upper','lower'),[(int(h*.065),int(h*.16)),(int(h*.84),int(h*.94))]):
@@ -118,6 +134,22 @@ def rear_antennas(image, *, refine_bands=('upper','lower'), sides=('left','right
         result[side]=dict(rows=rows,rear_image_edge=edge_name,checks=proof)
     return result
 
+
+
+def rear_antennas(image, *, refine_bands=('upper','lower'), sides=('left','right')):
+    result = {}
+    for side in sides:
+        try:
+            found = _rear_antennas(image,refine_bands=refine_bands,sides=(side,))
+        except ValueError:
+            w,h = image.size
+            glass = image.crop((int(.4*w),int(.43*h),int(.6*w),int(.56*h))).convert('RGB')
+            if np.median(np.asarray(glass))>=95:
+                raise
+            found = _rear_antennas(image,reflective_rim=True,refine_bands=refine_bands,sides=(side,))
+            found[side]['reference_track'] = 'dark_break_across_three_specular_ridge_tracks'
+        result.update(found)
+    return result
 
 def hardware(image,side):
     a=np.asarray(image.convert('RGBA'));h,w=a.shape[:2]
@@ -215,6 +247,50 @@ def measure_side(image,target,signs):
     return checks
 
 
+
+def _warp_along_rail(image, source, dest):
+    """Follow the observed rail when the source and destination rows taper differently."""
+    from .iphone17_buttons import _sample_xy
+    from texture_alignment.align_textures import anchor_matrix
+    w,h = image.size
+    src = anchor_matrix(source,h,w,'source')
+    dst = anchor_matrix(dest,h,w,'target')
+    yy,xx = np.indices((h,w),dtype=float)
+    sy = np.stack([np.interp(yy[:,x],dst[:,x],src[:,x]) for x in range(w)],axis=1)
+    alpha = np.asarray(image.getchannel('A'),dtype=float)
+    sx = xx.copy()
+    for field, x, sign in ((alpha,xx,1),(alpha[:,::-1],w-1-xx,-1)):
+        hit = field>=128
+        first = hit.argmax(axis=1)
+        before = field[np.arange(h),np.maximum(0,first-1)]
+        after = field[np.arange(h),first]
+        rail = np.maximum(0,first-1+(128-before)/np.maximum(1,after-before))
+        rail[first==0] = 0
+        moved = (sy!=yy) & (x < rail[:,None]+10)
+        if not moved.any():
+            continue
+        y = sy[moved]
+        if not (hit.any(axis=1)[np.floor(y).astype(int)].all() and
+                hit.any(axis=1)[np.ceil(y).astype(int)].all() and
+                hit.any(axis=1)[yy[moved].astype(int)].all()):
+            raise ValueError('Antenna correction has no observed rail')
+        shift = np.interp(y,np.arange(h),rail)-rail[yy[moved].astype(int)]
+        if abs(shift).max()>3:
+            raise ValueError('Antenna rail moves beyond the observed local contour')
+        weight = np.clip(1-(x[moved]-rail[yy[moved].astype(int)])/10,0,1)
+        sx[moved] += sign*shift*weight
+    # The tight crop can bisect an antialiased outer sample. Its subpixel
+    # footprint terminates at the last photographed column. Keep the actual
+    # boundary sample only for that fractional, translucent footprint.
+    outside = (sx<0)|(sx>w-1)
+    beyond = (sx < -1)|(sx > w)
+    if np.any(outside & (alpha>=128)) or np.any(beyond & (alpha>0)):
+        raise ValueError('Antenna correction would extrapolate the body rail')
+    sx[beyond] = xx[beyond]
+    sy[beyond] = yy[beyond]
+    sx = np.clip(sx,0,w-1)
+    return _sample_xy(image,sx,sy)
+
 def apply(image,cfg, *, refine_indices=(0,1,2,3)):
     if tuple(refine_indices) not in ((0,1),(2,3),(0,1,2,3)):
         raise ValueError('Refine both boundaries of each selected antenna together')
@@ -233,8 +309,13 @@ def apply(image,cfg, *, refine_indices=(0,1,2,3)):
     # interpolation-phase corrections do not redefine the frozen rear target.
     anchors=[1,2,5,6];positions=np.array([.155,.5,.845])*w
     factor=cfg['back_size'][1]/h
+    follow_rail = False
     for attempt in range(5):
         out=warp_rows(image,source,dest)
+        if np.any((a[...,3]>=240)&(np.asarray(out)[...,3]<128)):
+            follow_rail = True
+        if follow_rail:
+            out=_warp_along_rail(image,source,dest)
         checks=measure_side(out,expected,cfg['signs'])
         errors=np.asarray([checks[k]['measured'] for k in ('left','center','right')])-expected
         widths=(errors[:,[1,3]]-errors[:,[0,2]])*factor
@@ -253,7 +334,7 @@ def apply(image,cfg, *, refine_indices=(0,1,2,3)):
     if max(c['max_error_px'] for c in checks.values())>2.5:
         raise ValueError('Standard antenna endpoint failed alignment')
     return out,dict(endpoint_checks=checks,alpha_changed=int(np.count_nonzero(a[...,3]!=b[...,3])),
-        opaque_body_lost=0,buttons_changed=0,endcaps_changed=0,
+        opaque_body_lost=0,buttons_changed=0,endcaps_changed=0,followed_native_rail=follow_rail,
         model_uv_verified=False,basis=cfg['basis'],back_sha256=cfg['back_sha256'],
         rear_reference_rows=rear.tolist(),rear_image_edge=cfg['rear_detection']['rear_image_edge'],
         target_rows=expected.tolist(),reference_policy=cfg['reference_policy'],side=cfg['side'],

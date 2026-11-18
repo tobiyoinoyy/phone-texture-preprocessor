@@ -1,6 +1,7 @@
 """Model-calibrated standard 17 frame ends and dual-lens texture registration."""
 import contextlib
 import io
+import shutil
 from pathlib import Path
 
 import cv2
@@ -42,6 +43,36 @@ def aligned_metal(work, face, size):
                          for x in range(size[0])],axis=1)
     return mask >= 254
 
+
+
+def _current_seam_readings(files, chains, masks, sigma):
+    engine=seam_engine()
+    low={}
+    for face in FRAMES:
+        rgba=np.asarray(Image.open(files[face]).convert('RGBA'))
+        fit=masks[face] & (rgba[...,3]>=240)
+        den=engine.gaussian(fit.astype(float),sigma)
+        lab=engine.rgb_to_lab(rgba[...,:3])
+        low[face]=engine.gaussian(lab*fit[...,None],sigma)/np.maximum(den[...,None],1e-8)
+    readings=[]
+    for chain in chains:
+        samples=[]
+        valid=np.ones(192,dtype=bool)
+        arc=chain['arc']
+        for side in chain['sides']:
+            name=side['name']
+            positions=np.asarray(side['points'])
+            points=np.column_stack([np.interp(np.linspace(0,arc[-1],192),arc,axis)
+                                    for axis in positions.T])
+            samples.append(engine.sample(low[name],points))
+            valid &= engine.sample(masks[name][...,None],points)[:,0]>.98
+        if valid.mean()<.98:
+            raise ValueError('Current model seam lacks jointly editable photographed metal')
+        delta=np.linalg.norm(samples[0]-samples[1],axis=1)[valid]
+        readings.append(dict(pair=chain['names'],edge_ids=chain['edges'],
+            joint_coverage=float(valid.mean()),metric_samples=int(valid.sum()),total_samples=len(valid),
+            after_p95_deltaE76=float(np.quantile(delta,.95)),after_mean_deltaE76=float(delta.mean())))
+    return readings
 
 def finish_frames(files, work, output, records):
     # Use the same source-bound domains and registration as the approved images.
@@ -95,25 +126,116 @@ def finish_frames(files, work, output, records):
         pp=records/(face+'-excluded.png')
         Image.fromarray((~mask*255).astype('uint8')).save(pp)
         views[face]=dict(source=str(src),editable_mask=str(mp),protected_mask=str(pp))
-    w.save(records/'chains.json',dict(chains=resized_chains(profile,files)))
+    baseline=w.read(PROFILE.with_name('iphone17-frame-baseline.json'))
+    w.save(records/'chains.json',dict(chains=resized_chains(baseline,files)))
     w.save(records/'scene.json',{})
     job=dict(scene=str(records/'scene.json'),seam_chains=str(records/'chains.json'),views=views,
-             output_dir=str(output),records_dir=str(records/'engine'),width_units=.18,
+             output_dir=str(records/'baseline-frames'),records_dir=str(records/'engine'),width_units=.18,
              guard_pixels=18,sigma=2,protection_feather=0,max_lab_shift=[28,16,16],
              minimum_joint_coverage=.98,maximum_p95_deltaE76=2.,sampling_refinements=2,
              maximum_correction_step_deltaE76=3.,continuity_retry_sigmas=[2,4],
              continuity_warning_limit_deltaE76=8.)
     w.save(records/'job.json',job)
-    with contextlib.redirect_stdout(io.StringIO()):
-        report=match_uv_seams.run(records/'job.json')
+    # Preserve the reviewed frame lighting wherever it already matches the
+    # current mesh. The previous seam layout supplies a starting image only.
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            match_uv_seams.run(records/'job.json')
+        starting={face:records/'baseline-frames'/(face+'.png') for face in FRAMES}
+    except ValueError as exc:
+        w.save(records/'baseline-warning.json',dict(reason=str(exc)))
+        starting={face:Path(views[face]['source']) for face in FRAMES}
+    chains=resized_chains(profile,files)
+    before=_current_seam_readings(starting,chains,masks,job['sigma'])
+    needed=[chain for chain,check in zip(chains,before) if check['after_p95_deltaE76']>job['maximum_p95_deltaE76']]
+    if needed:
+        current_views={face:dict(view,source=str(starting[face])) for face,view in views.items()}
+        w.save(records/'current-chains.json',dict(chains=needed))
+        current=dict(job,views=current_views,seam_chains=str(records/'current-chains.json'),
+                     output_dir=str(output),records_dir=str(records/'current-engine'))
+        w.save(records/'current-job.json',current)
+        with contextlib.redirect_stdout(io.StringIO()):
+            match_uv_seams.run(records/'current-job.json')
+        after=_current_seam_readings({f:output/(f+'.png') for f in FRAMES},chains,masks,job['sigma'])
+    else:
+        output.mkdir(parents=True,exist_ok=True)
+        for face,path in starting.items():
+            shutil.copy2(path,output/(face+'.png'))
+        after=[dict(entry) for entry in before]
+    for first,last in zip(before,after):
+        last.update(before_p95_deltaE76=first['after_p95_deltaE76'],before_mean_deltaE76=first['after_mean_deltaE76'])
+        if last['after_p95_deltaE76']>job['maximum_p95_deltaE76']:
+            raise ValueError('Final frame fails the current model seam colour check')
     for face in FRAMES:
         a,_=arrays[face]
         out=np.asarray(Image.open(output/(face+'.png')))
         if not np.array_equal(out[...,3],a[...,3]) or not np.array_equal(out[~masks[face]],a[~masks[face]]):
             raise ValueError('Frame finish changed geometry or nonmetal: '+face)
-    return dict(seams=report['seams'],reference_L=target,model_sha256=profile['model_sha256'],
+    return dict(seams=after,reference_L=target,model_sha256=profile['model_sha256'],
                 profile_sha256=w.sha(PROFILE))
 
+
+
+def _rim_ellipse(contour,w,h):
+    if len(contour)<10:
+        return None
+    (x,y),(dx,dy),_=cv2.fitEllipse(contour)
+    radius=(dx+dy)/4
+    if (.072*w<radius<.12*w and .89<dx/dy<1.12 and .10*w<x<.27*w and
+            .035*h<y<.24*h and .97<cv2.contourArea(contour)/(np.pi*radius**2)<1.03):
+        return np.array([x,y,radius])
+    return None
+
+
+def _photographed_lens_rings(roi,alpha,w,h):
+    # The dark glass merges with a dark camera platform. A complete bright
+    # annulus still has two independently closed, approximately concentric rims.
+    readings=[]
+    for threshold in range(35,116,5):
+        bright=(roi>threshold)&(alpha>=240)
+        contours,tree=cv2.findContours(bright.astype('uint8'),cv2.RETR_TREE,cv2.CHAIN_APPROX_NONE)
+        pair=[]
+        for idx,contour in enumerate(contours):
+            parent=tree[0,idx,3]
+            if parent<0:continue
+            inner=_rim_ellipse(contour,w,h)
+            if inner is None:continue
+            outer=_rim_ellipse(contours[parent],w,h)
+            if outer is None:continue
+            if (.055*inner[2]<outer[2]-inner[2]<.21*inner[2] and
+                    np.linalg.norm(inner[:2]-outer[:2])<.035*inner[2]):
+                pair.append(inner)
+        if len(pair)==2:
+            readings.append(sorted(pair,key=lambda v:v[1]))
+    if len(readings)<4:
+        raise ValueError('Both camera rings require closed inner and outer contours')
+    tracks=np.asarray(readings)
+    cluster=max((tracks[np.max(abs(tracks-r),axis=(1,2))<1.4*w/988] for r in tracks),key=len)
+    if len(cluster)<4:
+        raise ValueError('Camera ring boundaries disagree across brightness levels')
+    # Re-read the original subpixel transition in independent angular sectors.
+    angles=np.arange(240)*2*np.pi/240
+    step=.25
+    result=[]
+    for x,y,r in np.median(cluster,axis=0):
+        radii=np.arange(r-5,r+5+step,step)
+        xs=x+np.cos(angles)[:,None]*radii
+        ys=y+np.sin(angles)[:,None]*radii
+        signal=ndimage.map_coordinates(roi.astype(float),[ys,xs],order=1)
+        slope=np.gradient(ndimage.gaussian_filter1d(signal,2,axis=1),axis=1)
+        k=slope.argmax(axis=1)
+        good=(k>1)&(k<len(radii)-2)&(slope[np.arange(len(k)),k]>1.)
+        if min(np.mean(part) for part in np.array_split(good,8))<.65:
+            raise ValueError('Camera glass lacks an independent edge in every sector')
+        points=np.column_stack((xs[np.arange(len(k)),k],ys[np.arange(len(k)),k])).astype('float32')
+        fits=[]
+        for group in (np.arange(len(k))%2==0,np.arange(len(k))%2==1):
+            (cx,cy),(dx,dy),_=cv2.fitEllipse(points[good&group])
+            fits.append([cx,cy,(dx+dy)/4])
+        if np.max(np.ptp(fits,axis=0))>.65*w/988:
+            raise ValueError('Independent camera glass contours disagree')
+        result.append(np.mean(fits,axis=0))
+    return np.asarray(result)
 
 def lens_pair(a):
     h,width=a.shape[:2]
@@ -137,13 +259,14 @@ def lens_pair(a):
     # Select a consistent cluster, rejecting ring/step contours when a higher
     # threshold merges the lens glass with its surround.
     samples=np.array(readings)
-    if len(samples)<3:
-        raise ValueError('Two separate standard lenses lack source support')
     groups=[samples[(np.max(abs(samples-s),axis=(1,2))<=1.4*width/988)] for s in samples]
-    group=max(groups,key=len)
-    if len(group)<3:
-        raise ValueError('Standard lens centers/radii disagree across thresholds')
-    result=np.median(group,axis=0)
+    group=max(groups,key=len,default=[])
+    if len(group)>=3:
+        result=np.median(group,axis=0)
+    elif np.median(gray[h//2,width//3:width*2//3])<95:
+        result=_photographed_lens_rings(roi,a[:roi.shape[0],:roi.shape[1],3],width,h)
+    else:
+        raise ValueError('Two separate standard lenses lack source support')
     if abs(result[1,0]-result[0,0])>.15*result[0,2] or not 2.2<(result[1,1]-result[0,1])/result[:,2].mean()<2.8:
         raise ValueError('Standard vertical lens layout is unresolved')
     return result

@@ -69,6 +69,28 @@ def measure(image):
                     return measured
             except ValueError:
                 continue
+        # On dark metal the four sides of the USB rim are separable only
+        # within a narrow tonal interval. Independently match the rounded
+        # optical outline and require four consecutive complete hole groups.
+        from .bottom_rectify import port_rounded_rect, Rejected
+        gray=np.asarray(image.convert('L'))
+        h,w=gray.shape
+        if np.median(gray[int(.35*h):int(.65*h),int(.12*w):int(.18*w)])<140:
+            for start in range(40,111,5):
+                try:
+                    levels=tuple(range(start,start+16,5))
+                    m=_measure(image,levels,filter_print=True)
+                    single=[_measure(image,(t,),True) for t in levels]
+                    proposals=[s['port'] for s in single]
+                    if (any(s['screw'] is None for s in single)
+                            or np.ptp(proposals,axis=0).max()>2):
+                        continue
+                    port,spread,_,_=port_rounded_rect(gray,proposals,w/1000)
+                    if spread<=2 and abs(port[0]-m['port'][0])<=2:
+                        m['port']=port
+                        return m
+                except (ValueError,Rejected):
+                    continue
         raise original
 
 

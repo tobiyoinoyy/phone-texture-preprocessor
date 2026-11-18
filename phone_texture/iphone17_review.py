@@ -97,7 +97,7 @@ def continue_review(case, sku, review_dir=None):
                 selected[face] = review/'checks'/(face+'-antenna.png')
                 aligned.save(selected[face])
                 stages[face] = 'antenna'
-                buttons = iphone17_buttons.propose(files['back'], selected[face], face)
+                buttons = iphone17_buttons.propose(files['back'], selected[face], face, case/'work/geometry-records/report.json')
                 image, checks = iphone17_buttons.apply(aligned, buttons)
                 w.save(review/'checks'/(face+'-buttons.json'), checks)
                 selected[face] = review/'checks'/(face+'-buttons.png')

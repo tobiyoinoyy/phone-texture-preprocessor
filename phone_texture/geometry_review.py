@@ -200,7 +200,8 @@ def verify_report(report_path, records=None):
         if entry['face']=='top' and report.get('mode') in ('standardize','original_only_automatic'):
             geometry=entry.get('geometry',{})
             top=geometry.get('top_body_calibration') or geometry
-            if (top.get('method')!='top_body_exposed_corners_v1' or
+            if (top.get('method') not in ('top_body_exposed_corners_v1','top_body_corners_and_exposed_lower_v2',
+                                         'source_supported_local_frame_contacts') or
                     top.get('camera_policy')!='exclude_entire_camera_island_and_lenses' or
                     top.get('automatic_checks',{}).get('status')!='passed' or
                     top.get('transform_checks',{}).get('status')!='passed'):

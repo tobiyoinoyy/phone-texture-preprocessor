@@ -358,8 +358,19 @@ def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_suppo
     a=np.array(matte.convert('RGBA')); original=a.copy()
     raw=np.array(source_image.convert('RGB')) if source_image else None
     if face == 'top':
-        from .top_frame import calibrate_top, verify_top_mask
-        top,bottom,proof=calibrate_top(a,raw)
+        from .top_frame import TopCalibrationError, calibrate_top, verify_top_mask
+        try:
+            top,bottom,proof=calibrate_top(a,raw)
+        except TopCalibrationError as failure:
+            if not str(failure).startswith(('TOP_CORNER_AMBIGUOUS', 'TOP_BODY_RAILS_DISAGREE')):
+                raise
+            from .frame_contact import recover_frame
+            try:
+                recovered, proof = recover_frame(matte, source_image, face, stage_sink)
+                proof['original_failure'] = str(failure)
+                return recovered, proof
+            except ValueError as unsupported:
+                raise TopCalibrationError(f'{failure} (source contact check: {unsupported})') from unsupported
     else:
         top,bottom,proof=frame_rails(a,raw)
     x=np.arange(a.shape[1])[None,:]+.5; y=np.arange(a.shape[0])[:,None]

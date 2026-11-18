@@ -16,6 +16,15 @@ def paper(image, face):
     proposal, proof = seeded_paper(a, face, resolve_end=False)
     if proposal is None:
         raise ValueError('Standard iPhone 17 bottom label has no supported print seed')
+    try:
+        return _standard_paper_end(a, proposal, proof)
+    except ValueError:
+        from .iphone17_paper import measured_paper
+        return measured_paper(a, proof)
+
+
+def _standard_paper_end(a, proposal, proof):
+    h,w = a.shape[:2]
     gray = cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY).astype(float)
     # The standard label has a different print layout. Measure its physical
     # lower boundary, rather than predicting it from the Pro's red dot.
@@ -136,6 +145,23 @@ def glass_back_rim(image,sticker=None):
         values=gradient[indices]
         from scipy.signal import find_peaks
         peaks,_=find_peaks(values,height=max(.8,values.max()*.35))
+        if not len(peaks) and np.median(gray[h//2,w//3:w*2//3])<95:
+            # A specular outer lip can be the largest response at the first
+            # sample. Identify the inner transition adjoining flat dark glass
+            # in three disjoint spans along this same edge.
+            readings=[]
+            for section in np.array_split(ys if i<2 else xs,3):
+                local=np.median(gray[section],axis=0) if i<2 else np.median(gray[:,section],axis=1)
+                samples=local[indices]
+                response=np.gradient(ndimage.gaussian_filter1d(samples,.7))
+                features=find_peaks(response,height=1.5)[0]
+                stable=[k for k in features if k>=2 and k+7<len(samples)
+                        and abs(np.median(samples[k+4:k+8])-np.median(samples[-5:]))<=3
+                        and np.ptp(samples[k+4:k+8])<=3]
+                if len(stable)!=1:break
+                readings.append(stable[0])
+            if len(readings)==3 and np.ptp(readings)<=2:
+                peaks=np.array([int(np.median(readings))])
         if not len(peaks):raise ValueError('Glass-back metal boundary lacks source gradient')
         k=int(peaks[np.argmax(values[peaks])])
         width=float(offsets[k]+1)
@@ -187,6 +213,13 @@ def job(source,face,folder,structure):
                 if (.25*h<cy<.75*h and bh>h*.08 and bw>h*.08 and
                     area>25 and bw<w*.18 and .3< bw/max(1,bh)<5):
                     holes|=ndimage.binary_fill_holes(labels==i)
+            if face=='top' and holes.any():
+                # The standard top rail has no drilled apertures. Scattered
+                # dark wear without an opaque reference belongs to its metal.
+                try:
+                    reference_box(a, holes & remaining)
+                except ValueError:
+                    holes[:]=False
             if holes.any():
                 regions.append(('apertures',holes,[max(3,h*.05),max(3,w*.008)],False));remaining &= ~holes
             # A full-thickness antenna is a supported vertical stripe, not a

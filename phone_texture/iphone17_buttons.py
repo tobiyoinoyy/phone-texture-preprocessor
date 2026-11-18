@@ -17,7 +17,7 @@ def _edge_track(a,edge,level):
     return -(idx-1+(level-before)/np.maximum(.001,after-before))
 
 
-def _rear_buttons(image,side,rail_window=0):
+def _rear_buttons(image,side,rail_window=0, optical_tracks=None):
     """Locate independent protrusions; no side-photo positions used as targets.
 
     The contour shoulder is measured at 25% of the protrusion's fitted depth,
@@ -29,8 +29,9 @@ def _rear_buttons(image,side,rail_window=0):
     edge={'left':'right','right':'left'}[side];expected=3 if side=='left' else 1
     lo,hi=round(h*.146),round(h*.559);scale=w/988
     all_tracks=[];profiles=[]
-    for level in (.35,.5,.65):
-        track=ndimage.gaussian_filter1d(_edge_track(a,edge,level),1.)
+    for index,level in enumerate((.35,.5,.65)):
+        raw = _edge_track(a,edge,level) if optical_tracks is None else optical_tracks[index]
+        track=ndimage.gaussian_filter1d(raw,1.)
         ys=np.arange(lo,hi);coef=np.polyfit(ys,track[ys],2)
         for _ in range(15):
             delta=track[ys]-np.polyval(coef,ys)
@@ -115,10 +116,183 @@ def button_edges(image,boxes):
     return np.asarray(rows)
 
 
-def propose(back_path,side_path,side):
+def source_bound_buttons(back_path, back, side, geometry_report):
+    # Tight transparency trimming can leave an antialiased button touching
+    # the first column. Its outer interpolation sample belongs to the wider
+    # pre-crop photograph, not to that first pixel a second time.
+    column = 0 if side == 'right' else back.width-1
+    y0, y1 = round(.146*back.height)-5, round(.559*back.height)+5
+    border = np.asarray(back.getchannel('A'))[y0:y1,column]
+    if not np.any(border >= .35*255):
+        try:
+            return rear_buttons(back,side)
+        except ValueError:
+            if geometry_report is None:
+                raise
+    if geometry_report is None or not Path(geometry_report).is_file():
+        raise ValueError('Rear button reaches crop boundary; pre-crop evidence required')
+    from .workspace import read
+    back_digest = digest(back_path)
+    matches = [r for r in read(geometry_report).get('images', []) if r['face']=='back'
+               and r['output_sha256']==back_digest]
+    if len(matches)!=1:
+        raise ValueError('Missing source-bound rear geometry for button measurement')
+    record = matches[0]
+    captures = [a for a in record.get('geometry_evidence', [])
+                if Path(a['path']).name=='after-rotation-canvas.png']
+    if (len(captures)!=1 or not Path(captures[0]['path']).is_file() or
+            digest(captures[0]['path'])!=captures[0]['sha256']):
+        raise ValueError('Pre-crop rear evidence is missing or has changed')
+    geometry = record.get('geometry', {})
+    crop = geometry.get('canvas_trim_xyxy', [])
+    trim = geometry.get('visible_canvas_trim', {}).get('crop_xyxy', [])
+    if len(crop)!=4 or len(trim)!=4:
+        raise ValueError('Pre-crop rear geometry lacks its crop coordinates')
+    ox,oy = crop[:2]
+    left,top,right,bottom = trim
+    rect = (ox+left,oy+top,ox+right,oy+bottom)
+    with Image.open(captures[0]['path']) as canvas:
+        if (rect[0]<3 or rect[2]+3>canvas.width or rect[1]<0 or rect[3]>canvas.height or
+                not np.array_equal(np.asarray(canvas.crop(rect)),np.asarray(back))):
+            raise ValueError('Pre-crop rear pixels disagree with the selected button reference')
+        extended = canvas.crop((rect[0]-3,rect[1],rect[2]+3,rect[3]))
+    if np.any(np.asarray(extended.getchannel('A'))[y0:y1,0 if side=='right' else -1]>=.35*255):
+        raise ValueError('Button outline still extends beyond the observed rear edge')
+    try:
+        measured = rear_buttons(extended,side)
+    except ValueError:
+        return photographic_buttons(record, rect, captures[0], side)
+    # Retain previously stable subpixel anchors only after agreement with the
+    # actual neighbouring pixels; otherwise use the three measured isocontours.
+    try:
+        previous = rear_buttons(back,side)
+    except ValueError:
+        previous = None
+    if previous and np.max(abs(np.array(previous['rows'])-measured['rows']))<=.1:
+        result = previous
+    else:
+        result = measured
+    return dict(result, pre_crop_contour_rows=measured['rows'], pre_crop_sha256=captures[0]['sha256'])
+
+
+
+def photographic_buttons(record, rect, capture, side):
+    """Measure the outer shoulder directly against the photographed background."""
+    from PIL import ImageOps
+    source = Path(record['source'])
+    if digest(source) != record['source_sha256']:
+        raise ValueError('Rear photograph changed since geometry measurement')
+    with Image.open(source) as original:
+        photo = ImageOps.exif_transpose(original).convert('RGB')
+    angle = record['geometry']['rotation_ccw_degrees']
+    if abs(angle) >= 1e-5:
+        photo = photo.rotate(angle, Image.Resampling.BICUBIC, expand=True)
+    left, top, right, bottom = rect
+    extended = (left-14, top, right+14, bottom)
+    with Image.open(capture['path']) as canvas:
+        if photo.size != canvas.size or left < 14 or right+14 > canvas.width:
+            raise ValueError('Rear photograph lacks the required background margin')
+        matte = canvas.crop(extended)
+    edge = 'left' if side == 'right' else 'right'
+    rgba = np.asarray(matte)
+    rgb = np.asarray(photo.crop(extended))
+    if edge == 'right':
+        rgb = rgb[:,::-1]
+    h,w = rgba.shape[:2]
+    centers = np.clip(np.rint(-_edge_track(rgba,edge,.5)).astype(int),12,w-14)
+    offsets = np.arange(-12,14)
+    rows = np.arange(h)
+    values = rgb[rows[:,None],centers[:,None]+offsets].astype(float)
+    values = ndimage.gaussian_filter1d(values,1.5,axis=0)
+    exterior = np.median(values[:,:5],axis=1)
+    delta = abs(values-exterior[:,None,:])
+    results = []
+    for threshold in (8,12,18,24,30):
+        tracks = []
+        for channel in range(3):
+            field = delta[:,:,channel]
+            crossed = field > threshold
+            crossed[:,:5] = False
+            k = crossed.argmax(axis=1)
+            before = field[rows,np.maximum(0,k-1)]
+            after = field[rows,k]
+            fraction = np.clip((threshold-before)/np.maximum(.1,after-before),0,1)
+            track = -(centers+offsets[k]-1+fraction)
+            tracks.append(track)
+        try:
+            observed = _rear_buttons(matte,side,optical_tracks=tracks)
+        except ValueError:
+            results.append(None)
+            continue
+        # Every shoulder must have observed background and an actual first
+        # material crossing in all channels immediately on either side.
+        valid = (delta[:,5:].max(axis=1)>threshold).all(axis=1)
+        quiet = (delta[:,:5].max(axis=(1,2))<threshold)
+        if any(not (valid & quiet)[round(y)-4:round(y)+5].all()
+               for bounds in observed['rows'] for y in bounds):
+            results.append(None)
+            continue
+        results.append(observed)
+    stable = [(a,b) for a,b in zip(results,results[1:]) if a and b and
+              np.max(abs(np.array(a['rows'])-b['rows'])) <= 1.]
+    if not stable:
+        raise ValueError('Rear button shoulders lack repeatable photographic RGB edges')
+    members = [r for pair in stable for r in pair]
+    if np.max(np.ptp([r['rows'] for r in members],axis=0)) > 1.5:
+        raise ValueError('Competing photographic button shoulders')
+    measured = dict(members[0])
+    measured.pop('alpha_levels')
+    measured['rgb_channel_rows'] = measured.pop('independent_contour_rows')
+    measured.update(definition='25_percent_photographed_protrusion_above_bare_rail',
+                    photographic_threshold_rows={str(t):r['rows'] for t,r in
+                        zip((8,12,18,24,30),results) if r is not None},
+                    raw_photo_sha256=record['source_sha256'], pre_crop_sha256=capture['sha256'])
+    return measured
+
+
+
+def _button_face_plane(image,boxes,sources,targets):
+    """Recover the shared scale from the button faces inside their dark grooves."""
+    h=image.height
+    gray=np.asarray(image.convert('RGB'),dtype=float).mean(axis=2)
+    gradient=np.gradient(ndimage.gaussian_filter1d(gray,.75,axis=0),axis=0)
+    inner=[]
+    for (x0,_,x1,_),bounds in zip(boxes,sources):
+        center=(x0+x1)/2
+        band=max(1,round((x1-x0)*.05))
+        pairs=[]
+        for offset in (-band,0,band):
+            col=round(center)+offset
+            signal=np.median(gradient[:,col-1:col+2],axis=1)
+            rows=[]
+            for outer,sign in zip(bounds,(1,-1)):
+                search=np.rint(outer+sign*np.arange(1,max(7,round((x1-x0)*.27)))).astype(int)
+                k=np.argmax(sign*signal[search])
+                if k==0 or k==len(search)-1 or sign*signal[search[k]]<5:
+                    raise ValueError('Button face lacks a second distinct cap edge')
+                rows.append(gradient_peak(signal,search[k],sign,3))
+            pairs.append(rows)
+        if np.max(np.ptp(pairs,axis=0))>2.5:
+            raise ValueError('Button face contours disagree across the cap')
+        inner.append(np.median(pairs,axis=0))
+    inner=np.asarray(inner)
+    residuals=[]
+    for held in range(3):
+        train=np.arange(3)!=held
+        coeff=np.polyfit(inner[train].ravel(),targets[train].ravel(),1)
+        residuals.extend(np.polyval(coeff,inner[held])-targets[held])
+    if np.max(abs(np.asarray(residuals)))>h*.003:
+        raise ValueError('Held-out button face rejects common rail scale')
+    q=np.r_[np.polyfit(inner.ravel()/h,targets.ravel()/h,1),0.]
+    fitted=np.polyval(q[:2],inner.ravel()/h)*h
+    if np.max(abs(fitted-targets.ravel()))>h*.003 or not .75<q[0]<1.25:
+        raise ValueError('Button face scale disagrees with the rear shoulders')
+    return q,fitted,dict(inner_rows=inner.tolist(),held_out_error_px=residuals)
+
+def propose(back_path,side_path,side,geometry_report=None):
     back=Image.open(back_path);im=Image.open(side_path);h,w=im.height,im.width
     boxes=hardware(im,side);count=3 if side=='left' else 1
-    refs=rear_buttons(back,side);targets=(np.asarray(refs['rows'])+.5)/back.height*h-.5
+    refs=source_bound_buttons(back_path,back,side,geometry_report);targets=(np.asarray(refs['rows'])+.5)/back.height*h-.5
     sources=button_edges(im,boxes[:count])
     if np.max(abs(targets-sources))>h*.06:raise ValueError('Button correction exceeds independently supported correspondence')
     ratios=np.diff(targets,axis=1)/np.diff(sources,axis=1)
@@ -144,9 +318,14 @@ def propose(back_path,side_path,side):
         q=np.r_[np.polyfit(sn,tn,1),0.]
         mode='affine_projective_limit_two_reliable_endpoints'
     fitted=(q[0]*sn+q[1])/(q[2]*sn+1)*h
+    cap_proof={}
     if np.max(abs(fitted-targets.ravel()))>h*.003 or abs(q[2])>.5:
-        raise ValueError('Button references do not support a stable shared perspective model')
-    return dict(side=side,perspective_coefficients=q.tolist(),mapping_mode=mode,
+        if count!=3:
+            raise ValueError('Button references do not support a stable shared perspective model')
+        q,fitted,evidence=_button_face_plane(im,boxes[:count],sources,targets)
+        cap_proof['face_plane']=evidence
+        mode='shared_affine_from_three_independently_measured_button_faces'
+    return dict(**cap_proof,side=side,perspective_coefficients=q.tolist(),mapping_mode=mode,
                 shared_projective_residual_px=(fitted-targets.ravel()).tolist(),back_sha256=digest(back_path),source_sha256=digest(side_path),back_size=list(back.size),
                 rear_detection=refs,source_boxes=boxes,source_rows=sources.tolist(),target_rows=targets.tolist(),
                 source_anchors=src,target_anchors=dst,allowed_rows=[int(np.floor(boundaries[0])),int(np.ceil(boundaries[-1]))+1],
@@ -189,7 +368,12 @@ def apply(image,cfg):
         if attempt==4:raise ValueError('Final perspective button contour fails rear endpoints/length')
         correction+=(measured-targets).ravel()
         if np.max(abs(correction))>3:raise ValueError('Button interpolation correction exceeds 3 source pixels')
-    if not np.array_equal(a[...,3],b[...,3]):raise ValueError('Button correction changed the body alpha contour')
+    if not np.array_equal(a[...,3],b[...,3]):
+        out = _retain_interior_coverage(a, b, xx, yy, sx, sy)
+        b = np.asarray(out)
+        # Do not carry a pre-correction hardware measurement to the output.
+        # The final hardware and endpoint checks below read this exact RGBA.
+
     if not np.array_equal(a[:lo],b[:lo]) or not np.array_equal(a[hi:],b[hi:]):raise ValueError('Button warp changed a locked region')
     for box in cfg['locked_hardware_boxes']:
         x0,y0,x1,y1=box
@@ -205,9 +389,29 @@ def apply(image,cfg):
                    center_error_rear_px=centers.tolist(),length_error_rear_px=lengths.tolist(),
                    unchanged_rows=[[0,lo],[hi,h]],locked_hardware_unchanged=True,opaque_body_lost=0,
                    model_uv_verified=False,render_iterations=attempt+1,sampling_correction=correction.tolist(),alpha_changed=0,
+                   **({'face_plane':cfg['face_plane']} if 'face_plane' in cfg else {}),
                    mapping_mode=cfg['mapping_mode'],perspective_coefficients=q.tolist(),
                    shared_projective_residual_px=cfg['shared_projective_residual_px'],
                    source_jacobian_range=[float(derivative.min()),float(derivative.max())])
+
+
+def _retain_interior_coverage(source, rendered, xx, yy, sx, sy):
+    # Some segmentation mattes vary between 250 and 255 in the solid body.
+    # Button alignment moves colour over the intact metal; coverage belongs
+    # to the original canvas. Require an opaque margin around every source
+    # interpolation footprint and every moved destination before fixing alpha.
+    moved = (abs(sx-xx)>1e-8) | (abs(sy-yy)>1e-8)
+    core = ndimage.binary_erosion(source[...,3]>=250,iterations=3)
+    if not core[moved].all():
+        raise ValueError('Button correction changed the body alpha contour')
+    x,y = sx[moved],sy[moved]
+    for ix in (np.floor(x).astype(int), np.ceil(x).astype(int)):
+        for iy in (np.floor(y).astype(int), np.ceil(y).astype(int)):
+            if not core[iy,ix].all():
+                raise ValueError('Button correction would sample the body alpha contour')
+    result = rendered.copy()
+    result[...,3] = source[...,3]
+    return Image.fromarray(result)
 
 
 def _sample_xy(image,x,y):
@@ -237,7 +441,12 @@ def validate(check):
         raise ValueError('Button endpoint/length check failed')
     if check.get('alpha_changed')!=0 or check.get('locked_hardware_unchanged') is not True:
         raise ValueError('Button correction changed locked geometry or hardware')
-    if check.get('mapping_mode') not in ('shared_projective_with_small_smooth_landmark_residual','affine_projective_limit_two_reliable_endpoints'):
+    if check.get('mapping_mode')=='shared_affine_from_three_independently_measured_button_faces':
+        evidence=check.get('face_plane',{})
+        if (count!=3 or np.shape(evidence.get('inner_rows'))!=(3,2)
+                or np.shape(evidence.get('held_out_error_px'))!=(6,)):
+            raise ValueError('Missing independent three-button face measurements')
+    elif check.get('mapping_mode') not in ('shared_projective_with_small_smooth_landmark_residual','affine_projective_limit_two_reliable_endpoints'):
         raise ValueError('A source-supported perspective/scaling model is required')
 
 
