@@ -31,6 +31,25 @@ def reference_contract(reference, geometry):
         return dict(base, mode='existing_canvas_reference_review', original_unknown_preserved=False)
     require(status == 'source_tail_applicability_unknown' and applicability.get('applicable') is None,
             'Other reference state cannot enter this review branch')
+    if (applicability.get('reason') == 'No supported original source RGB/alpha rail pair'
+            and geometry.get('method') == 'local_stand_removal_from_exposed_plate_edges_v1'):
+        axis = geometry.get('axis_evidence', {})
+        trim = geometry.get('visible_canvas_trim', {})
+        span = geometry.get('body_x')
+        require(isinstance(span, (list, tuple)) and len(span) == 2 and
+                all(isinstance(x, (int, float)) and math.isfinite(x) for x in span) and 0 <= span[0] < span[1],
+                'Exposed plate requires a measured body interval')
+        width = span[1] - span[0]
+        require(axis.get('method') == 'independent_long_side_axis_v1'
+                and {side.get('side') for side in axis.get('sides', [])} == {'left', 'right'}
+                and geometry.get('rgb_painted') is False and width > 0
+                and geometry.get('exposed_samples', 0) >= .2 * width
+                and 0 <= geometry.get('lower_edge_residual_p95_px', math.inf) <= 3
+                and trim.get('retained_rgba_unchanged') is True
+                and trim.get('body_pixels_lost') == 0,
+                'Exposed lower edge and both side axes are required for canvas review')
+        return dict(base, mode='existing_canvas_exposed_plate_review',
+                    original_unknown_preserved=True, independent_bottom_rails_certified=False)
     require(applicability.get('reason') == 'Exposed two-flank rail evidence required; unsupported geometry branch',
             'Unknown reference has an unsupported reason')
     require(geometry.get('method') == 'source_exposed_plate_rgb_alpha_consensus_v1' and geometry.get('clear_bands') is None,

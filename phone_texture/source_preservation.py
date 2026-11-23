@@ -148,6 +148,7 @@ def preserve(case,sku,geometry,geometry_files,checks,model,error,original_traceb
         additional_optional_failures=additional_errors,lighting_checks=light_checks,frame_uv_seam_checks=seams,
         rejected_partial_effects=reverted,proposed_partial_effect_seam_observations=proposed_seams,
         back_standard_canvas=back_canvas_proof,
+        back_ready_for_backfill=bool(back_canvas_proof and back_canvas_proof.get('back_ready_for_backfill')),
         final_sha256={f:digest(p) for f,p in final[sku].items()},source_hashes_unchanged=True)
     write(case/'work/source-preservation-report.json',record)
     pipeline.overview({sku:geometry_files},final,case/'overview.png',faces=pipeline.FACES)

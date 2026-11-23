@@ -59,3 +59,24 @@ def test_seam_measurement_uses_current_positions_and_rejects_unobserved_metal(tm
     masks['left'][25:32,:]=False
     with pytest.raises(ValueError,match='jointly editable'):
         _current_seam_readings(files,[boundary(29)],masks,2)
+
+
+def test_review_with_four_matching_edges_preserves_bytes_and_binds_export(tmp_path):
+    from phone_texture.iphone17_model_finish import FRAMES, finish_frames, verified_frame_finish
+    files = {}
+    for face in FRAMES:
+        size = (540, 60) if face in ('top', 'bottom') else (60, 1000)
+        path = tmp_path / (face + '.png')
+        Image.new('RGBA', size, (150, 157, 164, 255)).save(path)
+        files[face] = path
+        folder = tmp_path / 'material-inputs' / face
+        folder.mkdir(parents=True)
+        Image.new('L', size, 255).save(folder / 'main_surface.png')
+    output = tmp_path / 'finished'
+    proof = finish_frames(files, tmp_path, output, tmp_path / 'records', review_alignment={})
+    hashes = {f: w.sha(output / (f+'.png')) for f in FRAMES}
+    assert proof['already_matched'] and hashes == {f: w.sha(files[f]) for f in FRAMES}
+    assert verified_frame_finish(proof, hashes)
+    assert not verified_frame_finish(proof, dict(hashes, left='other'))
+    assert not verified_frame_finish(dict(proof, seams=proof['seams'][:3]), hashes)
+    assert not verified_frame_finish(dict(proof, model_sha256='other'), hashes)

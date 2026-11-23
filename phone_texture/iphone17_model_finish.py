@@ -22,20 +22,26 @@ def ease(value):
     return t*t*(3-2*t)
 
 
-def aligned_metal(work, face, size):
+def aligned_metal(work, face, size, *, review_alignment=None):
     material = work/'material-inputs'/face
     mask = np.asarray(Image.open(material/'main_surface.png').convert('L'))
     if mask.shape != size[::-1]:
         raise ValueError('Metal mask dimensions differ from the aligned frame')
+    if review_alignment is not None and face not in review_alignment:
+        return mask >= 254
     if face == 'bottom':
-        mx = np.load(work/'bottom-source-x.npy', allow_pickle=False)
+        mx = (np.load(work/'bottom-source-x.npy', allow_pickle=False) if review_alignment is None
+              else review_alignment[face])
         if mx.shape != (size[0],):
             raise ValueError('Missing aligned bottom mask mapping')
         mask = ndimage.map_coordinates(mask.astype(float),
             np.broadcast_arrays(np.arange(size[1])[:,None], mx[None,:]),order=1)
     elif face in ('left','right'):
-        spec = w.read(work/'structure-proposal.json')[face]
-        checks = w.read(work/'structure-checks.json')[face]
+        if review_alignment is None:
+            spec = w.read(work/'structure-proposal.json')[face]
+            checks = w.read(work/'structure-checks.json')[face]
+        else:
+            spec, checks = review_alignment[face]
         source, target = np.array(spec['source']), np.array(spec['target'])
         source[[1,2,5,6]] += np.array(checks['sampling_correction'])[[1,2,5,6]]
         rows = np.arange(size[1])
@@ -74,7 +80,7 @@ def _current_seam_readings(files, chains, masks, sigma):
             after_p95_deltaE76=float(np.quantile(delta,.95)),after_mean_deltaE76=float(delta.mean())))
     return readings
 
-def finish_frames(files, work, output, records):
+def finish_frames(files, work, output, records, *, review_alignment=None):
     # Use the same source-bound domains and registration as the approved images.
     # Only terminal metal participates. Buttons, paper, holes and antennas are
     # separated from the blend even where they approach an end.
@@ -87,7 +93,7 @@ def finish_frames(files, work, output, records):
     for face in FRAMES:
         a = np.asarray(Image.open(files[face]).convert('RGBA'))
         h,width = a.shape[:2]
-        mask = aligned_metal(work,face,(width,h)) & (a[...,3]>0)
+        mask = aligned_metal(work,face,(width,h),review_alignment=review_alignment) & (a[...,3]>0)
         y,x = np.ogrid[:h,:width]
         along,across,length,thickness = (x,y,width,h) if width>h else (y,x,h,width)
         distance = np.minimum(along,length-1-along)/thickness
@@ -100,7 +106,20 @@ def finish_frames(files, work, output, records):
                 raise ValueError('Insufficient plain metal beside frame end: '+face)
             references.append(float(np.median(values)))
         arrays[face],masks[face],coords[face] = (a,lab),mask,distance
+    source_hashes = {f: w.sha(files[f]) for f in FRAMES}
+    current_chains=resized_chains(profile,files)
+    input_readings=_current_seam_readings(files,current_chains,masks,2) if review_alignment is not None else None
     target=float(np.median(references))
+    if review_alignment is not None and all(r['after_p95_deltaE76']<=2 for r in input_readings):
+        output.mkdir(parents=True)
+        for face in FRAMES:
+            shutil.copy2(files[face],output/(face+'.png'))
+            Image.fromarray(masks[face].astype('uint8')*255).save(records/(face+'-metal.png'))
+        saved_hashes = {f: w.sha(output/(f+'.png')) for f in FRAMES}
+        if source_hashes != saved_hashes:
+            raise ValueError('Frame copy differs from the measured source')
+        return dict(input_sha256=source_hashes, output_sha256=saved_hashes, seams=input_readings,input_seams=input_readings,already_matched=True,
+                    model_sha256=profile['model_sha256'],profile_sha256=w.sha(PROFILE))
     for face in FRAMES:
         a,lab = arrays[face]
         mask,distance = masks[face],coords[face]
@@ -136,16 +155,20 @@ def finish_frames(files, work, output, records):
              maximum_correction_step_deltaE76=3.,continuity_retry_sigmas=[2,4],
              continuity_warning_limit_deltaE76=8.)
     w.save(records/'job.json',job)
+    effect_warnings = []
     # Preserve the reviewed frame lighting wherever it already matches the
     # current mesh. The previous seam layout supplies a starting image only.
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            match_uv_seams.run(records/'job.json')
+            baseline_checks = match_uv_seams.run(records/'job.json')
+        resolution = baseline_checks.get('continuity_resolution')
+        if resolution and 'warning_limit' in resolution:
+            effect_warnings.append(dict(resolution, stage='baseline'))
         starting={face:records/'baseline-frames'/(face+'.png') for face in FRAMES}
     except ValueError as exc:
         w.save(records/'baseline-warning.json',dict(reason=str(exc)))
         starting={face:Path(views[face]['source']) for face in FRAMES}
-    chains=resized_chains(profile,files)
+    chains=current_chains
     before=_current_seam_readings(starting,chains,masks,job['sigma'])
     needed=[chain for chain,check in zip(chains,before) if check['after_p95_deltaE76']>job['maximum_p95_deltaE76']]
     if needed:
@@ -155,7 +178,10 @@ def finish_frames(files, work, output, records):
                      output_dir=str(output),records_dir=str(records/'current-engine'))
         w.save(records/'current-job.json',current)
         with contextlib.redirect_stdout(io.StringIO()):
-            match_uv_seams.run(records/'current-job.json')
+            current_checks = match_uv_seams.run(records/'current-job.json')
+        resolution = current_checks.get('continuity_resolution')
+        if resolution and 'warning_limit' in resolution:
+            effect_warnings.append(dict(resolution, stage='current'))
         after=_current_seam_readings({f:output/(f+'.png') for f in FRAMES},chains,masks,job['sigma'])
     else:
         output.mkdir(parents=True,exist_ok=True)
@@ -171,8 +197,32 @@ def finish_frames(files, work, output, records):
         out=np.asarray(Image.open(output/(face+'.png')))
         if not np.array_equal(out[...,3],a[...,3]) or not np.array_equal(out[~masks[face]],a[~masks[face]]):
             raise ValueError('Frame finish changed geometry or nonmetal: '+face)
-    return dict(seams=after,reference_L=target,model_sha256=profile['model_sha256'],
-                profile_sha256=w.sha(PROFILE))
+    result = dict(seams=after, reference_L=target, model_sha256=profile['model_sha256'],
+                  profile_sha256=w.sha(PROFILE), input_sha256=source_hashes,
+                  output_sha256={f: w.sha(output/(f+'.png')) for f in FRAMES})
+    if effect_warnings:
+        result['continuity_warnings'] = effect_warnings
+    if input_readings is not None:
+        result['input_seams'] = input_readings
+    return result
+
+
+def verified_frame_finish(report, hashes):
+    if not report or not set(FRAMES).issubset(hashes):
+        return False
+    profile = w.read(PROFILE)
+    if (report.get('model_sha256') != profile['model_sha256']
+            or report.get('profile_sha256') != w.sha(PROFILE)
+            or report.get('output_sha256') != {f: hashes.get(f) for f in FRAMES}):
+        return False
+    checks = report.get('seams', [])
+    expected = {frozenset(chain['names']) for chain in profile['chains']}
+    return (len(checks) == len(expected)
+            and {frozenset(c.get('pair', ())) for c in checks} == expected
+            and all(0 <= c.get('after_p95_deltaE76', float('inf')) <= 2.
+                    and .98 <= c.get('joint_coverage', 0) <= 1
+                    and c.get('total_samples') == 192
+                    and 189 <= c.get('metric_samples', 0) <= 192 for c in checks))
 
 
 
@@ -263,26 +313,27 @@ def lens_pair(a):
     group=max(groups,key=len,default=[])
     if len(group)>=3:
         result=np.median(group,axis=0)
-    elif np.median(gray[h//2,width//3:width*2//3])<95:
-        result=_photographed_lens_rings(roi,a[:roi.shape[0],:roi.shape[1],3],width,h)
     else:
-        raise ValueError('Two separate standard lenses lack source support')
+        try:
+            result=_photographed_lens_rings(roi,a[:roi.shape[0],:roi.shape[1],3],width,h)
+        except ValueError as exc:
+            raise ValueError('Two separate standard lenses lack source support: '+str(exc)) from exc
     if abs(result[1,0]-result[0,0])>.15*result[0,2] or not 2.2<(result[1,1]-result[0,1])/result[:,2].mean()<2.8:
         raise ValueError('Standard vertical lens layout is unresolved')
     return result
 
 
-def register_camera(image):
+def register_camera(image, *, center_tolerance=.65, measure=lens_pair):
     profile=w.read(PROFILE)['camera']
     a=np.asarray(image.convert('RGBA'));h,width=a.shape[:2]
     scale=np.array([width,h])/profile['reference_size']
     target=(np.array(profile['centers_px'])+.5)*scale-.5
-    measured=lens_pair(a)
+    measured=measure(a)
     radius=np.asarray(profile['radii_px'])*scale[0]
     shift=measured[:,:2]-target
     if np.max(np.linalg.norm(shift,axis=1)/radius)>.23 or np.max(abs(measured[:,2]/radius-1))>.06:
         raise ValueError('Lens correction exceeds supported local registration')
-    if (np.max(np.linalg.norm(shift,axis=1))/np.mean(scale)<=.65
+    if (np.max(np.linalg.norm(shift,axis=1))/np.mean(scale)<=center_tolerance
             and np.max(abs(measured[:,2]-radius))/scale[0]<=.9):
         return image.copy(),dict(before=measured.tolist(),after=measured.tolist(),
             target=target.tolist(),model_reference_error_px=(np.linalg.norm(shift,axis=1)/np.mean(scale)).tolist(),
@@ -299,12 +350,26 @@ def register_camera(image):
     cy=np.clip(y,target[0,1],target[1,1])
     cx=np.interp(cy,target[:,1],target[:,0])
     dist=np.hypot(x-cx,y-cy)
-    weight=ease((1.74-dist/radius.mean())/.47)
     body=ndimage.distance_transform_edt(np.pad(a[...,3]>=250,1))[1:-1,1:-1]
-    weight*=ease((body[:y.shape[0],:y.shape[1]]-18*scale[0])/(52*scale[0]))
-    mx=(x+dx*weight).astype('float32');my=(y+dy*weight).astype('float32')
-    jac=np.gradient(mx,axis=1)*np.gradient(my,axis=0)-np.gradient(mx,axis=0)*np.gradient(my,axis=1)
-    if jac.min()<.50 or jac.max()>1.55:
+    contour_weight=ease((body[:y.shape[0],:y.shape[1]]-18*scale[0])/(52*scale[0]))
+    # Keep the same outer footprint. If the original transition compresses
+    # glass too much, begin its taper closer to the ring on the same photo.
+    radial=dist/radius.mean()
+    widths=[.47]
+    inner=max(1.17,1.15*max(radius)/radius.mean())
+    if inner < 1.27:
+        widths.append(1.74-inner)
+    if center_tolerance < .65 and 1.13 * radius.mean() >= 1.10 * max(radius):
+        # Keep a ten-percent margin beyond both glass disks and taper within
+        # the same footprint. The original Jacobian and contour limits apply.
+        widths.append(.61)
+    for width_ratio in widths:
+        weight=ease((1.74-radial)/width_ratio)*contour_weight
+        mx=(x+dx*weight).astype('float32');my=(y+dy*weight).astype('float32')
+        jac=np.gradient(mx,axis=1)*np.gradient(my,axis=0)-np.gradient(mx,axis=0)*np.gradient(my,axis=1)
+        if jac.min()>=.50 and jac.max()<=1.55:
+            break
+    else:
         raise ValueError('Camera warp would distort the glass transition')
     changed=weight>0
     sample=cv2.remap(a,mx,my,cv2.INTER_CUBIC)
@@ -312,9 +377,9 @@ def register_camera(image):
         raise ValueError('Camera correction would touch transparent body contour')
     out=a.copy()
     out[:y.shape[0],:y.shape[1]][changed]=sample[changed]
-    actual=lens_pair(out)
+    actual=measure(out)
     residual=np.linalg.norm(actual[:,:2]-target,axis=1)/np.mean(scale)
-    if residual.max()>.65 or np.max(abs(actual[:,2]-radius))/scale[0]>.9:
+    if residual.max()>center_tolerance or np.max(abs(actual[:,2]-radius))/scale[0]>.9:
         raise ValueError('Rendered standard lenses fail model UV reference check')
     return Image.fromarray(out),dict(before=measured.tolist(),target=target.tolist(),
                   after=actual.tolist(),model_reference_error_px=residual.tolist(),

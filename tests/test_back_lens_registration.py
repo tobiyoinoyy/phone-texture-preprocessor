@@ -48,3 +48,25 @@ def test_missing_lenses_keep_the_image():
     a = synthetic_back('iphone17pro'); a[..., :3] = (90, 100, 180)
     out, proof = bl.register(a, 'iphone17pro')
     assert proof['reason'] == 'lenses_not_measured' and out is a
+
+
+@pytest.mark.parametrize('model', ['iphone17pro', 'iphone17promax'])
+def test_delivered_model_specific_back_has_a_level_rail_and_three_aligned_disks(tmp_path, model):
+    from phone_texture.back_canvas import standardize
+    from phone_texture.back_inspection import inspect_back
+    source = synthetic_back(model, shift=(-2., 3.))
+    h, width = source.shape[:2]
+    y, x = np.ogrid[:h, :width]
+    source[..., 3] = np.where(y >= 2 + np.rint(5*x/width), 255, 0)
+    raw = tmp_path/'source.png'
+    result = tmp_path/'back.png'
+    Image.fromarray(source).save(raw)
+    report = standardize(raw, result, model)
+    check = inspect_back(result, model)
+    assert report['back_ready_for_backfill'] and check['verified']
+    assert len(check['distances_px']) == 3 and max(check['distances_px']) <= .30
+    assert abs(report['top_rail']['before']['left_minus_right_px']) > 2
+    assert abs(check['rail']['left_minus_right_px']) <= .5
+    fx, fy = np.rint(np.array(bl.STANDARD[model]['flash'])*[width,h]).astype(int)
+    actual = np.asarray(Image.open(result))
+    np.testing.assert_array_equal(actual[fy-45:fy+45,fx-45:fx+45], source[fy-45:fy+45,fx-45:fx+45])

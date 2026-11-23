@@ -135,3 +135,33 @@ def test_correction_gate_rejects_a_block_before_writing_images(seam_engine, monk
     assert not output.exists()
     for path,content in originals.items():
         assert path.read_bytes()==content
+
+
+@pytest.mark.parametrize('model', MODELS)
+def test_viewer_and_original_seam_profiles_are_bound_to_their_mesh(model):
+    current, current_path = profile(model)
+    original_path = current_path.with_name(model + '.json')
+    original = json.loads(original_path.read_text())
+    assert current['model_sha256'] != original['model_sha256']
+    assert profile(model, original['model_sha256'])[1] == original_path
+    assert profile(model, current['model_sha256'])[1] == current_path
+    with pytest.raises(ValueError, match='所选模型'):
+        profile(model, '0'*64)
+
+
+def test_partial_terminal_mask_requires_both_current_source_and_unchanged_mask(tmp_path):
+    import hashlib
+    from phone_texture.frame_seams import terminal_metal
+    assets = tmp_path/'material-inputs'/'right'
+    assets.mkdir(parents=True)
+    mask = assets/'seam-terminal-metal.png'
+    Image.new('L', (10, 40)).save(mask)
+    proof = dict(face='right', scope='only_outside_both_source_antennas',
+                 source_sha256='this-photo', mask_sha256=hashlib.sha256(mask.read_bytes()).hexdigest())
+    mask.with_suffix('.json').write_text(json.dumps(proof))
+    assert terminal_metal(tmp_path, 'right', 'this-photo') == mask
+    with pytest.raises(ValueError, match='differs'):
+        terminal_metal(tmp_path, 'right', 'another-photo')
+    Image.new('L', (10, 40), 255).save(mask)
+    with pytest.raises(ValueError, match='differs'):
+        terminal_metal(tmp_path, 'right', 'this-photo')

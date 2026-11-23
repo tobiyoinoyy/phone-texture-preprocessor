@@ -284,3 +284,24 @@ def test_rear_can_reject_bad_side_width_only_with_independent_consensus():
     assert proof['width_prior_rejected']==5 and proof['agreeing_columns']>=3
     a[400:,:,:3]=170
     with pytest.raises(ValueError):rear_reference(Image.fromarray(a),'left',399,5.)
+
+
+def test_front_axis_uses_straight_sections_around_protruding_keys():
+    from phone_texture.auto_geometry import plate_axis
+
+    rgb=np.full((700,200,3),220,np.uint8)
+    alpha=np.zeros((700,200),np.uint8)
+    rgb[10:690,45:155]=45
+    alpha[10:690,45:155]=255
+    for lo,hi in ((200,266),(329,409),(476,555)):
+        rgb[lo:hi,35:45]=200
+        alpha[lo:hi,35:45]=255
+    rgba=np.dstack([rgb,alpha])
+    rows=np.arange(10,690)
+    with pytest.raises(ValueError):
+        plate_axis(rgba,rgb,rows)
+    slope,proof=plate_axis(rgba,rgb,rows,exclude_front_controls=True)
+    assert abs(slope)<.002
+    sections=proof['sides'][0]['straight_sections_excluding_controls']
+    for lo,hi in sections:
+        assert not np.any(alpha[lo:hi+1,35])

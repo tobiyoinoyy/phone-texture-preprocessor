@@ -1,6 +1,7 @@
 """Create a movable evidence package from verified current-job selections."""
 import copy
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import zipfile
 
 import numpy as np
@@ -25,7 +26,21 @@ def create(row, case, manifest, geometry_files, options):
         if (w.sha(source) != info['source_sha256'] or w.sha(target) != row['final_sha256'][face]
                 or info['selected_sha256'] != row['final_sha256'][face]):
             raise RuntimeError('Portable candidate current source/selection changed: '+face)
-        with Image.open(source) as a, Image.open(target) as b:
+        selected = target
+        canvas = row.get('back_standard_canvas') if face == 'back' else None
+        if canvas:
+            from .back_canvas import standardize
+            selected = Path(info['selected_stage_file']).resolve(strict=True)
+            if not selected.is_relative_to(case/'work') or w.sha(selected) != canvas.get('source_sha256'):
+                raise RuntimeError('Portable back canvas input changed')
+            with TemporaryDirectory() as folder:
+                replay = Path(folder)/'back.png'
+                measured = standardize(selected, replay, options['model'])
+                metadata_matches = all(measured[key] == canvas.get(key) for key in
+                                       ('model', 'method', 'source_size', 'output_size'))
+                if not metadata_matches or w.sha(replay) != w.sha(target):
+                    raise RuntimeError('Portable back differs from the verified model canvas')
+        with Image.open(source) as a, Image.open(selected) as b:
             if a.format != 'PNG' or b.format != 'PNG' or a.mode != 'RGBA' or b.mode != 'RGBA':
                 raise RuntimeError('Portable candidate source/output is not RGBA PNG')
             before, after = np.asarray(a), np.asarray(b)
@@ -33,19 +48,22 @@ def create(row, case, manifest, geometry_files, options):
                 raise RuntimeError('Portable candidate changed source geometry: '+face)
         checks = dict(source_identity_verified=True, pixel_integrity_verified=True,
             output_selection_verified=True, hard_failures=[],
-            alpha_changed_pixels=0, source_and_output_size_equal=True,
+            alpha_changed_pixels=0, source_and_output_size_equal=not canvas or canvas['source_size'] == canvas['output_size'],
             source_geometry_byte_identical=w.sha(source) == w.sha(target),
             final_canvas_checks=copy.deepcopy(row['final_canvas_checks'][face]))
+        if canvas:
+            checks.update(alpha_check_scope='before_verified_model_canvas',
+                verified_canvas_input_sha256=w.sha(selected), verified_canvas_output_sha256=w.sha(target))
         if info['selected_stage'] == 'structure_review':
             checks['lighting'] = copy.deepcopy(row['lighting_review_checks'][face])
             checks['structure'] = copy.deepcopy(row['structure_review_checks'][face])
         elif info['selected_stage'] == 'lighting':
             original = row['lighting_checks'][face]
-            if (original['source_sha256'] != w.sha(source) or original['output_sha256'] != w.sha(target)
+            if (original['source_sha256'] != w.sha(source) or original['output_sha256'] != w.sha(selected)
                     or any(original[name] != 0 for name in ('alpha_changed', 'paper_changed', 'outside_material_changed'))):
                 raise RuntimeError('Portable normal-lighting checks differ: '+face)
             checks['current_lighting_checks'] = copy.deepcopy(original)
-        elif w.sha(source) != w.sha(target):
+        elif w.sha(source) != w.sha(selected):
             raise RuntimeError('Portable face lacks a verified selected stage: '+face)
         faces[face] = dict(source_sha256=w.sha(source), output_sha256=w.sha(target), checks=checks)
     # Current case files are a closed evidence inventory. Original source paths

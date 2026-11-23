@@ -68,3 +68,18 @@ def test_central_projection_is_not_cut_as_a_camera():
     rgb[150:180, 360:520] = 70
     with pytest.raises(ValueError, match="Central upper projection"):
         recover_frame(Image.fromarray(a), Image.fromarray(rgb), "bottom")
+
+
+def test_top_rail_ignores_stand_touching_sensor_and_requires_bilateral_rgb():
+    from phone_texture.frame_contact import _exposed_top_rail
+    x = np.arange(600)
+    edge = np.full(600, 92)
+    edge[55:400] = 180
+    gradient = np.zeros((180, 600))
+    gradient[92] = 8
+    line, ends = _exposed_top_rail(x, edge, [edge, edge], gradient)
+    np.testing.assert_allclose(np.polyval(line, [1, 598]), 92)
+    assert len(ends) == 2 and all(w['source_rgb_fraction'] == 1 for w in ends)
+    gradient[:, 450:] = 0
+    with pytest.raises(ValueError, match='RGB'):
+        _exposed_top_rail(x, edge, [edge, edge], gradient)

@@ -483,7 +483,36 @@ def stop_group(proc):
     proc.wait(timeout=5)
 
 
-def scan_folder(value, model=None):
+def sheet_column_directions(images, hashes):
+    """Use an explicit six-cell download receipt only for unresolved photo directions."""
+    if (not isinstance(hashes, dict) or set(hashes) != set(FACES)
+            or len(images) != 6 or len({item['sha256'] for item in images}) != 6):
+        return False
+    seen = set()
+    for item in images:
+        face = Path(item['name']).stem.lower()
+        if face in seen or hashes.get(face) != item['sha256'] or item.get('face') not in (None, face):
+            return False
+        seen.add(face)
+        if item.get('face') is None:
+            if not item.get('score', 0) > 0:
+                return False
+            if item.get('reason') not in ('方向识别不确定', '画面与当前拍摄规范差异较大', '疑似镜像或侧面方向不确定'):
+                return False
+            if item.get('reason') == '疑似镜像或侧面方向不确定':
+                scores = item.get('side_scores', {})
+                hardware = item.get('hardware_orientation') or {}
+                detail = hardware.get('scores') or {}
+                if (face not in scores or max(scores, key=scores.get) != face
+                        or scores[face] <= item.get('mirror_score', 1)):
+                    return False
+                if detail and (max(detail, key=detail.get) != face
+                               or hardware.get('mirror_score', 1) - detail[face] >= .01):
+                    return False
+    return seen == set(FACES)
+
+
+def scan_folder(value, model=None, sheet_face_hashes=None):
     source = Path(value).expanduser().resolve(strict=True)
     if not source.is_dir():
         raise ValueError('请选择文件夹。')
@@ -508,6 +537,15 @@ def scan_folder(value, model=None):
             errors.append('缺少：' + '、'.join(missing))
         recognition = inspect_images(paths, standard=True) if model == 'iphone17' else inspect_images(paths)
         identified = recognition['complete']
+        if sheet_face_hashes is not None and folder.name in sheet_face_hashes:
+            if not sheet_column_directions(recognition['images'], sheet_face_hashes[folder.name]):
+                rows.append(dict(name=folder.name, files=files, valid=False, can_rename=False,
+                    changes=[], recognition=recognition, errors=['飞书六面原图列与当前图片不一致，或方向存在冲突']))
+                continue
+            if not identified:
+                recognition = dict(recognition, direction_source='sheet_columns',
+                                   direction_warnings=list(recognition['errors']))
+                identified = True
         changes = [dict(source=r['name'], target=r['face']+Path(r['file']).suffix.lower())
                    for r in recognition['images'] if r['face'] and Path(r['file']).stem.lower()!=r['face']]
         needs_rename = identified and bool(changes)
@@ -676,8 +714,13 @@ class App:
         with self.lock:
             job.update(values); save(self.registry/(job['id']+'.json'), job)
 
-    def scan(self, value, model=None):
-        result = scan_folder(value, model) if model else scan_folder(value)
+    def scan(self, value, model=None, sheet_face_hashes=None):
+        if sheet_face_hashes is not None and not isinstance(sheet_face_hashes, dict):
+            raise ValueError('飞书原图列需要逐台提供六面校验值')
+        result = scan_folder(value, model, sheet_face_hashes) if sheet_face_hashes is not None else (
+            scan_folder(value, model) if model else scan_folder(value))
+        if sheet_face_hashes is not None:
+            result['sheet_face_hashes'] = sheet_face_hashes
         result['standard'] = model == 'iphone17'
         result['id'] = secrets.token_hex(12)
         with self.lock:
@@ -841,6 +884,9 @@ class App:
             if standard:
                 job.update(protection_policy='sticker_only', lighting_profile='standard_glass_back',
                            bottom_alignment='standard_3_5_holes')
+            if scan.get('sheet_face_hashes') is not None:
+                job['sheet_face_hashes'] = {n: scan['sheet_face_hashes'][n] for n in names
+                    if n in scan['sheet_face_hashes']}
             if resume_job and standard:
                 job.update(parent_job_id=resume_job['id'], message='准备从标准版原图重新处理')
             elif resume_job:
@@ -865,7 +911,10 @@ class App:
             selected = body.get('skus', names)
             if not selected or not isinstance(selected, list) or not set(selected) <= set(names):
                 raise ValueError('没有需要继续的处理阶段；已完成候选仅需复核。')
-            scan = self.scan(job['source'], 'iphone17') if job['model'] == 'iphone17' else self.scan(job['source'])
+            if 'sheet_face_hashes' in job:
+                scan = self.scan(job['source'], job['model'], job['sheet_face_hashes'])
+            else:
+                scan = self.scan(job['source'], 'iphone17') if job['model'] == 'iphone17' else self.scan(job['source'])
             return self.start(dict(scan_id=scan['id'], skus=selected, model=job['model'],
                 concurrency=body.get('concurrency', 1),
                 output=body.get('output') or job.get('output_base') or str(Path(job['output']).parent),
@@ -1227,7 +1276,7 @@ def handler(app):
                 if not isinstance(body, dict):
                     raise ValueError('请求格式无效')
                 if self.path == '/api/scan':
-                    result = app.scan(body['path'], body.get('model'))
+                    result = app.scan(body['path'], body.get('model'), body.get('sheet_face_hashes'))
                 elif self.path == '/api/name':
                     result = app.apply_names(body['scan_id'])
                 elif self.path == '/api/start':

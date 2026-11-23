@@ -82,12 +82,22 @@ def segment_face(normalizer, raw, max_side):
 
 def geometry_face(matte, raw, face, capture):
     if face in pipeline.FRAMES:
-        image, evidence = frame_geometry(matte, face, capture, source_image=raw, separate_support_edge=False)
+        try:
+            image, evidence = frame_geometry(matte, face, capture, source_image=raw, separate_support_edge=False)
+        except ValueError as original:
+            if face != 'bottom':
+                raise
+            from .frame_contact import recover_frame
+            try:
+                image, evidence = recover_frame(matte, raw, face, capture, retain_small_upper_detail=True)
+            except ValueError as recovery:
+                raise ValueError(f'{original} (source contact check: {recovery})') from recovery
+            evidence['previous_bottom_geometry_error'] = str(original)
     else:
         paper, info = paper_mask(matte, face)
         image, evidence = plate_geometry(matte, face, paper, capture, source_image=raw, reconstruct_paper_tail=False)
         evidence['paper'] = info
-    paper, _ = paper_mask(image, face)
+    paper = None if face == 'bottom' else paper_mask(image, face)[0]
     image, trim = trim_visible_canvas(image, paper)
     evidence['visible_canvas_trim'] = trim
     return image, evidence
@@ -115,7 +125,7 @@ def light_face(source, face, work, light, structure):
     delta=lightness(after[...,:3])-lightness(before[...,:3])
     if abs(delta[allowed]).max()>35.5:raise ValueError('Standard illumination exceeded the frozen source correction limit')
     check.update(visual_approved=False,max_lightness_shift=float(abs(delta[allowed]).max()),
-        material_domains=[d['name'] for d in spec['views'][0]['domains']])
+        material_notes=proof.get('material_notes',[]),material_domains=[d['name'] for d in spec['views'][0]['domains']])
     return check
 
 
@@ -133,8 +143,25 @@ def run(source, work=None, output=None, *, single_name='SKU_01', device='auto', 
     try:
         files = geometry(source, work/'work', single_name, device, cpu_threads)
         from .iphone17_structure import propose,apply as align
-        from .iphone17_port import mapping as port_mapping,apply as port_apply,measure as port_measure
-        structure=propose(files)
+        from .iphone17_port import mapping as port_mapping,apply as port_apply,verify_export
+        from .iphone17_review import side_material
+        warnings = []
+        def keep_position(face, feature, exc):
+            warnings.append(dict(face=face, code=feature+'_position_retained',
+                                 message=('天线' if feature=='antenna' else '按键')+'保留实拍位置',
+                                 error=str(exc)))
+        structure = {}
+        materials = {}
+        try:
+            structure = propose(files)
+        except ValueError:
+            for side in ('left','right'):
+                try:
+                    structure.update(propose(files, sides=(side,)))
+                except ValueError as exc:
+                    keep_position(side,'antenna',exc)
+                    materials.update(side_material(files[side],side))
+        materials.update(structure)
         w.save(work/'structure-proposal.json',structure)
         port_map,port_proof=port_mapping(Image.open(files['bottom']))
         w.save(work/'port-registration.json',port_proof)
@@ -143,40 +170,63 @@ def run(source, work=None, output=None, *, single_name='SKU_01', device='auto', 
         lighting_checks={}
         for face in pipeline.FACES:
             print('lighting: '+face,flush=True)
-            check = light_face(files[face], face, work, light, structure)
+            check = light_face(files[face], face, work, light, materials)
+            for message in check.get('material_notes',[]):
+                warnings.append(dict(code='native_feature_lighting',face=face,message=message))
             lighting_checks[face]=check
             w.save(work/'lighting-checks.json',lighting_checks)
         staged=work/'final-candidates'/single_name;staged.mkdir(parents=True,exist_ok=True)
         structural={}
+        frame_alignment={'bottom':port_map}
+        face_stages={face:'lighting' for face in pipeline.FACES}
         for face in pipeline.FACES:
             print('structure: '+face,flush=True)
             im=Image.open(light/(face+'.png')).convert('RGBA')
             if face in ('left','right'):
-                im,structural[face]=align(im,structure[face])
-                from .iphone17_buttons import propose as button_propose,apply as button_apply
+                structural[face]={'antenna_position':'retained'}
+                if face in structure:
+                    try:
+                        im,structural[face]=align(im,structure[face])
+                    except ValueError as exc:
+                        keep_position(face,'antenna',exc)
+                    else:
+                        frame_alignment[face]=(structure[face],structural[face])
+                        face_stages[face]='antenna'
+                from .iphone17_buttons import SourceEvidenceError,propose as button_propose,apply as button_apply
                 button_dir=work/'button-inputs';button_dir.mkdir(exist_ok=True)
                 button_input=button_dir/(face+'.png');im.save(button_input)
-                button_spec=button_propose(files['back'],button_input,face,work/'work/geometry-records/report.json')
-                w.save(work/(face+'-button-proposal.json'),button_spec)
-                im,structural[face]['button_alignment']=button_apply(im,button_spec)
+                try:
+                    button_spec=button_propose(files['back'],button_input,face,work/'work/geometry-records/report.json')
+                    w.save(work/(face+'-button-proposal.json'),button_spec)
+                    im,structural[face]['button_alignment']=button_apply(im,button_spec)
+                except SourceEvidenceError:
+                    raise
+                except ValueError as exc:
+                    keep_position(face,'button',exc)
+                    structural[face]['button_position']='retained'
+                else:
+                    face_stages[face]='antenna_and_buttons' if face in frame_alignment else 'buttons'
             elif face=='bottom':
                 im=port_apply(im,port_map)
-                measured=port_measure(im)['port']
-                error=float(measured[0]-(im.width-1)/2)
-                if abs(error)>2.5:raise ValueError('Final rendered USB-C centre failed independent measurement')
-                port_proof.update(final_measured_port_x=float(measured[0]),final_rendered_center_error_px=error)
+                face_stages[face]='bottom_registration'
                 structural[face]=port_proof
             else:
                 shutil.copy2(light/(face+'.png'),staged/(face+'.png'));continue
             im.save(staged/(face+'.png'))
         w.save(work/'structure-checks.json',structural)
-        from .iphone17_model_finish import finish_frames, register_camera
+        from .iphone17_model_finish import finish_frames
+        from .iphone17_back_finish import finish_back
         baseline={face:staged/(face+'.png') for face in pipeline.FACES}
         finish_dir=work/('model-finish-'+str(time.time_ns()))
         finished=finish_dir/'candidates'/single_name
-        frame_finish=finish_frames(baseline,work,finished,finish_dir/'records')
-        aligned_camera,camera_finish=register_camera(Image.open(baseline['back']))
+        frame_finish=finish_frames(baseline,work,finished,finish_dir/'records',
+                                   review_alignment=frame_alignment if len(frame_alignment)<3 else None)
+        verify_export(finished/'bottom.png',port_proof)
+        w.save(work/'structure-checks.json',structural)
+        w.save(work/'port-registration.json',port_proof)
+        aligned_camera,camera_finish=finish_back(Image.open(baseline['back']))
         aligned_camera.save(finished/'back.png')
+        camera_finish['output_sha256']=w.sha(finished/'back.png')
         shutil.copy2(baseline['front'],finished/'front.png')
         staged=finished
         final={face:staged/(face+'.png') for face in pipeline.FACES}
@@ -184,7 +234,7 @@ def run(source, work=None, output=None, *, single_name='SKU_01', device='auto', 
         pipeline.overview({single_name:files},{single_name:final},work/'overview.png',faces=pipeline.FACES)
         manifest=w.read(work/'work/intake.json');w.check_sources(manifest)
         report.update(status='processed_needs_visual_review',processed=1,six_faces_processed=True,
-            lighting_checks=lighting_checks,structure_checks=structural,source_hashes_unchanged=True,
+            face_processing=face_stages,item_effect_warnings=warnings,lighting_checks=lighting_checks,structure_checks=structural,source_hashes_unchanged=True,
             candidate=str(staged),final_sha256={f:w.sha(p) for f,p in final.items()})
         report['lighting_directory']=str(light)
         report['implementation_sha256']={str(p.relative_to(Path(__file__).parent)):w.sha(p)
@@ -209,6 +259,8 @@ def publish(work,review,output):
         raise ValueError('Complete standard-model processing required before image delivery')
     for side in ('left','right'):
         check=report.get('structure_checks',{}).get(side,{})
+        if not report.get('partial_revision') and check.get('antenna_position')=='retained':
+            continue
         if check.get('basis')!='same_sku_back_rim_measured_pixel_center_ratio' or not check.get('rear_reference_rows'):
             raise ValueError('Measured rear rim alignment required; native-side-only results cannot be published')
     if record.get('report_sha256')!=w.sha(work/'report.json') or not record.get('reviewer'):
@@ -242,9 +294,12 @@ def publish(work,review,output):
             if not np.array_equal(old[lo:hi],new[lo:hi]):raise ValueError('Partial correction changed upper/buttons/endcap')
     else:
         for side in ('left','right'):
-            validate_render_checks(report['structure_checks'][side])
+            check=report['structure_checks'][side]
+            if check.get('antenna_position')!='retained':
+                validate_render_checks(check)
             from .iphone17_buttons import validate as validate_buttons
-            validate_buttons(report['structure_checks'][side].get('button_alignment',{}))
+            if check.get('button_position')!='retained':
+                validate_buttons(check.get('button_alignment',{}))
     checks=('outline_corners_contact','material_paper_edges','native_and_4x','structure_and_features')
     if set(record.get('faces',{}))!=set(pipeline.FACES):raise ValueError('All six faces require an independent review')
     for face,path in files.items():

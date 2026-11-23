@@ -98,7 +98,7 @@ def _plate_axis_strict(rgba,raw_rgb,rows):
 
 
 
-def plate_axis(rgba,raw_rgb,rows):
+def plate_axis(rgba,raw_rgb,rows,*,exclude_front_controls=False):
     """Keep ordinary source proof; recover one ragged matte side from raw RGB.
 
     An independently fitted opposite silhouette and both actual photograph
@@ -138,13 +138,34 @@ def plate_axis(rgba,raw_rgb,rows):
         agreement=float(abs(rgb[0]-anchor[0])*span)
         if agreement>3:raise ValueError('Raw body axis disagrees with independent opposite silhouette')
         alpha_distance=float(np.percentile(abs(np.polyval(rgb,ys+.5)-value),95))
+        straight_sections = None
         if fit is None and alpha_distance>radius+1:
-            raise ValueError('Raw body axis exceeds bounded matte neighborhood')
+            # The silhouette follows protruding keys. Fit only extended bare
+            # metal sections, witnessed by the photograph and the opposite rail.
+            outward=(np.polyval(rgb,ys+.5)-value)*(1 if side=='left' else -1)
+            if not exclude_front_controls or np.percentile(outward,5)<-2.5:
+                raise ValueError('Raw body axis exceeds bounded matte neighborhood')
+            labels,count=ndimage.label(np.abs(outward)<=2.5)
+            spans=[run[0] for run in ndimage.find_objects(labels) if run is not None
+                   and run[0].stop-run[0].start>=max(12,int(.015*len(ys)))]
+            bare=np.zeros(len(ys),bool)
+            for run in spans:
+                bare[run]=True
+            if len(spans)<2 or bare.mean()<.35 or np.ptp(ys[bare])<.6*span:
+                raise ValueError('Too little straight front rail outside the controls')
+            rgb,keep,error=consensus_line(ys[bare]+.5,observed[bare].astype(float),2.5,np.tan(np.deg2rad(4)))
+            alpha_distance=float(np.percentile(abs(np.polyval(rgb,ys[bare]+.5)-value[bare]),95))
+            agreement=float(abs(rgb[0]-anchor[0])*span)
+            if alpha_distance>2.5 or agreement>3 or any(supported[run].mean()<.6 for run in spans):
+                raise ValueError('Bare front rail disagrees with the photograph or opposite silhouette')
+            straight_sections=[[int(ys[run.start]),int(ys[run.stop-1])] for run in spans]
         axis.append(rgb if fit is None else fit[0])
         proof.append(dict(side=side,alpha_consensus_available=fit is not None,alpha_proposal=proposal.tolist(),
             raw_rgb_line=rgb.tolist(),raw_rgb_residual_p95_px=error,raw_rgb_supported_fraction=float(supported.mean()),
             source_consensus_fraction=float(keep.mean()),source_search_radius_px=radius,
             opposite_alpha_axis_disagreement_over_shaft_px=agreement,alpha_distance_p95_px=alpha_distance))
+        if straight_sections:
+            proof[-1]['straight_sections_excluding_controls']=straight_sections
     slope=float(np.mean([v[0] for v in axis]))
     return -slope,dict(method='one_opposite_silhouette_and_two_raw_sides_v1',sides=proof,
         original_failure=original_error,rotation_ccw_degrees=float(np.degrees(np.arctan(-slope))),
@@ -354,6 +375,66 @@ def frame_rails(rgba,source_rgb=None):
         top_rail=top.tolist(), bottom_rail=bottom.tolist())
 
 
+def _bottom_upper_body_rail(rgba, raw, top, bottom, extent):
+    """Recover the near rail when a broad raised object fills the central silhouette."""
+    x0,x1 = extent
+    width = x1-x0
+    alpha = rgba[...,3]
+    mask = principal(alpha)
+    fraction = (np.arange(x0,x1)-x0)/width
+    x = np.arange(x0,x1)
+    transition = np.argmax(mask[:,x], axis=0)
+    ends = ((fraction>.025)&(fraction<.045), (fraction>.955)&(fraction<.975))
+    if any(use.sum() < 3 for use in ends):
+        return top, None
+    gaps = [np.median(transition[use]-np.polyval(top,x[use]+.5)) for use in ends]
+    if min(gaps) < .025*width or abs(gaps[0]-gaps[1]) > .012*width:
+        return top, None
+    grad = np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw.astype(np.float32),.8,axis=0),
+                                      axis=0),axis=2)
+    seed = top.copy()
+    seed[1] += np.median(gaps)
+    tracks = []
+    # Disjoint end and middle windows on both sides of the port. The port
+    # and the central printed label never enter the fit.
+    for lo,hi in ((.025,.055),(.10,.18),(.24,.32),(.66,.74),(.82,.90),(.945,.975)):
+        cols = x[(fraction>=lo)&(fraction<hi)]
+        predicted = np.polyval(seed,cols+.5)
+        rows = np.rint(predicted[:,None]+np.arange(-9,10)).astype(int)
+        if rows.min()<0 or rows.max()>=len(alpha):
+            return top,None
+        support = grad[rows,cols[:,None]]
+        peak = np.argmax(support,axis=1)
+        good = (peak>0)&(peak<18)&(support.max(axis=1)>3)
+        if good.mean()<.75:
+            return top,None
+        tracks.append((cols[good]+.5,rows[good,peak[good]]+.5))
+    line = np.polyfit([np.median(c) for c,y in tracks],[np.median(y) for c,y in tracks],1)
+    residuals = []
+    for c, y in tracks:
+        cols = (c-.5).astype(int)
+        rows = np.rint(np.polyval(line,c)[:,None]-.5+np.arange(-4,5)).astype(int)
+        if rows.min() < 0 or rows.max() >= len(alpha):
+            return top, None
+        signal = grad[rows,cols[:,None]]
+        local = (signal[:,1:-1]>=signal[:,:-2])&(signal[:,1:-1]>signal[:,2:])&(signal[:,1:-1]>3)
+        local &= signal[:,1:-1]>=.5*signal.max(axis=1,keepdims=True)
+        distance = abs(rows[:,1:-1]+.5-np.polyval(line,c)[:,None])
+        peaks = 1+np.argmin(np.where(local,distance,np.inf),axis=1)
+        seen = local.any(axis=1)
+        if seen.mean()<.8:
+            return top,None
+        residuals.append(float(np.percentile(abs(rows[seen,peaks[seen]]+.5-np.polyval(line,c[seen])),95)))
+    if max(residuals)>3 or abs(line[0]-bottom[0])*width>5:
+        return top,None
+    if any(abs(np.median(transition[use]-np.polyval(line,x[use]+.5)))>5 for use in ends):
+        return top,None
+    if np.min(np.polyval(bottom-line,[x0,x1]))<.035*width:
+        return top,None
+    return line, dict(method='six_disjoint_source_rgb_upper_body_windows',
+                      original_rail=top.tolist(),window_residuals_px=residuals)
+
+
 def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_support_edge=True):
     a=np.array(matte.convert('RGBA')); original=a.copy()
     raw=np.array(source_image.convert('RGB')) if source_image else None
@@ -372,7 +453,23 @@ def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_suppo
             except ValueError as unsupported:
                 raise TopCalibrationError(f'{failure} (source contact check: {unsupported})') from unsupported
     else:
-        top,bottom,proof=frame_rails(a,raw)
+        try:
+            top,bottom,proof=frame_rails(a,raw)
+        except ValueError as error:
+            if raw is None or str(error) not in ('No consistent exposed lower-rail estimate',
+                    'Source RGB and alpha lower-rail measurements disagree'):
+                raise
+            from .frame_contact import recover_frame
+            try:
+                recovered, proof = recover_frame(matte, source_image, face, stage_sink)
+            except ValueError as contact_error:
+                raise ValueError(f'{error} (source contact check: {contact_error})') from contact_error
+            proof['original_failure'] = str(error)
+            return recovered, proof
+        if face == 'bottom':
+            top, body_rail = _bottom_upper_body_rail(a,raw,top,bottom,proof['x_extent'])
+            if body_rail:
+                proof.update(upper_body_evidence=body_rail, top_rail=top.tolist())
     x=np.arange(a.shape[1])[None,:]+.5; y=np.arange(a.shape[0])[:,None]
     # Preserve native curved endcaps with their segmentation alpha. Rail
     # masking removes only projections/support, with an outward allowance.
@@ -528,7 +625,7 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
     center=mask[rows[len(rows)//2]];xs=np.flatnonzero(center);x0,x1=int(xs[0]),int(xs[-1])+1;bw=x1-x0
     if source_image is None:raise ValueError('Independent raw photograph required for automatic plate geometry')
     raw_rgb=np.array(source_image.convert('RGB'))
-    body_slope,axis_proof=plate_axis(a,raw_rgb,rows)
+    body_slope,axis_proof=plate_axis(a,raw_rgb,rows,exclude_front_controls=face=='front')
     # Clear strips between the round corners and the stand are an independent
     # body measurement. A central RGB maximum can be the stand's white joint.
     clear_options=[];raw_gradient=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(np.float32),.8,axis=0),axis=0),axis=2)

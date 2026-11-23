@@ -186,3 +186,28 @@ def test_fit_mask_is_only_estimation_support_and_cannot_bypass_support_gate(tmp_
     Image.new('L',(10,10),255).save(fit_path)
     with pytest.raises(ValueError,match='Fit mask dimensions'):
         module.process_view(item,np.array([70,0,0]),{})
+
+
+def test_button_missing_from_lighting_does_not_block_the_remaining_rail(tmp_path):
+    image=side_image()
+    ImageDraw.Draw(image).rectangle((20,590,60,740),fill=(180,183,185,255))
+    source=tmp_path/'right.png'
+    image.save(source)
+    job,proof,_,_=auto_material.propose_job(source,'right',tmp_path/'materials')
+    assert proof['button_lighting_notice']
+    domains={v['name']:v for v in job['views'][0]['domains']}
+    assert {'main_surface','antenna_0','antenna_1','hardware_0'} <= set(domains)
+    assert np.asarray(Image.open(domains['main_surface']['fit_mask']))[650,40]==0
+
+
+def test_relaxed_contours_keep_bare_middle_metal_available_to_lighting(tmp_path,monkeypatch):
+    from phone_texture import side_material
+    image=side_image()
+    detected=hardware_materials(image,'right')
+    monkeypatch.setattr(side_material,'lighting_hardware',lambda *_:(detected,'nested rims'))
+    source=tmp_path/'right.png'
+    image.save(source)
+    job,_,_,_=auto_material.propose_job(source,'right',tmp_path/'materials')
+    metal=next(d for d in job['views'][0]['domains'] if d['name']=='main_surface')
+    fit=np.asarray(Image.open(metal['fit_mask']))
+    assert fit[500,40] and not fit[350,40]

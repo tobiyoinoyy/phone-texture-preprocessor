@@ -103,3 +103,49 @@ def test_engine_rejects_stale_shadow_bindings(tmp_path,changed):
     item=dict(name='back',source=str(source),domains=[dict(name='camera_surround',mask=str(mask),sigma=[3,3],strength=[0,0,0])],rear_shadow_correction=plan)
     with pytest.raises(ValueError,match='binding changed'):
         render.process_view(item,np.array([40,0,0]),dict(color_mode='source_lightness'))
+
+
+def test_optional_shadow_rejection_keeps_verified_base_lighting(tmp_path, monkeypatch):
+    a=np.full((35,45,4),255,np.uint8)
+    a[...,:3]=np.linspace(44,128,45,dtype=np.uint8)[None,:,None]
+    source=tmp_path/'source.png';mask=tmp_path/'mask.png'
+    Image.fromarray(a).save(source);Image.new('L',(45,35),255).save(mask)
+    render=engine('aluminum')
+    view=dict(name='back',source=str(source),domains=[dict(name='camera_surround',mask=str(mask),sigma=[3,3])])
+    defaults=dict(color_mode='source_lightness')
+    baseline,_,_,_=render.process_view(view,np.array([60,0,0]),defaults)
+    assert not np.array_equal(baseline,a)
+    plan=dict(source_sha256=render.digest(source),material_sha256=render.digest(mask),material_mask=str(mask))
+    def reject(*_):
+        raise rear_shadow.InsufficientRearShadowEvidence('Rear shadow: narrow joint lacks source support')
+    monkeypatch.setattr(rear_shadow,'correction',reject)
+    result,_,_,report=render.process_view(dict(view,rear_shadow_correction=plan),np.array([60,0,0]),defaults)
+    assert np.array_equal(result,baseline)
+    assert report['rear_shadow_correction']['status'] == 'source_evidence_unavailable'
+
+
+def test_one_unsupported_lens_preserves_its_base_and_other_corrections(monkeypatch):
+    rgba, metal, _, _ = scene()
+    plan = rear_shadow.prepare(rgba, metal, 'source', 'material')
+    light = engine('aluminum').rgb_to_lab(rgba[..., :3])[..., 0]
+    complete, _, _ = rear_shadow.correction(light, light, metal, plan)
+    original = rear_shadow._lens_field
+    lens = plan['lenses'][0]
+
+    def reject_first(*args):
+        if args[5] is lens:
+            raise rear_shadow.InsufficientRearShadowEvidence('source shadow has unrecoverable black pixels')
+        return original(*args)
+
+    monkeypatch.setattr(rear_shadow, '_lens_field', reject_first)
+    field, scope, proof = rear_shadow.correction(light, light, metal, plan)
+    assert proof['status'] == 'partially_applied'
+    assert [r['lens'] for r in proof['skipped_lenses']] == [0]
+    cx, cy, major, minor, angle = lens['ellipse']
+    yy, xx = np.indices(metal.shape)
+    phi = np.deg2rad(angle)
+    u = (np.cos(phi)*(xx-cx) + np.sin(phi)*(yy-cy)) / (major/2)
+    v = (-np.sin(phi)*(xx-cx) + np.cos(phi)*(yy-cy)) / (minor/2)
+    protected = u*u + v*v <= (max(lens['start_radii']) + .42)**2
+    assert not scope[protected].any()
+    assert scope.any() and np.array_equal(field[~protected], complete[~protected])

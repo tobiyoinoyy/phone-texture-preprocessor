@@ -3,24 +3,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 from scipy import ndimage
-from .auto_material import (paper_mask, seeded_paper, save_mask, reference_box,
+from .auto_material import (paper_mask, save_mask, reference_box,
                             front_metal, rear_body_contour)
 from .geometry_review import digest
 
 
 def paper(image, face):
-    if face != 'bottom':
-        # The Pro printed-tail reconstruction assumes the Pro label layout.
-        return paper_mask(image, face, source_tail=False)
-    a = np.array(image.convert('RGBA')); h,w = a.shape[:2]
-    proposal, proof = seeded_paper(a, face, resolve_end=False)
-    if proposal is None:
-        raise ValueError('Standard iPhone 17 bottom label has no supported print seed')
-    try:
-        return _standard_paper_end(a, proposal, proof)
-    except ValueError:
-        from .iphone17_paper import measured_paper
-        return measured_paper(a, proof)
+    if face == 'bottom':
+        return np.zeros(image.size[::-1], dtype=bool), dict(method='bottom_lit_without_label_boundary', protected_pixels=0)
+    # The Pro printed-tail reconstruction assumes the Pro label layout.
+    return paper_mask(image, face, source_tail=False)
 
 
 def _standard_paper_end(a, proposal, proof):
@@ -111,7 +103,38 @@ def cross_strip_end(proposal, proof, gray, cols, side_responses):
                       end_response=float(responses[y]))
 
 
-def glass_back_rim(image,sticker=None):
+def _glass_plateau_edge(gray, indices, sections, vertical):
+    """Independently locate a metal-to-glass transition across the same edge."""
+    from scipy.signal import find_peaks
+    readings=[]
+    for section in np.array_split(sections,5):
+        profile=np.median(gray[section],axis=0) if vertical else np.median(gray[:,section],axis=1)
+        values=profile[indices]
+        gradient=np.gradient(ndimage.gaussian_filter1d(values,.7))
+        amplitude=abs(gradient)
+        peaks=find_peaks(amplitude,height=3.5,prominence=1)[0]
+        plateau=np.median(values[-6:])
+        observed=[]
+        for k in peaks:
+            if k<2 or k+8>=len(values):
+                continue
+            change=plateau-np.median(values[k-2:k])
+            after=values[k+4:k+9]
+            if (abs(change)>=6 and np.sign(change)==np.sign(gradient[k])
+                    and abs(np.median(after)-plateau)<=5 and np.ptp(after)<=5
+                    and amplitude[k+4:].max()<=3):
+                observed.append((int(k),int(np.sign(change))))
+        if len(observed)>1:
+            return None
+        readings.append(observed[0] if observed else None)
+    found=[r for r in readings if r is not None]
+    if (len(found)<4 or not readings[0] or not readings[-1]
+            or len({r[1] for r in found})!=1 or np.ptp([r[0] for r in found])>2):
+        return None
+    return int(np.median([r[0] for r in found]))
+
+
+def glass_back_rim(image,sticker=None, *, allow_partial=False):
     """Measure the bright glass transition inwards from the body silhouette."""
     a=np.array(image.convert('RGBA'));h,w=a.shape[:2]
     body,body_proof=rear_body_contour(image)
@@ -162,14 +185,35 @@ def glass_back_rim(image,sticker=None):
                 readings.append(stable[0])
             if len(readings)==3 and np.ptp(readings)<=2:
                 peaks=np.array([int(np.median(readings))])
-        if not len(peaks):raise ValueError('Glass-back metal boundary lacks source gradient')
+        if not len(peaks):
+            crossing=_glass_plateau_edge(gray,indices,ys if i<2 else xs,i<2)
+            if crossing is None:
+                if allow_partial:
+                    widths.append(0.)
+                    continue
+                raise ValueError('Glass-back metal boundary lacks source gradient')
+            peaks=np.array([crossing])
         k=int(peaks[np.argmax(values[peaks])])
         width=float(offsets[k]+1)
-        if not 3<=width<=w*.035:raise ValueError('Implausible standard rear rim width')
+        if not 3<=width<=w*.035:
+            if allow_partial:
+                widths.append(0.)
+                continue
+            raise ValueError('Implausible standard rear rim width')
         widths.append(width);measurements.append(dict(edge=i,width_px=width,gradient=float(values[k])))
     dy,dx=np.gradient(ndimage.gaussian_filter(distance,3));den=np.maximum(abs(dx)+abs(dy),1e-8)
     local=(abs(dx)*np.where(dx>=0,widths[0],widths[1])+abs(dy)*np.where(dy>=0,widths[2],widths[3]))/den
-    return (a[...,3]>0)&(distance<=local),dict(method='standard_glass_back_source_transition',
+    observed = (a[...,3]>0)&(distance<=local)
+    if allow_partial:
+        if len(measurements) < 2:
+            raise ValueError('Fewer than two rear metal edges have usable source evidence')
+        # Avoid turning an unmeasured fourth edge into an inferred corner
+        # material. Only treat the near-normal part of each supported edge.
+        x_supported = np.where(dx>=0,widths[0]>0,widths[1]>0)
+        y_supported = np.where(dy>=0,widths[2]>0,widths[3]>0)
+        observed &= ((x_supported & (abs(dx)/den>=.92)) |
+                     (y_supported & (abs(dy)/den>=.92)))
+    return observed,dict(method='standard_glass_back_source_transition',
         edge_measurements=measurements,body_contour=body_proof),body
 
 
@@ -191,13 +235,18 @@ def job(source,face,folder,structure):
         remaining=visible&~sticker
         if face in ('left','right'):
             lines=np.asarray(structure[face]['antenna_lines']);yy=np.arange(h)[:,None]
-            for i in range(2):
+            proof['material_notes']=list(structure[face].get('material_notes',[]))
+            for i in range(len(lines)//2):
                 mask=remaining&(yy>=lines[2*i])&(yy<lines[2*i+1])
                 regions.append((f'antenna_{i}',mask,[max(4,np.median(lines[2*i+1]-lines[2*i])*.3),max(4,w*.2)],False));remaining &= ~mask
             from .iphone17_structure import capsule_mask
             gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
             for index,box in enumerate(structure[face]['hardware_boxes']):
-                hw=capsule_mask(image,box,face)&remaining
+                try:
+                    hw=capsule_mask(image,box,face)&remaining
+                except ValueError:
+                    proof['material_notes'].append('按键轮廓不清，按实拍边框整体调光')
+                    continue
                 cut,_=cv2.threshold(gray[hw].reshape(-1,1),0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
                 dark=hw&(gray<=cut);face_mask=hw&~dark
                 for suffix,mask in [('inset',dark),('face',face_mask)]:
@@ -213,9 +262,10 @@ def job(source,face,folder,structure):
                 if (.25*h<cy<.75*h and bh>h*.08 and bw>h*.08 and
                     area>25 and bw<w*.18 and .3< bw/max(1,bh)<5):
                     holes|=ndimage.binary_fill_holes(labels==i)
-            if face=='top' and holes.any():
-                # The standard top rail has no drilled apertures. Scattered
-                # dark wear without an opaque reference belongs to its metal.
+            if holes.any():
+                # Isolated dark fringes lack a material reference. Keep them
+                # in the broad source-lightness field instead of deriving a
+                # separate illumination from scratches, print or partial rims.
                 try:
                     reference_box(a, holes & remaining)
                 except ValueError:
@@ -229,14 +279,28 @@ def job(source,face,folder,structure):
             from scipy.signal import find_peaks
             g=np.gradient(ndimage.gaussian_filter1d(signal,.8));peaks,_=find_peaks(abs(g),height=2,distance=3)
             bands=[]
+            witnesses = None
+            if face == 'bottom':
+                # The terminal break must appear across the rail height. Ink
+                # and the paper edge near the port are not antenna evidence.
+                witnesses = [np.gradient(ndimage.gaussian_filter1d(np.median(section, axis=0), .8))
+                             for section in np.array_split(gray[y0:y1].astype(float), 3)]
             for lo in peaks:
                 for hi in peaks:
-                    if .004*w<hi-lo<.025*w and g[lo]<-2 and g[hi]>2 and .12*w<lo<.9*w:
-                        bands.append((min(-g[lo],g[hi]),int(lo),int(hi)))
-            if not bands:raise ValueError('Standard top/bottom antenna stripe is unresolved')
-            _,lo,hi=max(bands);stripe=remaining&(np.arange(w)[None,:]>=lo)&(np.arange(w)[None,:]<hi)
-            regions.append(('antenna',stripe,[max(3,h*.1),max(2,(hi-lo)*.3)],False));remaining &= ~stripe
-            proof['antenna_columns']=[lo,hi]
+                    if not (.004*w<hi-lo<.025*w and g[lo]<-2 and g[hi]>2 and .12*w<lo<.9*w):
+                        continue
+                    if witnesses is not None:
+                        if not (hi < .30*w or lo > .70*w):
+                            continue
+                        if not all(v[lo-2:lo+3].min() < -1.5 and v[hi-2:hi+3].max() > 1.5 for v in witnesses):
+                            continue
+                    bands.append((min(-g[lo],g[hi]),int(lo),int(hi)))
+            if bands:
+                _,lo,hi=max(bands);stripe=remaining&(np.arange(w)[None,:]>=lo)&(np.arange(w)[None,:]<hi)
+                regions.append(('antenna',stripe,[max(3,h*.1),max(2,(hi-lo)*.3)],False));remaining &= ~stripe
+                proof['antenna_columns']=[lo,hi]
+            else:
+                proof['material_notes']=['天线边缘不清，按实拍边框整体调光']
         regions.append(('main_surface',remaining,[max(3,h*.018),max(3,w*.12)],False))
     for name,mask,sigma,contour in regions:
         mask &= visible&~sticker
@@ -248,11 +312,12 @@ def job(source,face,folder,structure):
             shoulder=float(ndimage.distance_transform_edt(~reliable)[mask&(a[...,3]>=128)].max())
             if shoulder>max(8,w*.045):raise ValueError('Standard rim lacks nearby opaque metal support')
             d.update(field='contour',reference_profile='contour_depth',contour_inset_depth=max(3.,shoulder+1))
+            d['fallback_contour_source_inset_limit'] = max(8., w*.045)
             if face=='back':d['contour_alpha_mask']=body_path
         domains.append(d)
     sticker_path=save_mask(folder/'paper.png',sticker)
     required=save_mask(folder/'required-editable.png',allowed)
     view=dict(name=face,source=str(Path(source).resolve()),source_sha256=digest(source),
-        protection_policy='sticker_only',sticker_mask=sticker_path,protected_mask=sticker_path,
+        protection_policy='none' if face=='bottom' else 'sticker_only',sticker_mask=sticker_path,protected_mask=sticker_path,
         required_editable_mask=required,reference_boxes=domains[0]['reference_boxes'],domains=domains)
     return dict(color_mode='source_lightness',defaults=dict(max_lab_shift=[35,0,0],feather=0),views=[view]),proof,allowed,sticker

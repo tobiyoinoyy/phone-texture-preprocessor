@@ -202,6 +202,8 @@ def process_one(task):
             geometry=dict(mode='original_only_automatic',success=False,geometry_status='needs_review',
                 candidates_complete=False,images=[],automatic_profile=PROFILE)
             device_observations=[];forward_observations=[];begin=time.perf_counter()
+            geometry['contact_fallbacks'] = {}
+            geometry_failures = []
             with Normalizer(NormalizerConfig(remove_support=False,deskew=False,tight_crop=False,device=device)) as norm:
                 original_forward=norm.backend._run_model
                 def observe_forward(model,inputs,torch_module):
@@ -242,19 +244,37 @@ def process_one(task):
                         tight_paper,_=paper_mask(image,face,resolve_end=False) if protection_policy=='none' else paper_mask(image,face)
                         analysis_stage='visible_canvas_trim'
                         image,tight_proof=trim_visible_canvas(image,None if protection_policy=='none' else tight_paper)
-                    except Exception:
-                        failed=records/'failed-source-analysis';failed.mkdir(exist_ok=True)
-                        matte.save(failed/(face+'-matte.png'))
-                        failure=dict(source=item['source'],source_sha256=item['sha256'],analysis_stage=analysis_stage)
-                        if pre_trim_image is not None:
-                            failed_image=failed/(face+'-geometry-before-final-trim.png')
-                            pre_trim_image.save(failed_image)
-                            failure.update(geometry_source_image=str(failed_image),
-                                geometry_source_sha256=w.sha(failed_image),
-                                geometry_source_size=list(pre_trim_image.size),
-                                coordinate_space='post_geometry_before_visible_canvas_trim')
-                        write(failed/(face+'.json'),failure)
-                        raise
+                    except Exception as error:
+                        fallback_valid = False
+                        if (isinstance(error, ValueError) and analysis_stage=='geometry'
+                                and review_fallback=='preserve-source' and face in ('front', 'back')):
+                            from .geometry_continuation import recover_plate
+                            try:
+                                image, evidence = recover_plate(matte, face, error)
+                            except ValueError:
+                                pass
+                            else:
+                                geometry['contact_fallbacks'][face] = evidence
+                                stages = dict(source_matte=matte)
+                                tight_proof = evidence['visible_canvas_trim']
+                                fallback_valid = True
+                        if not fallback_valid:
+                            failed=records/'failed-source-analysis';failed.mkdir(exist_ok=True)
+                            matte.save(failed/(face+'-matte.png'))
+                            failure=dict(source=item['source'],source_sha256=item['sha256'],analysis_stage=analysis_stage)
+                            if pre_trim_image is not None:
+                                failed_image=failed/(face+'-geometry-before-final-trim.png')
+                                pre_trim_image.save(failed_image)
+                                failure.update(geometry_source_image=str(failed_image),
+                                    geometry_source_sha256=w.sha(failed_image),
+                                    geometry_source_size=list(pre_trim_image.size),
+                                    coordinate_space='post_geometry_before_visible_canvas_trim')
+                            write(failed/(face+'.json'),failure)
+                            if (review_fallback=='preserve-source' and isinstance(error, ValueError)
+                                    and face in ('top', 'bottom') and isinstance(matte, Image.Image)):
+                                geometry_failures.append(dict(face=face, stage='geometry', error=str(error)))
+                                continue
+                            raise
                     evidence['visible_canvas_trim']=tight_proof
                     evidence['output_size']=list(image.size)
                     p=folder/(face+'.png');image.save(p)
@@ -268,7 +288,18 @@ def process_one(task):
                         obs.update(mps_driver_bytes=int(torch.mps.driver_allocated_memory()),
                             mps_tensor_bytes=int(torch.mps.current_allocated_memory()))
                     device_observations.append(obs)
-            geometry['candidates_complete']=True;write(records/'report.json',geometry)
+            geometry['candidates_complete']=not geometry_failures
+            write(records/'report.json',geometry)
+            if geometry_failures:
+                from .partial_lighting import finish as finish_partial_lighting
+                available = {entry['face']: folder/(entry['face']+'.png') for entry in geometry['images']}
+                result.update(finish_partial_lighting(case,sku,manifest,geometry,available,geometry_failures,
+                              lighting_profile,protection_policy,progress))
+                result.update(seconds=time.perf_counter()-started,events=events,**peak_process_memory())
+                write(case/'work/stage-report.json',result)
+                write(case/'result.json',result)
+                progress('partial_review',completed=6+len(available))
+                return result
             write(records/'review-template.json',dict(report_sha256=w.sha(records/'report.json'),reviewer='',
                 items={sku+'/'+face:{**dict.fromkeys(gr.CHECKS,False),'notes':'','boundary_assertions':{}} for face in pipeline.FACES}))
             stage('segmentation_geometry_and_evidence',begin)
@@ -309,16 +340,28 @@ def process_one(task):
                 return retain_source_after_quality_comparison(effective_files,effective_geometry,
                     planar_files,planar_geometry,bottom_report,case/'work/bottom-alignment',comparison_path)
             bottom_quality=dict(source=quality_source,commit=quality_commit)
+        contact_fallbacks = geometry.get('contact_fallbacks', {})
+        source_reference_allowed = source_body_reference_review and 'back' not in contact_fallbacks
         reference_metadata = (dict(raw_path=inputs['back']['snapshot'],back_path=geometry_files['back'],
             geometry_report_path=case/'work/geometry-records/report.json',
             geometry_item=next(entry for entry in geometry['images'] if entry['face']=='back'),
             perspective_output_sha256=perspective_report['faces']['back']['output_sha256']
                 if perspective_report['faces']['back']['applied'] else None)
-            if source_body_reference_review else None)
+            if source_reference_allowed else None)
         result.update(process_stages(case,sku,effective_geometry,effective_files,manifest,model,
             protection_policy,lighting_profile,progress,stage,allow_partial=review_fallback=='preserve-source',bottom_fallback=bottom_fallback,
-            source_body_reference_review=source_body_reference_review,source_body_reference_metadata=reference_metadata,
-            bottom_quality=bottom_quality,side_candidate_review=side_candidate_review))
+            source_body_reference_review=source_reference_allowed,source_body_reference_metadata=reference_metadata,
+            bottom_quality=bottom_quality,side_candidate_review=side_candidate_review and source_reference_allowed))
+        if contact_fallbacks:
+            result['stage_status']['geometry'] = 'degraded'
+            result.update(six_faces_processed=False, mandatory_program_checks_complete=False,
+                          status='source_preserved_needs_review', geometry_contact_fallbacks=contact_fallbacks)
+            for face, proof in contact_fallbacks.items():
+                issue = dict(stage='geometry', face=face, error=proof['original_error'],
+                             candidate_status='degraded_repeated_stand_contact')
+                result['blocked_checks'].append(issue)
+                result['review_warnings'].append(dict(face=face, code='matte_contact_candidate',
+                    message='原图支架接触区采用多档重复轮廓，已继续调光。下缘仍待核对。'))
         if result.get('side_candidate_review_attempted'):
             result['execution_route']='normal_pipeline_with_side_review'
         result.setdefault('review_warnings',[]).extend(

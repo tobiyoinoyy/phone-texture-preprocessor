@@ -134,7 +134,67 @@ def _contact(edge, x, span, gradient, threshold_edges, sign):
     )
 
 
-def recover_frame(matte, raw_image, face, stage_sink=None, deskew=True):
+def _source_supported_upper_detail(rgba, gradient, xs, ys, upper, violation, thickness):
+    """Retain a small attached source detail without a material classification."""
+    tail_x, tail_y = xs[violation], ys[violation]
+    columns = np.unique(tail_x)
+    span = int(np.ptp(columns)) + 1
+    if not .35 * thickness <= span <= .85 * thickness:
+        return None
+    if np.max(upper[violation] - tail_y) > .14 * thickness or len(columns) < .85 * span:
+        return None
+    connected = principal(rgba[..., 3], threshold=64)
+    if not connected[tail_y, tail_x].all():
+        return None
+    edges = np.argmax(connected[:, columns], axis=0)
+    rows = np.clip(edges[:, None] + np.arange(-3, 4), 0, len(rgba)-1)
+    evidence = float(np.mean(gradient[rows, columns[:, None]].max(axis=1) >= 3))
+    if evidence < .8:
+        return None
+    return dict(source_xyxy=[int(tail_x.min()), int(tail_y.min()),
+                             int(tail_x.max())+1, int(tail_y.max())+1],
+                source_pixels_retained=int(violation.sum()), rgb_edge_support=evidence)
+
+
+def _exposed_top_rail(x, edge, threshold_edges, gradient):
+    """Fit the photographed rail when the short rounded tips disagree on roll."""
+    columns = np.arange(len(x))
+    even = columns % 2 == 0
+    visible = (edge > 3) & (edge < gradient.shape[0] - 3)
+    training = visible & even
+    if training.sum() < 20:
+        raise ValueError("Top rail has too few exposed samples")
+    positions = x + .5
+    center = positions - positions.mean()
+    best_count = 0
+    for slope in np.linspace(-.07, .07, 151):
+        intercepts = np.rint(edge[training] - slope * center[training]).astype(int)
+        minimum = intercepts.min()
+        intercept = np.bincount(intercepts - minimum).argmax() + minimum
+        supported = training & (abs(edge - (intercept + slope * center)) <= 1)
+        if supported.sum() > best_count:
+            best_count = int(supported.sum())
+            best = supported
+    if best_count < .25 * even.sum():
+        raise ValueError("Top rail lacks a continuous silhouette consensus")
+    line = np.polyfit(positions[best], edge[best], 1)
+    held = ~even & visible & (abs(edge - np.polyval(line, positions)) <= 1.6)
+    evidence = []
+    for end in (columns < .25 * len(x), columns >= .75 * len(x)):
+        indices = np.flatnonzero(held & end)
+        if len(indices) < 4:
+            raise ValueError("Top rail lacks independent samples at both ends")
+        if any(np.percentile(abs(other[indices] - edge[indices]), 90) > 2 for other in threshold_edges):
+            raise ValueError("Exposed top rail depends on an ambiguous matte boundary")
+        ys = np.clip(edge[indices, None] + np.arange(-3, 4), 0, len(gradient) - 1)
+        support = float((gradient[ys, x[indices, None]].max(axis=1) > 3).mean())
+        if support < .8:
+            raise ValueError("Exposed top rail lacks original RGB support")
+        evidence.append(dict(held_out_columns=len(indices), source_rgb_fraction=support))
+    return line, evidence
+
+
+def recover_frame(matte, raw_image, face, stage_sink=None, deskew=True, *, retain_small_upper_detail=False):
     if raw_image is None or raw_image.size != matte.size:
         raise ValueError("Frame contact needs its original RGB photograph")
     rgba = np.asarray(matte.convert("RGBA"))
@@ -164,8 +224,23 @@ def recover_frame(matte, raw_image, face, stage_sink=None, deskew=True):
         raise ValueError("Frame contact end thickness or tilt is unsupported")
     slopes = np.degrees(np.arctan([line[0] for line in lines]))
     angle = float(np.mean(slopes)) if deskew else 0.0
+    rail_evidence = None
     if np.ptp(slopes) > 0.3:
-        raise ValueError("Exposed ends disagree on frame roll")
+        if face != "top":
+            raise ValueError("Exposed ends disagree on frame roll")
+        gradient = np.linalg.norm(
+            np.gradient(ndimage.gaussian_filter1d(raw.astype(np.float32), .8, axis=0), axis=0), axis=2
+        )
+        measured = [_exposed_top_rail(x, edge, [pair[i] for pair in alternate], gradient)
+                    for i, edge in enumerate((top, bottom))]
+        lines = [line for line, evidence in measured]
+        thickness = np.polyval(lines[1], endpoints) - np.polyval(lines[0], endpoints)
+        slopes = np.degrees(np.arctan([line[0] for line in lines]))
+        if (np.ptp(slopes) > .3 or min(thickness) < .035 * width or max(thickness) > .25 * width
+                or max(abs(line[0]) for line in lines) > .07):
+            raise ValueError("Independent exposed rails disagree on body thickness or roll")
+        angle = float(np.mean(slopes)) if deskew else 0.
+        rail_evidence = {name: evidence for name, (_, evidence) in zip(("upper", "lower"), measured)}
     cap, stand = [
         _span(edge, np.polyval(line, x + 0.5), sign, width)
         for edge, line, sign in zip((top, bottom), lines, (-1, 1))
@@ -185,7 +260,7 @@ def recover_frame(matte, raw_image, face, stage_sink=None, deskew=True):
     )
     result = rgba.copy()
     y = np.arange(len(alpha))[:, None]
-    proof = {}
+    proof = {"exposed_rails": rail_evidence} if rail_evidence else {}
     body = np.zeros_like(mask)
     excluded = np.zeros_like(mask)
     opaque_core = ndimage.binary_erosion(alpha >= 250, iterations=3)
@@ -214,13 +289,17 @@ def recover_frame(matte, raw_image, face, stage_sink=None, deskew=True):
     # Reject additional disconnected objects, tall supports or a second
     # unmodelled camera instead of letting their alpha enlarge the output.
     ys, xs = np.nonzero(result[..., 3] >= 64)
-    if (
-        xs.min() < x[0] - 3
-        or xs.max() > x[-1] + 3
-        or np.any(ys < np.polyval(lines[0], xs + 0.5) - max(8, 0.008 * width))
-        or np.any(ys > np.polyval(lines[1], xs + 0.5) + max(8, 0.008 * width))
-    ):
+    tolerance = max(8, 0.008 * width)
+    upper = np.polyval(lines[0], xs + 0.5)
+    above = ys < upper - tolerance
+    if xs.min() < x[0] - 3 or xs.max() > x[-1] + 3 or np.any(ys > np.polyval(lines[1], xs + 0.5) + tolerance):
         raise ValueError("Residual foreground outside the measured body")
+    if above.any():
+        tail = (_source_supported_upper_detail(result, gradient, xs, ys, upper, above, np.median(thickness))
+                if face == 'bottom' and retain_small_upper_detail else None)
+        if tail is None:
+            raise ValueError("Residual foreground outside the measured body")
+        proof['small_supported_upper_detail'] = tail
 
     if stage_sink:
         stage_sink("source_matte", matte)

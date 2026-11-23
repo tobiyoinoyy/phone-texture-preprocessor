@@ -21,11 +21,17 @@ from .pipeline import FACES, fresh
 MODELS = ('iphone17pro', 'iphone17promax')
 
 
-def profile(model):
+def profile(model, model_sha256=None):
     if model not in MODELS:
         raise ValueError('请选择模型：iPhone 17 Pro 或 iPhone 17 Pro Max')
-    path = Path(__file__).with_name('seam_profiles') / (model + '.json')
+    directory = Path(__file__).with_name('seam_profiles')
+    path = directory / (model + '-viewer.json')
     data = json.loads(path.read_text())
+    if model_sha256 is not None and data['model_sha256'] != model_sha256:
+        path = directory / (model + '.json')
+        data = json.loads(path.read_text())
+        if data['model_sha256'] != model_sha256:
+            raise ValueError('接缝坐标与所选模型文件不匹配')
     expected = {frozenset(p) for p in [('top','left'), ('top','right'),
                                       ('bottom','left'), ('bottom','right')]}
     if data['schema'] != 'phone-frame-uv-seams-v1' or len(data['chains']) != 4 or {
@@ -58,8 +64,21 @@ def seam_engine():
     return importlib.import_module('match_uv_seams')
 
 
-def run(work, sku, model, output, records):
-    data, profile_path = profile(model)
+def terminal_metal(work, face, source_sha256):
+    folder = Path(work)/'material-inputs'/face
+    mask = folder/'seam-terminal-metal.png'
+    proof_path = mask.with_suffix('.json')
+    if face not in ('left','right') or not mask.is_file() or not proof_path.is_file():
+        return None
+    proof = json.loads(proof_path.read_text())
+    if (proof.get('scope') != 'only_outside_both_source_antennas' or proof.get('face') != face
+            or proof.get('source_sha256') != source_sha256 or proof.get('mask_sha256') != digest(mask)):
+        raise ValueError('Terminal seam material evidence differs from the selected source')
+    return mask
+
+
+def run(work, sku, model, output, records, *, model_sha256=None, terminal_sources=None):
+    data, profile_path = profile(model, model_sha256)
     work, output, records = Path(work), Path(output), Path(records)
     fresh(output); fresh(records); records.mkdir(parents=True)
     files = {f: work/'structure-records/candidate'/sku/(f+'.png') for f in FACES}
@@ -70,7 +89,14 @@ def run(work, sku, model, output, records):
         # Source-derived classification travels through the exact same
         # source-to-target mapping as the image, never reclassified by output.
         material = work/'material-inputs'/face
-        mask = Image.open(material/'main_surface.png').convert('RGBA')
+        mask_path = material/'main_surface.png'
+        if not mask_path.is_file() and face in ('left','right'):
+            if digest(light[face]) != spec[face]['source_sha256']:
+                raise ValueError('Terminal metal mapping differs from its aligned lighting source')
+            mask_path = terminal_metal(work, face, (terminal_sources or {}).get(face))
+        if mask_path is None or not mask_path.is_file():
+            raise ValueError('Missing source-verified frame metal: '+face)
+        mask = Image.open(mask_path).convert('RGBA')
         if face in ('left','right'):
             source, target, _, _ = sr.mapping(light, face, spec[face])
             mask = sr.warp_rows(mask, source, target)
@@ -87,7 +113,7 @@ def run(work, sku, model, output, records):
         views=views, output_dir=str(output), records_dir=str(records/'engine'),
         width_units=.20, sigma=3, guard_pixels=18, protection_feather=0,
         max_lab_shift=[25,15,15], minimum_joint_coverage=.98,
-        maximum_p95_deltaE76=2.0, sampling_refinements=2,
+        maximum_p95_deltaE76=2.0, sampling_refinements=3 if terminal_sources else 2,
         maximum_correction_step_deltaE76=3.0,
         # 2026-11-09: rounded rim ends can make a steep step; smooth along the
         # seam first, else apply with a hint up to 8 (user: effect issues hint).

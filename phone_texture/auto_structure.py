@@ -50,6 +50,7 @@ def antenna_rows(image,x_range,expected_width=None,require_full_span=False):
             raise ValueError('Antenna boundary falls outside opaque body')
         result.extend([lo,hi]);signs.extend([int(np.sign(g[lo])),int(np.sign(g[hi]))]);scores.append(float(score))
     selection=[]
+    recovered_center=False
     if require_full_span:
         # A button cap or a scratch can outrank the real antenna in the
         # central 1-D signal. Every chosen side candidate must independently
@@ -59,7 +60,7 @@ def antenna_rows(image,x_range,expected_width=None,require_full_span=False):
             rejected=[];first_error=None;weak=None
             for score,lo,hi in pairs:
                 candidate=result.copy();candidate[2*band:2*band+2]=[lo,hi]
-                try:_,gate_proof=trace_boundaries(image,candidate,bands=(band,))
+                try:_,gate_proof=trace_boundaries(image,candidate,bands=(band,),recover_center=False)
                 except ValueError as exc:
                     if first_error is None:first_error=exc
                     rejected.append(dict(rows=[lo,hi],reason=str(exc)))
@@ -72,12 +73,35 @@ def antenna_rows(image,x_range,expected_width=None,require_full_span=False):
                     continue
                 break
             else:
-                if weak is None:raise first_error
-                score,lo,hi,candidate=weak
+                if weak is None:
+                    for score,lo,hi in pairs:
+                        candidate=result.copy()
+                        candidate[2*band:2*band+2]=[lo,hi]
+                        try:
+                            _,gate_proof=trace_boundaries(image,candidate,bands=(band,),recover_center=True)
+                        except ValueError:
+                            continue
+                        # Recover the measured central strip, not a wider
+                        # reflection sharing only one of its two boundaries.
+                        dominant=pairs[0][1:3]
+                        if max(abs(lo-dominant[0]),abs(hi-dominant[1]))>2.5:
+                            continue
+                        recovered_center=True
+                        if gate_proof['endpoint_shape_review_required']:
+                            weak=(score,lo,hi,candidate)
+                        break
+                    else:
+                        raise first_error
+                else:
+                    score,lo,hi,candidate=weak
             result=candidate;signs[2*band:2*band+2]=[int(np.sign(g[lo])),int(np.sign(g[hi]))]
             scores[band]=float(score)
             selection.append(dict(band=band,rows=[lo,hi],rejected_candidates=rejected,
                 endpoint_shape_review_required=weak is not None and weak[3] is candidate))
+    if recovered_center:
+        widths=[result[1]-result[0],result[3]-result[2]]
+        if max(widths)>1.45*min(widths):
+            raise ValueError('Neighbour-supported source bands disagree in width')
     proof=dict(signal_columns=list(x_range),scores=scores,
         supported_central_candidates=[[[int(lo),int(hi)] for score,lo,hi in pairs] for pairs in ranked])
     if require_full_span:proof['full_span_candidate_selection']=selection
@@ -176,7 +200,7 @@ def windows(rows,h,radius=4):
     for i,row in enumerate(rows):
         lo=max(1,int(np.floor(row))-radius);hi=min(h-2,int(np.ceil(row))+radius+1)
         if i:lo=max(lo,int(np.ceil((rows[i-1]+row)/2)))
-        if i<len(rows)-1:hi=min(hi,int(np.floor((row+rows[i+1])/2))+1)
+        if i<len(rows)-1:hi=min(hi,int(np.ceil((row+rows[i+1])/2)))
         if hi-lo<3:raise ValueError('Antenna boundaries too close for independent windows')
         result.append([lo,hi])
     return result
@@ -194,7 +218,7 @@ def body_rows(image,paper=None):
     return [float(np.median(top)),float(np.median(bottom))]
 
 
-def hardware_ranges(image, controls_only=False):
+def hardware_ranges(image, controls_only=False, *, optional=False):
     """controls_only keeps centred contours at least a fifth of the side wide:
     the buttons, not narrow scratches near the rim."""
     a=np.array(image.convert('RGBA'));h,w=a.shape[:2]
@@ -209,7 +233,7 @@ def hardware_ranges(image, controls_only=False):
         if np.median(a[y:y+bh,x:x+bw,3])<240:continue
         if controls_only and (bw<w*.2 or not w*.35<=x+bw/2<=w*.65):continue
         ranges.append([max(0,y-5),min(h,y+bh+5)]);boxes.append([x,y,x+bw,y+bh])
-    if not ranges:raise ValueError('No independent complete hardware contours detected')
+    if not ranges and not optional:raise ValueError('No independent complete hardware contours detected')
     merged=[]
     for lo,hi in sorted(ranges):
         if merged and lo<=merged[-1][1]+3:merged[-1][1]=max(hi,merged[-1][1])
@@ -361,11 +385,29 @@ def propose(files, coordinate_mode='body_endpoints', antenna_evidence=None, side
             br0=independent_back[0]
             source_width=float(np.mean([br0[1]-br0[0],br0[3]-br0[2]])*reference_scale)
         except ValueError:pass
-        detection,rows,signs,proof,source_context=source_antenna_rows(image,xr,files[side],
-            (antenna_evidence or {}).get(side),side,source_width)
+        try:
+            detection,rows,signs,proof,source_context=source_antenna_rows(image,xr,files[side],
+                (antenna_evidence or {}).get(side),side,source_width)
+        except ValueError as original:
+            if independent_back is None:
+                raise
+            try:
+                recovered=source_antenna_rows(image,xr,files[side],(antenna_evidence or {}).get(side),side,None)
+                measured=recovered[1]
+                side_widths=np.array([measured[1]-measured[0],measured[3]-measured[2]])/reference_scale
+                if side_widths.max()>1.33*side_widths.min():
+                    raise ValueError('Independent side strip widths disagree')
+                ref=_rear_reference(back,side,right if side=='left' else left,float(side_widths.mean()),3,per_band=True)
+                rear_widths=np.diff(ref[0])[::2]
+                if np.max(np.abs(rear_widths-side_widths))>max(3.,.2*side_widths.min()):
+                    raise ValueError('Source and rear band widths disagree')
+            except ValueError:
+                raise original from None
+            detection,rows,signs,proof,source_context=recovered
+            proof['independent_rear_width_remeasurement']=ref[3]
         if independent_back is not None:
             proof['independent_back_width_seed']=dict(width_pixels=source_width,source_detection=independent_back[3])
-        buttons,boxes=hardware_ranges(image)
+        buttons,boxes=hardware_ranges(image,optional=True)
         # The physical side identities are established by the named, upright
         # source capture convention, never by copying another SKU's targets.
         body=review_body if review_body is not None else body_rows(image)
@@ -382,18 +424,23 @@ def propose(files, coordinate_mode='body_endpoints', antenna_evidence=None, side
             desired=np.asarray(sbr.targets(body_reference,br,body,sh),float)
         elif coordinate_mode=='canvas_pixel_centers':
             desired=(np.asarray(br,dtype=float)+.5)/h*sh-.5
-        middle_lo=min(r[0] for r in buttons)-3;middle_hi=max(r[1] for r in buttons)+3
-        if middle_lo<=max(rows[1],desired[1])+4 or middle_hi>=min(rows[2],desired[2])-4:
-            # A narrow rim scratch can pass as a contour; retry with the buttons only.
-            try:buttons,_=hardware_ranges(image,controls_only=True)
-            except ValueError:buttons=[]
-            if buttons:
-                middle_lo=min(r[0] for r in buttons)-3;middle_hi=max(r[1] for r in buttons)+3
-                proof['hardware_ranges']='controls_only_after_rim_contour_overlap'
-            if (not buttons or middle_lo<=max(rows[1],desired[1])+4
-                    or middle_hi>=min(rows[2],desired[2])-4):
-                raise ValueError('Independent hardware contours overlap an antenna remapping zone')
         measured_lines,boundary_proof=per_column_boundaries(detection,rows,return_proof=True)
+        upper=max(float(measured_lines[1].max()),desired[1])
+        lower=min(float(measured_lines[2].min()),desired[2])
+        if buttons and (min(r[0] for r in buttons)-3<=upper+4 or max(r[1] for r in buttons)+3>=lower-4):
+            buttons,_=hardware_ranges(image,controls_only=True,optional=True)
+            proof['hardware_ranges']='controls_only_after_rim_contour_overlap'
+        if buttons and min(r[0] for r in buttons)-3>upper+4 and max(r[1] for r in buttons)+3<lower-4:
+            middle_lo=min(r[0] for r in buttons)-3;middle_hi=max(r[1] for r in buttons)+3
+        else:
+            # With uncertain buttons keep the entire span between antenna
+            # transition zones stationary, including unidentified controls.
+            margin=max(8,int(np.ceil(3*np.max(abs(desired-np.asarray(rows))))))
+            middle_lo=int(np.ceil(upper))+margin;middle_hi=int(np.floor(lower))-margin
+            if middle_lo>=middle_hi:
+                raise ValueError('No stationary rail between measured antenna transitions')
+            buttons=[[middle_lo,middle_hi]]
+            proof['hardware_ranges']='stationary_middle_without_button_localization'
         anchors=np.vstack([measured_lines[0:2],np.full(sw,middle_lo),np.full(sw,middle_hi),measured_lines[2:4]])
         antenna_indices=[0,1,4,5];outline_ranges=[]
         if coordinate_mode in ('canvas_pixel_centers',sbr.MODE):

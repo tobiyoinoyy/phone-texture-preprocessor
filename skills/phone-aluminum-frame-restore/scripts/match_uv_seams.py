@@ -245,15 +245,29 @@ def run(job_path):
         # rim end. Retry with mild along-seam smoothing of the same targets.
         attempts=[dict(along_sigma=0.,max_step_deltaE76=check['max_step_deltaE76'],face=name)]
         accepted=None
+        warning_limit=job.get('continuity_warning_limit_deltaE76')
+        smooth_warning=None
         for along_sigma in job.get('continuity_retry_sigmas',[]):
             trial=solve(float(along_sigma))
             tname,tcheck=worst(trial[3]);p95=predicted_p95(trial[0],trial[1])
             attempts.append(dict(along_sigma=float(along_sigma),max_step_deltaE76=tcheck['max_step_deltaE76'],face=tname,predicted_p95_deltaE76=p95))
             if tcheck['max_step_deltaE76']<=limit and p95<=job.get('maximum_p95_deltaE76',float('inf')):
                 accepted=trial;break
+            # When the original field would be rejected, retain the smoothest
+            # measured retry that meets both existing effect and colour limits.
+            if (warning_limit is not None and check['max_step_deltaE76']>warning_limit
+                    and tcheck['max_step_deltaE76']<=warning_limit
+                    and p95<=job.get('maximum_p95_deltaE76',float('inf'))
+                    and (smooth_warning is None or tcheck['max_step_deltaE76']<smooth_warning[0])):
+                smooth_warning=(tcheck['max_step_deltaE76'], float(along_sigma), tname)
         if accepted is not None:
             fields,bands,info,continuity=accepted
             continuity_resolution=dict(method='along_seam_smoothing',attempts=attempts,along_sigma=attempts[-1]['along_sigma'])
+        elif smooth_warning is not None:
+            step,along_sigma,name=smooth_warning
+            fields,bands,info,continuity=solve(along_sigma)
+            continuity_resolution=dict(method='smoothed_with_steep_step_warning',attempts=attempts,
+                along_sigma=along_sigma,face=name,max_step_deltaE76=step,limit=limit,warning_limit=warning_limit)
         else:
             fields,bands,info,continuity=solve(0.)
             warn=job.get('continuity_warning_limit_deltaE76')

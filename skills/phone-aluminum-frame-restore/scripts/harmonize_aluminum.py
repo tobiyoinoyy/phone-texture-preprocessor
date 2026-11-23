@@ -712,7 +712,16 @@ def process_view(item, target, defaults):
             # their real finish differences to lighting and create dark bands.
             field_lab=lab.copy();field_lab[...,0]-=profile
         if field == 'contour':
-            low, support, reliable = supported_contour_field(field_lab, fit, allowed, contour_alpha, sigma,domain.get('contour_inset_depth',5.),domain.get('contour_source_inset_limit'))
+            args = (field_lab, fit, allowed, contour_alpha, sigma, domain.get('contour_inset_depth', 5.))
+            try:
+                low, support, reliable = supported_contour_field(*args, domain.get('contour_source_inset_limit'))
+            except ValueError as error:
+                limit = domain.get('fallback_contour_source_inset_limit')
+                if limit is None or not str(error).startswith('Unsupported editable contour illumination:'):
+                    raise
+                low, support, reliable = supported_contour_field(*args, limit)
+                if profile_info is not None:
+                    profile_info = dict(profile_info, fallback_source_normal_limit_px=limit)
         elif field == 'gaussian':
             low, support, reliable = supported_field(lab, fit, allowed, sigma, src[...,3])
         elif field == 'feature_excluded_gaussian':
@@ -820,9 +829,9 @@ def process_view(item, target, defaults):
                 gamut_continuity.append(dict(name=name, **proof))
     elif any('gamut_continuity_step_L' in domain for domain in item['domains']):
         raise ValueError('Gamut continuity requires source_lightness')
-    rear_shadow=None
+    rear_shadow=item.get('rear_shadow_notice')
     if item.get('rear_shadow_correction'):
-        from phone_texture.rear_shadow import correction
+        from phone_texture.rear_shadow import InsufficientRearShadowEvidence, correction
         plan=item['rear_shadow_correction']
         if item.get('name')!='back' or mode!='source_lightness':
             raise ValueError('Rear shadow correction requires a source-lightness back')
@@ -831,12 +840,16 @@ def process_view(item, target, defaults):
         material=np.array(Image.open(plan['material_mask']).convert('L'))>0
         if material.shape!=(h,w) or np.any(material&~allowed_union):
             raise ValueError('Rear shadow material is outside the editable source')
-        extra,scope,rear_shadow=correction(out_lab[...,0],lab[...,0],material,plan)
-        desired=out_lab.copy();desired[...,0]+=extra
-        safe,limited=preserve_chroma_in_gamut(desired,lab)
-        # Preserve every other material/field exactly, including the logo.
-        out_lab[scope]=safe[scope]
-        rear_shadow.update(gamut_limited_pixels=limited,scope_outside_material_pixels=int(np.count_nonzero(scope&~material)))
+        try:
+            extra,scope,rear_shadow=correction(out_lab[...,0],lab[...,0],material,plan)
+        except InsufficientRearShadowEvidence as exc:
+            rear_shadow=dict(status='source_evidence_unavailable', reason=str(exc))
+        else:
+            desired=out_lab.copy();desired[...,0]+=extra
+            safe,limited=preserve_chroma_in_gamut(desired,lab)
+            # Preserve every other material/field exactly, including the logo.
+            out_lab[scope]=safe[scope]
+            rear_shadow.update(gamut_limited_pixels=limited,scope_outside_material_pixels=int(np.count_nonzero(scope&~material)))
     dst = src.copy()
     converted = lab_to_rgb(out_lab)
     quantization=[]

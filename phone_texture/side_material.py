@@ -411,6 +411,80 @@ def _resolve_hardware_conflicts(image,face,candidates,original_error):
 
 
 def hardware_materials(image, face):
+    try:
+        return _hardware_materials(image, face)
+    except ValueError as error:
+        if face != 'right' or not str(error).startswith(('Unresolved right hardware materials: 1,',
+                                                          'Ambiguous crossing side hardware contours')):
+            raise
+        current = np.asarray(image.convert('RGBA'))
+        tolerance = max(1.5, image.width*.015)
+        resolved = getattr(error, 'resolved_hardware', ())
+        if len(resolved)==1:
+            from .side_control_material import filled_control
+            filled = _distinct_hardware_proposals(filled_control(image,resolved[0][1]['box'][3]+1),tolerance)
+            if not filled:
+                filled=_distinct_hardware_proposals(filled_control(image,resolved[0][1]['box'][3]+1,
+                                                      channel_witnesses=True),tolerance)
+            if len(filled)==1 and not np.any(resolved[0][0]&filled[0][0]):
+                return [resolved[0],filled[0]]
+        # A blue/anodized rail can retain the capsule in a native channel when
+        # luminance blends it into metal. Check each proposal on independent
+        # source channels, including both end caps, before using its mask.
+        planes = cv2.split(current[..., :3])
+        distances = [ndimage.distance_transform_edt(cv2.Canny(
+            cv2.GaussianBlur(plane, (0, 0), max(1., image.width*.008)), 4, 12) == 0)
+            for plane in planes]
+        certified = []
+        for channel, plane in enumerate(planes):
+            try:
+                candidates = _hardware_materials(image, face, plane)
+            except ValueError:
+                continue
+            verified = []
+            for mask, proof in candidates:
+                existing = [entry for entry in resolved
+                    if np.count_nonzero(mask & entry[0]) > .8*min(mask.sum(), entry[0].sum())]
+                if len(existing) == 1:
+                    verified.append(existing[0])
+                    continue
+                yy, xx = np.nonzero(mask & ~ndimage.binary_erosion(mask))
+                x, y, x1, y1 = proof['box']
+                radius = (x1-x)/2
+                parts = (xx < x+radius/2, xx > x1-radius/2, yy < y+radius, yy > y1-radius)
+                witnesses = []
+                for other, distance in enumerate(distances):
+                    supported = distance[yy, xx] <= tolerance
+                    if supported.mean() >= .95 and all(p.any() and supported[p].mean() >= .75 for p in parts):
+                        witnesses.append(other)
+                if channel not in witnesses or len(witnesses) < 2:
+                    break
+                verified.append((mask, dict(proof, source_channel=channel, edge_witness_channels=witnesses)))
+            if (len(verified) == 2 and not np.any(verified[0][0] & verified[1][0])
+                    and all(any(entry is present for present in verified) for entry in resolved)
+                    and (any(verified[1] is entry for entry in resolved)
+                         or _hardware_material_step(current, verified[1][1]['box'], tolerance)['accepted'])):
+                certified.append(verified)
+        if not certified:
+            raise
+        for pair in zip(*certified):
+            try:
+                if len(_distinct_hardware_proposals(list(pair), tolerance)) != 1:
+                    raise error
+            except ValueError:
+                raise error from None
+        return certified[0]
+
+
+def lighting_hardware(image, face):
+    """A lighting domain does not require certifying every button boundary."""
+    try:
+        return hardware_materials(image,face), None
+    except ValueError as error:
+        return _hardware_materials(image,face,lighting_only=True), str(error)
+
+
+def _hardware_materials(image, face, gray=None, *, lighting_only=False):
     """Resolve this studio profile's complete capsule components independently.
 
     Recognition may smooth a working signal and bridge short edge gaps. The
@@ -420,7 +494,8 @@ def hardware_materials(image, face):
     if face not in ('left', 'right'):
         raise ValueError('Side hardware requires left or right')
     a = np.asarray(image.convert('RGBA')); h, w = a.shape[:2]
-    gray = cv2.cvtColor(a[..., :3], cv2.COLOR_RGB2GRAY)
+    if gray is None:
+        gray = cv2.cvtColor(a[..., :3], cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(cv2.GaussianBlur(gray, (0, 0), max(1., w*.008)), 4, 12)
     distance = ndimage.distance_transform_edt(edges == 0)
     candidates = []; refinements=[]; blemished=[]; gy, gx = np.indices((h, w))
@@ -482,6 +557,18 @@ def hardware_materials(image, face):
         if refined is None:continue
         mask,new_proof=refined;proof=dict(proof,**new_proof);proof['pixels']=int(mask.sum())
         candidates.append((mask,proof))
+    if lighting_only:
+        # Pick one photographed outer contour per co-located control. When
+        # the candidates cross substantially, the rail's broad light field
+        # can pass over it without declaring a separate material or moving it.
+        controls=[]
+        for group in _hardware_candidate_groups(candidates):
+            outer,proof=max((candidates[i] for i in group),key=lambda item:item[1]['pixels'])
+            if all(np.count_nonzero(candidates[i][0]&outer)>=.90*candidates[i][0].sum()
+                   for i in group):
+                controls.append((outer,dict(proof,lighting_only_candidates=len(group))))
+        return sorted(controls,key=lambda item:item[1]['box'][1]) if not any(
+            (a[0]&b[0]).any() for i,a in enumerate(controls) for b in controls[i+1:]) else []
     # Keep complete outer contours ahead of nested grooves. Resolve an old
     # conflict only with a unique, independently certified source material.
     try:
@@ -521,7 +608,9 @@ def hardware_materials(image, face):
                 mask,new_proof=refined
                 if any(np.any(mask&m) for m,_ in selected):continue
                 selected.append((mask,dict(proof,**new_proof,pixels=int(mask.sum()),blemished_rim_fallback=True)))
-            if len(selected)!=expected:raise missing
+            if len(selected)!=expected:
+                missing.resolved_hardware = selected
+                raise missing
             selected.sort(key=lambda entry: entry[1]['box'][1])
     if len(selected) != expected:
         raise ValueError(f'Unresolved {face} hardware materials: {len(selected)}, expected {expected}')

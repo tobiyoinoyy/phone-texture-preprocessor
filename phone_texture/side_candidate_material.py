@@ -96,14 +96,20 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
                 region=(yy>=lines[2*i])&(yy<lines[2*i+1])&remaining
                 materials.append(('antenna_'+str(i),region,[max(6,(rows[2*i+1]-rows[2*i])*.30),max(8,w*.20)]))
                 remaining &= ~region
-        buttons,boxes=hardware_ranges(image);proof.update(antenna=antenna_proof,hardware_boxes=boxes)
+        buttons,boxes=hardware_ranges(image,optional=True);proof.update(antenna=antenna_proof,hardware_boxes=boxes)
         # Structural locking boxes intentionally include weak edge fragments;
         # they must never be used as material labels or independent color islands.
-        from .side_material import hardware_materials
-        components=hardware_materials(image,face);hw=np.zeros((h,w),bool)
+        from .side_material import lighting_hardware
+        components,notice=lighting_hardware(image,face)
+        if notice:
+            proof['button_lighting_notice']=notice
+        hw=np.zeros((h,w),bool)
         proof['hardware_materials']=[]
         for index,(region,component_proof) in enumerate(components):
-            if np.any(region&~remaining):raise ValueError('Hardware material crosses antenna/paper')
+            if np.any(region&~remaining):
+                notice='按键候选跨入天线或贴纸，沿用实拍位置及边框光照'
+                proof['button_lighting_notice']=notice
+                continue
             name=f'hardware_{index}';hw |= region
             materials.append((name,region,[max(6,h*.012),max(2,w*.08)]))
             # Fit each component from its own interior; a groove or a separate
@@ -113,6 +119,12 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
             proof['hardware_materials'].append(dict(name=name,**component_proof))
         remaining &= ~hw
         fit_masks['main_surface']=remaining&~ndimage.binary_dilation(hw,iterations=max(2,int(w*.025)))
+        if notice and len(proof['hardware_materials']) != (4 if face=='left' else 2):
+            # Without a complete component set, omit the central key spine
+            # from fitting. Keep two nearby metal rails for local light support.
+            xx=np.arange(w)[None,:]
+            fit_masks['main_surface'] &= abs(xx-(w-1)/2)>min(w*.07,8)
+
     if face=='back':
         # Camera glass/flash components are distinct from aluminum and do not
         # enter metal fitting. Shape + position are required, not darkness alone.

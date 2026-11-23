@@ -18,7 +18,7 @@ def process_case(args):
         report = iphone17.run(source, case, output/name, single_name=name, cpu_threads=1)
         complete = report.get('processed') == 1
         if complete:
-            face_stages = {f: 'antenna_and_buttons' if f in ('left','right') else
+            face_stages = report.get('face_processing') or {f: 'antenna_and_buttons' if f in ('left','right') else
                            'bottom_registration' if f == 'bottom' else 'lighting' for f in pipeline.FACES}
         else:
             strict_error = report.get('error')
@@ -30,6 +30,10 @@ def process_case(args):
         candidate = Path(report['candidate'])
         if set(report['final_sha256']) != set(pipeline.FACES):
             raise ValueError('标准版六面校验记录不完整')
+        from .iphone17_model_finish import verified_frame_finish
+        seam_checked = verified_frame_finish(report.get('model_frame_finish'), report['final_sha256'])
+        if complete and not seam_checked:
+            raise ValueError('标准版成品缺少与图片匹配的四角接缝记录')
         pending = output/('.'+name+'.pending')
         pending.mkdir()
         for face in pipeline.FACES:
@@ -38,18 +42,31 @@ def process_case(args):
             if w.sha(target) != report['final_sha256'][face]:
                 raise ValueError('标准版候选在导出时发生变化')
         pending.rename(output/name)
+        degraded = set(report.get('degraded_lighting', {}))
         lit = {f for f, stage in face_stages.items() if stage in
-               ('lighting','antenna','antenna_and_buttons','bottom_registration')}
+               ('lighting','antenna','buttons','antenna_and_buttons','bottom_registration','bottom_registration_unverified')} - degraded
         geom = all(stage not in ('source_matte','frame_without_paper_check') for stage in face_stages.values())
+        geometry_status = ('degraded' if report.get('degraded_geometry') else 'complete') if geom else 'partial'
         row = dict(sku=name, model='iphone17', seconds=time.monotonic()-started,
                    status='processed_needs_visual_review' if complete else 'source_preserved_needs_review',
                    six_faces_processed=complete, six_faces_generated=True,
-                   final_sha256=report['final_sha256'], structural_alignment_applied=complete,
-                   seam_accepted=complete, stage_status=dict(geometry='complete' if geom else 'partial',
-                       lighting='complete' if len(lit)==6 else 'partial' if lit else 'blocked',
-                       structure='complete' if complete else 'blocked', seam='complete' if complete else 'blocked'),
+                   final_sha256=report['final_sha256'], structural_alignment_applied=complete or 'bottom_registration' in face_stages.values(),
+                   strict_structure_verified=complete and all(face_stages[f]=='antenna_and_buttons' for f in ('left','right')),
+                   seam_accepted=seam_checked, frame_colors_ready_for_backfill=seam_checked,
+                   model_camera_registration=report.get('model_camera_registration'),
+                   back_ready_for_backfill=bool(report.get('model_camera_registration') and
+                       report['model_camera_registration'].get('output_sha256') == report['final_sha256']['back']),
+                   model_frame_finish=report.get('model_frame_finish'), stage_status=dict(geometry=geometry_status,
+                       lighting='complete' if len(lit)==6 else 'degraded' if len(lit|degraded)==6 else
+                                'partial' if lit or degraded else 'blocked',
+                       structure='complete' if complete else 'blocked', seam='complete' if seam_checked else 'blocked'),
+                   item_effect_warnings=report.get('item_effect_warnings', []) + [dict(code='frame_seam_correction_gradient', face=item['face'],
+                       message='四角色差通过，局部校色过渡较陡', error=str(round(item['max_step_deltaE76'], 2)))
+                       for item in (report.get('model_frame_finish') or {}).get('continuity_warnings', [])],
                    blocked_checks=report.get('blocked_checks', []), face_processing=face_stages,
-                   per_face_stages={f: dict(selected_stage=stage, lighting='complete' if f in lit else 'blocked')
+                   degraded_lighting=report.get('degraded_lighting', {}),
+                   per_face_stages={f: dict(selected_stage=stage, lighting='complete' if f in lit else
+                                                'degraded' if f in degraded else 'blocked')
                                     for f, stage in face_stages.items()})
     except Exception as exc:
         row = dict(sku=name, model='iphone17', status='failed', error=str(exc),

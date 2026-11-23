@@ -4,7 +4,7 @@ A dark metal rim can be darker than the plastic antenna. Both edges then
 reverse polarity together; isolated per-column same-sign maxima are unsafe.
 """
 import numpy as np
-from scipy.ndimage import gaussian_filter1d, label
+from scipy.ndimage import gaussian_filter1d, label, median_filter
 
 # Unmeasured opaque end columns allowed per antenna end (shaded end cap).
 ENDPOINT_EXTENSION_MAX_PX = 8
@@ -110,18 +110,213 @@ def _refine_pair_phase(gradient, chosen, reliable, polarity):
                        columns=refined,maximum_shift_px=maximum)
 
 
-def trace_boundaries(image, rows, bands=(0,1), *, _observer=None):
-    result,proof=_trace(image,rows,bands,_observer,())
+def _fit_central_peaks(peaks, gradient, alpha, x, center, sign):
+    w=len(x)
+    fit=center&(alpha[peaks,x]>=240)&(gradient[peaks,x]*sign>.5)
+    for _ in range(4):
+        if fit.sum()<w*.45:raise ValueError('Insufficient central paired antenna support')
+        c=np.polyfit(x[fit]/w,peaks[fit],2);pred=np.polyval(c,x/w)
+        fit &= abs(peaks-pred)<=2
+    if np.percentile(abs(peaks[fit]-pred[fit]),95)>1.5:
+        raise ValueError('Unstable central antenna contour')
+    return pred
+
+
+def _material_crossing_curve(colors, alpha, x, center, pair, index):
+    """Fit native half-contrast crossings between this strip and its neighbouring metal."""
+    width=pair[1]-pair[0]
+    row=int(round(pair[index]))
+    pad=max(2,round(width*.2))
+    reach=max(pad+2,round(width*.55))
+    inner=colors[int(np.ceil(pair[0]))+pad:int(np.floor(pair[1]))-pad+1]
+    outer=colors[row-reach:row-pad] if index==0 else colors[row+pad+1:row+reach+1]
+    if not len(inner) or not len(outer):
+        raise ValueError('Material plateaus are too short')
+    plastic=np.median(inner,axis=0)
+    metal=np.median(outer,axis=0)
+    delta=plastic-metal
+    magnitude=np.linalg.norm(delta,axis=1)
+    direction=delta/np.maximum(magnitude[:,None],1e-8)
+    radius=max(4,round(width*.35))
+    start=row-radius
+    level=((colors[start:row+radius+1]-(plastic+metal)/2)*direction).sum(axis=2)
+    if index==1:
+        level=-level
+    crossing=(level[:-1]<=0)&(level[1:]>0)
+    slope=np.diff(level,axis=0)
+    # Require the photographed material transition to exceed the variability
+    # inside both neighbouring plateaus. Multiple crossings are ambiguous.
+    scatter=lambda patch,base:np.median(abs(((patch-base)*direction).sum(axis=2)),axis=0)
+    noise=np.maximum(scatter(inner,plastic),scatter(outer,metal))
+    k=crossing.argmax(axis=0)
+    fit=center&(crossing.sum(axis=0)==1)&(magnitude>np.maximum(3,4*noise))&(slope[k,x]>.75)
+    fit &= (alpha[start+k,x]>=240)&(alpha[start+k+1,x]>=240)
+    rows=start+k-level[k,x]/np.maximum(.001,slope[k,x])
+    mid=fit&(x>=len(x)*.4)&(x<len(x)*.6)
+    local_check=np.median(level[:,(x>=len(x)*.4)&(x<len(x)*.6)],axis=1)
+    central_cross=np.flatnonzero((local_check[:-1]<=0)&(local_check[1:]>0))
+    if len(central_cross)!=1 or abs(start+central_cross[0]-local_check[central_cross[0]]/
+            (local_check[central_cross[0]+1]-local_check[central_cross[0]])-row)>2.5 or not mid.any():
+        raise ValueError('Native material transition disagrees with central source reading')
+    native=fit.copy()
+    for _ in range(4):
+        if fit.sum()<len(x)*.45:
+            raise ValueError('Insufficient native paired material coverage')
+        pred=np.polyval(np.polyfit(x[fit]/len(x),rows[fit],2),x/len(x))
+        fit &= abs(rows-pred)<=2
+    if fit.sum()<len(x)*.45 or np.percentile(abs(rows[fit]-pred[fit]),95)>1.5:
+        # Local dents need not follow a quadratic. Alternating columns must
+        # independently resolve the same contour before it can guide a trace.
+        estimates=[]
+        for parity in (0,1):
+            cols=np.flatnonzero(native & (x%2==parity))
+            if len(cols)<len(x)*.225 or np.diff(cols).max(initial=0)>max(6,.08*len(x)):
+                raise ValueError('Material transition is not stable across central columns')
+            estimates.append(np.interp(x,cols,rows[cols]))
+        if np.percentile(np.abs(estimates[0][native]-estimates[1][native]),95)>1.5:
+            raise ValueError('Independent native material traces disagree')
+        local=(estimates[0]+estimates[1])/2
+        pred[center]=local[center]
+    return pred
+
+
+def _windowed_edge_guide(colors, alpha, x, center, pair, idx):
+    # Use disjoint metal windows only to aim the native paired-column search.
+    # Each window locates a signed transition independently of its neighbours.
+    row=int(round(pair[idx]))
+    r=max(4,round((pair[1]-pair[0])*.45))
+    positions=[];xs=[]
+    for cols in np.array_split(x[center],9):
+        if len(cols)<3 or np.min(alpha[row-r:row+r+1,cols])<240:
+            continue
+        profile=np.median(colors[row-r:row+r+1,cols],axis=1)
+        outer=np.median(profile[:3],axis=0)
+        inner=np.median(profile[-3:],axis=0)
+        delta=inner-outer
+        norm=np.linalg.norm(delta)
+        if norm<5:continue
+        line=(profile-(inner+outer)/2)@(delta/norm)
+        hits=np.flatnonzero((line[:-1]<=0)&(line[1:]>0))
+        if len(hits)!=1:continue
+        k=hits[0];rise=line[k+1]-line[k]
+        if rise<.75:continue
+        y=row-r+k-line[k]/rise
+        if abs(y-row)<=r-2:
+            xs.append(cols.mean());positions.append(y)
+    if len(xs)<7 or abs(np.median(positions)-row)>2.5:
+        raise ValueError('Independent metal windows do not confirm the source boundary')
+    xs=np.asarray(xs);positions=np.asarray(positions)
+    good=np.ones(len(xs),dtype=bool)
+    while good.sum()>=7:
+        alternatives=[]
+        for degree in (1,2):
+            errors=[]
+            for j in np.flatnonzero(good):
+                keep=good.copy()
+                keep[j]=False
+                model=np.polyfit(xs[keep],positions[keep],degree)
+                errors.append(abs(np.polyval(model,xs[j])-positions[j]))
+            alternatives.append(errors)
+        errors=min(alternatives,key=max)
+        if max(errors)<=1.5 and np.ptp(xs[good])>=.4*len(x):
+            return np.interp(x,xs[good],positions[good])
+        good[np.flatnonzero(good)[int(np.argmax(errors))]]=False
+    raise ValueError('Metal-window contour fails withheld source observations')
+
+
+def _neighbour_peak_curve(gradient, alpha, x, center, sign, row, lo, hi):
+    # A scratch in one column may be stronger than the actual strip. First
+    # measure a coherent neighbourhood, then refit native signed RGB maxima.
+    window=gradient[lo:hi]*sign
+    guide=lo+np.argmax(median_filter(window,size=(1,7)),axis=0)
+    middle=(x>=len(x)*.4)&(x<len(x)*.6)
+    if abs(np.median(guide[middle])-row)>2:
+        raise ValueError('Neighbour curve does not match the observed central boundary')
+    local=(window>=np.roll(window,1,axis=0))&(window>=np.roll(window,-1,axis=0))
+    local[[0,-1]]=False
+    near=abs(np.arange(lo,hi)[:,None]-guide)<=2
+    scores=np.where(local&near,window,-np.inf)
+    peaks=lo+scores.argmax(axis=0)
+    measured=center&np.isfinite(scores.max(axis=0))
+    return _fit_central_peaks(peaks,gradient,alpha,x,measured,sign)
+
+
+def _rgb_half_pairs(colors, alpha, basis, chosen, center, central_sign):
+    """Read missing boundaries on each native RGB column with two-sided material support."""
+    h,w=alpha.shape
+    observed=np.isfinite(chosen).all(axis=0)
+    additions=[]
+    for col in np.flatnonzero(~observed):
+        expected=basis[:,col]
+        a,b=np.rint(expected).astype(int)
+        width=b-a
+        inset=max(2,round(.22*width))
+        flank=max(4,round(.5*width))
+        if width<6 or a-flank<1 or b+flank>=h-1 or a+inset>=b-inset:
+            continue
+        inside=colors[a+inset:b-inset+1,col]
+        metal=[colors[a-flank:a-2,col],colors[b+3:b+flank+1,col]]
+        if min(map(len,metal))<2:
+            continue
+        plastic=np.median(inside,axis=0)
+        pair=[];axes=[]
+        for k,(segment,target) in enumerate(zip(metal,expected)):
+            outer=np.median(segment,axis=0)
+            color=plastic-outer
+            norm=np.linalg.norm(color)
+            axis=color/max(.001,norm)
+            noise=max(np.median(abs((inside-plastic)@axis)),np.median(abs((segment-outer)@axis)),1.)
+            if norm<max(5,4*noise) or (center[col] and np.sign(color.sum())!=central_sign[0]):
+                break
+            start=int(np.floor(target))-3
+            profile=(colors[start:int(np.ceil(target))+5,col]-(outer+plastic)/2)@axis
+            if k==1:profile=-profile
+            cross=np.flatnonzero((profile[:-1]<=0)&(profile[1:]>0))
+            if len(cross)!=1:
+                break
+            idx=int(cross[0])
+            slope=profile[idx+1]-profile[idx]
+            if slope<.75 or alpha[start+idx:start+idx+2,col].min()<128:
+                break
+            pair.append(start+idx-profile[idx]/slope)
+            axes.append(axis)
+        if len(pair)==2 and axes[0]@axes[1]>.85 and abs(pair[1]-pair[0]-width)<=3:
+            additions.append((int(col),pair))
+    # Only extend the evidence with a run of actual, mutually consistent
+    # paired observations. An isolated noise crossing does not vote.
+    verified=[]
+    for col,pair in additions:
+        near=[p for c,p in additions if 0<abs(c-col)<=2 and np.max(abs(np.subtract(p,pair)))<=2]
+        native=np.flatnonzero(observed & (abs(np.arange(w)-col)<=2))
+        if not near and not any(np.max(abs(chosen[:,c]-pair))<=2 for c in native):
+            continue
+        chosen[:,col]=pair
+        verified.append(dict(column=col,rows=pair))
+    return verified
+
+
+def trace_boundaries(image, rows, bands=(0,1), *, _observer=None, recover_center=True):
+    def run(hold,observer):
+        try:
+            return _trace(image,rows,bands,observer,hold,False)
+        except ValueError:
+            if not recover_center:
+                raise
+        try:
+            return _trace(image,rows,bands,observer,hold,True)
+        except ValueError as original:
+            if 'opaque antenna span' not in str(original).lower() and 'endpoint' not in str(original).lower():
+                raise
+        return _trace(image,rows,bands,observer,hold,True,bounded_guide=True)
+    result,proof=run((),_observer)
     sides=sorted({item['side'] for item in proof['endpoint_shape_weak']})
     if sides and len(bands)>1:
-        # Both bands end in the same shaded cap. A weak end in one band holds
-        # that end in every band, so noise there is never measured as strip.
-        result,proof=_trace(image,rows,bands,None,tuple(sides))
+        result,proof=run(tuple(sides),None)
     proof['endpoint_held_sides']=sides
     return result,proof
 
 
-def _trace(image, rows, bands, _observer, hold):
+def _trace(image, rows, bands, _observer, hold, recover_center, bounded_guide=False):
     a=np.asarray(image.convert('RGBA'));h,w=a.shape[:2];x=np.arange(w)
     rows=np.asarray(rows,float)
     if rows.shape!=(4,) or not np.isfinite(rows).all() or np.any(np.diff(rows)<=2):
@@ -140,13 +335,32 @@ def _trace(image, rows, bands, _observer, hold):
             sign=np.sign(np.median(gradient[int(round(row)),int(w*.4):int(w*.6)]))
             if sign==0:raise ValueError('Antenna central polarity is ambiguous')
             central_sign.append(sign);peaks=lo+np.argmax(gradient[lo:hi]*sign,axis=0)
-            fit=center&(a[peaks,x,3]>=240)&(gradient[peaks,x]*sign>.5)
-            for _ in range(4):
-                if fit.sum()<w*.45:raise ValueError('Insufficient central paired antenna support')
-                c=np.polyfit(x[fit]/w,peaks[fit],2);pred=np.polyval(c,x/w)
-                fit &= abs(peaks-pred)<=2
-            if np.percentile(abs(peaks[fit]-pred[fit]),95)>1.5:
-                raise ValueError('Unstable central antenna contour')
+            try:
+                pred=_fit_central_peaks(peaks,gradient,a[...,3],x,center,sign)
+            except ValueError:
+                if not recover_center:
+                    raise
+                try:
+                    pred=_neighbour_peak_curve(gradient,a[...,3],x,center,sign,row,lo,hi)
+                except ValueError:
+                    try:
+                        pred=_material_crossing_curve(rgb_colors,a[...,3],x,center,pair,len(basis))
+                    except ValueError:
+                        # Suppress isolated dents in the search guide. All
+                        # selected column pairs below still use native RGB.
+                        y0=max(0,int(pair[0])-2*int(width))
+                        y1=min(h,int(pair[1])+2*int(width)+1)
+                        guided=median_filter(rgb_colors[y0:y1],size=(1,5,1))
+                        try:
+                            pred=y0+_material_crossing_curve(guided,a[y0:y1,:,3],x,center,pair-y0,len(basis))
+                        except ValueError:
+                            pred=_windowed_edge_guide(rgb_colors,a[...,3],x,center,pair,len(basis))
+            if bounded_guide:
+                # A quadratic fitted to the middle can miss a straight rail
+                # at either end. Use the last central sample as the *search
+                # guide*, then require native paired observations as usual.
+                core=x[center]
+                pred=np.interp(x,core,pred[core])
             basis.append(pred)
         if central_sign[0]*central_sign[1]>=0:
             raise ValueError('Antenna requires opposing central material edges')
@@ -172,6 +386,7 @@ def _trace(image, rows, bands, _observer, hold):
             if candidates:
                 _,_,y0,y1,sign=max(candidates);chosen[:,col]=y0,y1;polarity[col]=sign
         color_evidence=_color_continuation(rgb_colors,a[...,3],basis,chosen)
+        half_pairs=_rgb_half_pairs(rgb_colors,a[...,3],basis,chosen,center,central_sign) if recover_center else []
         if _observer is not None:
             # Diagnostic copies cannot alter the candidates or disable gates.
             observed=chosen.copy();observed.setflags(write=False)
@@ -248,7 +463,7 @@ def _trace(image, rows, bands, _observer, hold):
             support_columns=x[reliable].tolist(),central_polarities=central_sign,
             maximum_opaque_gap_px=max([int(np.sum(missing==i)) for i in range(1,count+1)],default=0),
             endpoint_extended_columns=extended,endpoint_extension_max_px=ENDPOINT_EXTENSION_MAX_PX,
-            rgb_continuation=color_evidence,subpixel_phase=phase,endpoint_shape=shape_evidence,
+            rgb_continuation=color_evidence,native_rgb_half_pairs=half_pairs,subpixel_phase=phase,endpoint_shape=shape_evidence,
             endpoint_shape_weak_sides=shape_warnings))
     result=np.asarray(lines)
     if np.any(np.diff(result,axis=0)<=0):raise ValueError('Paired antenna boundaries cross')

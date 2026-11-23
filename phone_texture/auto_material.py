@@ -454,7 +454,7 @@ def reference_box(a,mask):
     raise ValueError('No complete opaque source reference patch for material domain')
 
 
-def front_metal(image):
+def front_metal(image, *, allow_partial=False):
     """Measure the glass/rim transition on four straight source edges."""
     a=np.array(image.convert('RGBA'));h,w=a.shape[:2];opaque=a[...,3]>=128
     distance=ndimage.distance_transform_edt(np.pad(a[...,3]>=128,1))[1:-1,1:-1]
@@ -479,22 +479,41 @@ def front_metal(image):
         alpha_samples=a[y[:,None],xx[None,:],3] if edge_index<2 else a[xx[:,None],x[None,:],3].T
         opaque_support=np.mean(alpha_samples>=240,axis=0)
         valid=(offsets>=(6 if edge_index<2 else 1))&(opaque_support>=.8)
-        if not valid.any():raise ValueError('Front glass/metal transition lacks opaque support')
+        if not valid.any():
+            if allow_partial:
+                transitions.append(-1.)
+                support_checks.append(0.)
+                continue
+            raise ValueError('Front glass/metal transition lacks opaque support')
         peaks,_=find_peaks(values,height=max(.5,float(values[valid].max())*.30))
         peaks=peaks[valid[peaks]]
-        if not len(peaks):raise ValueError('Front glass/metal transition is uncertain')
+        if not len(peaks):
+            if allow_partial:
+                transitions.append(-1.)
+                support_checks.append(0.)
+                continue
+            raise ValueError('Front glass/metal transition is uncertain')
         selected=int(peaks[0] if edge_index<2 else peaks[np.argmax(values[peaks])])
         transitions.append(float(np.abs(xx[selected]-edge)))
         support_checks.append(float(opaque_support[selected]))
     thickness=np.array(transitions)+1
-    if np.any(thickness<2) or np.any(thickness>w*.045):raise ValueError('Implausible front metal rim thickness')
+    valid_width = (thickness>=2)&(thickness<=w*.045)
+    if not allow_partial and not valid_width.all():raise ValueError('Implausible front metal rim thickness')
+    if allow_partial:
+        if valid_width.sum()<2:
+            raise ValueError('Fewer than two front metal edges have usable source evidence')
+        thickness[~valid_width]=0.
     # Photographing the bevel exposes different widths on the four edges.
     # Use the local contour normal to interpolate only around curved corners;
     # a side width must not extend across bottom glass or leave a top rim out.
     dy,dx=np.gradient(ndimage.gaussian_filter(distance,3));total=np.maximum(np.abs(dx)+np.abs(dy),1e-8)
     vertical=np.where(dx>=0,thickness[0],thickness[1]);horizontal=np.where(dy>=0,thickness[2],thickness[3])
     local=(np.abs(dx)*vertical+np.abs(dy)*horizontal)/total
-    return (a[...,3]>0)&(distance<=local),dict(method='four_source_glass_rim_gradients_v3_opaque_boundary',opaque_boundary_support=support_checks,edge_order=['left','right','top','bottom'],thickness_px=thickness.tolist(),edge_measurements_px=transitions)
+    observed = (a[...,3]>0)&(distance<=local)
+    if allow_partial:
+        observed &= (((vertical>0)&(abs(dx)/total>=.92)) |
+                     ((horizontal>0)&(abs(dy)/total>=.92)))
+    return observed,dict(method='four_source_glass_rim_gradients_v3_opaque_boundary',opaque_boundary_support=support_checks,edge_order=['left','right','top','bottom'],thickness_px=thickness.tolist(),edge_measurements_px=transitions)
 
 
 def rear_panel(image):
@@ -728,14 +747,20 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
             region=(yy>=lines[2*i])&(yy<lines[2*i+1])&remaining
             materials.append(('antenna_'+str(i),region,[max(6,(rows[2*i+1]-rows[2*i])*.30),max(8,w*.20)]))
             remaining &= ~region
-        buttons,boxes=hardware_ranges(image);proof.update(antenna=antenna_proof,hardware_boxes=boxes)
+        buttons,boxes=hardware_ranges(image,optional=True);proof.update(antenna=antenna_proof,hardware_boxes=boxes)
         # Structural locking boxes intentionally include weak edge fragments;
         # they must never be used as material labels or independent color islands.
-        from .side_material import hardware_materials
-        components=hardware_materials(image,face);hw=np.zeros((h,w),bool)
+        from .side_material import lighting_hardware
+        components,notice=lighting_hardware(image,face)
+        if notice:
+            proof['button_lighting_notice']=notice
+        hw=np.zeros((h,w),bool)
         proof['hardware_materials']=[]
         for index,(region,component_proof) in enumerate(components):
-            if np.any(region&~remaining):raise ValueError('Hardware material crosses antenna/paper')
+            if np.any(region&~remaining):
+                notice='按键候选跨入天线或贴纸，沿用实拍位置及边框光照'
+                proof['button_lighting_notice']=notice
+                continue
             name=f'hardware_{index}';hw |= region
             materials.append((name,region,[max(6,h*.012),max(2,w*.08)]))
             # Fit each component from its own interior; a groove or a separate
@@ -745,6 +770,12 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
             proof['hardware_materials'].append(dict(name=name,**component_proof))
         remaining &= ~hw
         fit_masks['main_surface']=remaining&~ndimage.binary_dilation(hw,iterations=max(2,int(w*.025)))
+        if notice and len(proof['hardware_materials']) != (4 if face=='left' else 2):
+            # Without a complete component set, omit the central key spine
+            # from fitting. Keep two nearby metal rails for local light support.
+            xx=np.arange(w)[None,:]
+            fit_masks['main_surface'] &= abs(xx-(w-1)/2)>min(w*.07,8)
+
     if face=='back':
         # Camera glass/flash components are distinct from aluminum and do not
         # enter metal fitting. Shape + position are required, not darkness alone.
@@ -797,7 +828,18 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
                 rear_proof[side]['side_geometry_sha256']=digest(companions[side])
         proof['rear_plastic_materials']=rear_proof
         if rim.sum()>=30:materials.append(('rear_perimeter',rim,[max(6,h*.012),max(2,w*.004)]));remaining &= ~rim
-        panel,panel_proof=rear_panel(image);proof['rear_panel']=panel_proof
+        try:
+            panel,panel_proof=rear_panel(image)
+        except ValueError as error:
+            if str(error)=='Rear panel corner lacks source seam support':
+                # Body contour and plastic antenna bands have already been
+                # measured on this crop. The unconfirmed panel corner must not
+                # block mild lighting of the independently identified rim.
+                verified_rim = rim & body_contour & ~label_fit
+                if np.count_nonzero(verified_rim & (a[...,3]>=240))>=100:
+                    save_mask(folder/'rear_perimeter-provisional.png',verified_rim)
+            raise
+        proof['rear_panel']=panel_proof
         from .rear_lighting_features import dark_rear_mark
         mark,mark_proof=dark_rear_mark(a,panel&~label_fit)
         proof['rear_mark_fit_exclusion']=mark_proof
@@ -1028,7 +1070,9 @@ def lighting_scope(source,face,job,folder):
                 if side=='left':witness[:,w//2:]=False
                 else:witness[:,:w//2]=False
                 key=f'rear_button_{side}_{index}'
-                if witness.sum()<20:raise ValueError('Rear button lacks independent source material samples')
+                if witness.sum()<20:
+                    spec.setdefault('button_effect_notes',[]).append(key)
+                    continue
                 spec['local_checks'][key]=dict(mask=save_mask(folder/(key+'.png'),witness),
                     min_L=0,max_L=100,percentile=10,max_added_step_L=1.25,step_axis=0,
                     bounds_basis='Continuous added illumination around source-detected protrusion; no button protection')
@@ -1199,7 +1243,7 @@ def lighting_scope(source,face,job,folder):
         # Source-only witnesses for the old false hardware rectangles. Every
         # component is checked separately; a whole-side median hides small blocks.
         from .auto_structure import hardware_ranges
-        _,boxes=hardware_ranges(image)
+        _,boxes=hardware_ranges(image,optional=True)
         fragments=np.zeros((h,w),bool)
         for x0,y0,x1,y1 in boxes:fragments[y0:y1,x0:x1]=True
         metal=domain_mask('main_surface')&(a[...,3]>=240)

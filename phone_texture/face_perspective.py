@@ -55,6 +55,8 @@ def _profile_peak(profile, lo, hi, pick, strength=.5):
     seg = profile[lo:hi]
     if not len(seg) or not np.isfinite(seg).all() or seg.max() <= 0:
         return None
+    if pick in ('outer_low', 'outer_high') and seg.max() < .8:
+        return None
     if pick == 'outer_low':      # first strong peak from the low end
         strong = np.nonzero(seg >= max(.8, strength*seg.max()))[0]
         i = int(strong[0])

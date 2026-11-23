@@ -147,6 +147,53 @@ def prepare_source_body_reference(case, sku, files, manifest, metadata):
     return options, audit, warnings
 
 
+def _continuity_candidate(error, job, path, face, source, scope, allowed, paper, profile):
+    """Retry the same measured metal field after a local continuity rejection."""
+    import re
+    from .shadow_lift_profile import NAME
+    target_domains = {'left': 'main_surface', 'right': 'main_surface', 'back': 'rear_perimeter'}
+    def local_step(failure):
+        return re.fullmatch(
+            r'Lighting (?:pixel )?correction discontinuity at '
+            r'(?:antenna_[01]_(?:left|right)_metal|rear_button_(?:left|right)_[0-9]+): [0-9.]+ L',
+            str(failure))
+    if profile != NAME or face not in target_domains or not local_step(error):
+        raise error
+    measure = lighting_review.measure_perimeter if face == 'back' else lighting_review.measure_local
+    for mode in ('rounding', 'smooth_field', 'moderate_lift'):
+        trial = copy.deepcopy(job)
+        view, = trial['views']
+        material = next((d for d in view['domains'] if d['name'] == target_domains[face]), None)
+        if material is None:
+            raise error
+        # Use the complete independently classified material. The verification
+        # patches are never used to select the pixels that will change.
+        view.setdefault('quantization_continuity', []).append(
+            dict(mask=material['mask'], max_added_step_L=1.25))
+        if mode == 'smooth_field':
+            material.update(correction_smooth=4., gamut_continuity_step_L=.4,
+                            gamut_continuity_follow_field=True)
+        elif mode == 'moderate_lift':
+            material['strength'][0] *= .75
+        folder = path.parent / ('continuity-' + mode)
+        folder.mkdir()
+        trial.update(output_dir=str(folder/'output'), records_dir=str(folder/'records'))
+        config = folder/'job.json'
+        write(config, trial)
+        report = lighting.run('aluminum', config)
+        output = folder/'output'/(face + '.png')
+        try:
+            effect = measure_effect(measure, scope, source, output, allowed, paper, profile)
+        except ValueError as next_error:
+            if local_step(next_error):
+                continue
+            raise
+        effect['continuity_retry'] = dict(method=mode, original_failure=str(error),
+                                          original_job=str(path), selected_job=str(config))
+        return config, report, output, effect
+    raise error
+
+
 def process_stages(case, sku, geometry, files, manifest, model, protection_policy,
                    lighting_profile, progress, stage, *, allow_partial=True, bottom_fallback=None,
                    source_body_reference_review=False, source_body_reference_metadata=None,
@@ -198,6 +245,14 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                 bindings[reference_audit['evidence_path']] = reference_audit['evidence_file_sha256']
             if any(w.sha(path) != value for path, value in bindings.items()):
                 raise ValueError('Immutable source body reference evidence changed')
+
+    def check_lit_pixels(face, source, candidate, allowed, paper, analysis, job, report):
+        checked = measure_masks(source, candidate, allowed, paper)
+        if any('rear_shadow_correction' in v or 'rear_shadow_notice' in v for v in job.get('views', [])):
+            checked['rear_shadow_correction'] = report['views'][face]['rear_shadow_correction']
+        if protection_policy == 'none':
+            checked['actual_no_zone_effects'] = no_zone_effects(source, candidate, analysis)
+        return checked
 
     def failure(name, face, error):
         verify_sources()
@@ -287,15 +342,17 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                 lighting_report = lighting.run('aluminum', path)
                 candidate = output/(face+'.png')
                 attempt_phase = 'pixel_integrity'
-                checked = measure_masks(source, candidate, allowed, paper)
-                if any('rear_shadow_correction' in v for v in job.get('views', [])):
-                    rear_shadow = lighting_report['views'][face]['rear_shadow_correction']
-                    checked['rear_shadow_correction'] = rear_shadow
-                if protection_policy == 'none':
-                    checked['actual_no_zone_effects'] = no_zone_effects(source, candidate, analysis)
+                checked = check_lit_pixels(face, source, candidate, allowed, paper, analysis, job, lighting_report)
                 attempt_phase = 'effect'
-                effect = measure_effect(lighting_review.measure_perimeter if face in ('front', 'back') else lighting_review.measure_local,
-                    scope, source, candidate, allowed, paper, lighting_profile)
+                try:
+                    effect = measure_effect(lighting_review.measure_perimeter if face in ('front', 'back') else lighting_review.measure_local,
+                        scope, source, candidate, allowed, paper, lighting_profile)
+                except ValueError as error:
+                    if face not in ('left', 'right', 'back'):
+                        raise
+                    path, lighting_report, candidate, effect = _continuity_candidate(
+                        error, job, path, face, source, scope, allowed, paper, lighting_profile)
+                    checked = check_lit_pixels(face, source, candidate, allowed, paper, analysis, job, lighting_report)
                 checked['source_relative_effect_checks'] = effect
                 attempt_phase = 'evidence'
                 lighting_review.evidence_images(scope, source, candidate, assets/'effect-visual-review')
@@ -305,6 +362,14 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                     verify_bindings(attempt_bindings)
                 checks[face], jobs[face], analyses[face] = checked, str(path), analysis
                 selected[face] = candidate
+                if scope.get('button_effect_notes'):
+                    item_effect_warnings.append(dict(face=face,code='rear_button_witness_unavailable',
+                        message='背面按键凸起周围可测金属不足，保留常规调光',
+                        error=', '.join(scope['button_effect_notes'])))
+                if analysis.get('button_lighting_notice'):
+                    item_effect_warnings.append(dict(face=face,code='button_lighting_relaxed',
+                        message='按键沿用实拍轮廓，内外边界按宽松规则调光',
+                        error=analysis['button_lighting_notice']))
                 row.update(lighting='effect_warning' if effect.get('original_effect_check_passed') is False else 'complete',
                     selected_stage='lighting', lighting_sha256=w.sha(candidate), lighting_file=str(candidate))
                 if (face == 'bottom' and attempt == 0 and bottom_quality is not None
@@ -373,6 +438,19 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                 material_failure = failure_kind(error) == 'material_classification'
                 failure('material' if material_failure else 'lighting', face, error)
                 row['lighting_error'] = str(error)
+                if allow_partial:
+                    from .lighting_continuation import recover
+                    fallback = case/'work/degraded-lighting'/(face+'.png')
+                    try:
+                        degradation = recover(source, face, fallback, assets, metal_back=True)
+                    except (ValueError, RuntimeError) as retry_error:
+                        row['lighting_fallback_error'] = str(retry_error)
+                    else:
+                        verify_sources()
+                        selected[face] = fallback
+                        row.update(lighting='degraded', selected_stage='degraded_lighting',
+                                   lighting_file=str(fallback), lighting_sha256=w.sha(fallback),
+                                   degraded_lighting=degradation)
                 if material_failure:
                     row['material_status'] = 'unresolved'
                     if hasattr(error, 'material_boundary_evidence'):
@@ -431,7 +509,10 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
     write(case/'work/lighting-checks.json', checks)
     write(case/'work/lighting-jobs.json', {sku: jobs})
     write(case/'work/lighting-stage.json', dict(faces=per_face, blocks=blocked))
-    state['lighting'] = 'complete' if len(checks) == len(pipeline.FACES) else 'partial' if checks else 'failed'
+    degraded = {face for face, row in per_face.items() if row['lighting']=='degraded'}
+    state['lighting'] = ('complete' if len(checks) == len(pipeline.FACES) else
+                         'degraded' if len(set(checks)|degraded) == len(pipeline.FACES) else
+                         'partial' if checks or degraded else 'failed')
     stage('independent_material_lighting_and_checks', begin)
 
     structural, seam_report = None, None
@@ -489,20 +570,24 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
         verify_sources()
         stage('current_side_candidate_generation_and_checks', begin)
 
-    if state['structure'] == 'complete' and all(face in checks for face in pipeline.FRAMES):
+    if state['structure'] == 'complete' and all(
+            face in checks or frame_seams.terminal_metal(case/'work', face, per_face[face].get('source_sha256'))
+            for face in pipeline.FRAMES):
         begin = time.perf_counter()
         progress('checking', completed=13)
         try:
             if any(w.sha(p) != selected_hashes[f] for f, p in selected.items()):
                 raise RuntimeError('Verified structural source changed before seam processing')
+            partial_sources = {f: per_face[f]['source_sha256'] for f in pipeline.FRAMES if f not in checks}
+            options = dict(terminal_sources=partial_sources) if partial_sources else {}
             seam_report = frame_seams.run(case/'work', sku, model,
-                case/'work/seam-candidates'/sku, case/'work/seam-records')
+                case/'work/seam-candidates'/sku, case/'work/seam-records', **options)
             verify_sources()
             selected = {f: case/'work/seam-candidates'/sku/(f+'.png') for f in pipeline.FACES}
             selected_hashes = seam_report['output_sha256']
             state['seam'] = 'complete'
             resolution = seam_report.get('continuity_resolution') or {}
-            if resolution.get('method') == 'applied_with_steep_step_warning':
+            if resolution.get('method') in ('applied_with_steep_step_warning', 'smoothed_with_steep_step_warning'):
                 item_effect_warnings.append(dict(face=resolution.get('face'), kind='seam_correction_step_warning',
                     code='seam_correction_step_warning',
                     message='四角接缝校色在圆角端过渡偏陡（%.1f，常规上限 %.1f），已照常应用' % (
@@ -547,6 +632,10 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
             from .back_canvas import standardize
             back_canvas_proof = standardize(source, dest, model)
             back_canvas_proof['source_sha256'] = w.sha(source)
+            rail = back_canvas_proof.get('top_rail') or {}
+            if rail.get('verified') is False:
+                item_effect_warnings.append(dict(face='back', code='back_top_rail_unverified',
+                    message='背面顶沿缺少校平依据，顶部留白未通过复测', detail=rail.get('reason')))
             lens = back_canvas_proof.get('lens_registration') or {}
             if not lens.get('applied') and lens.get('reason') in ('lenses_not_measured', 'shift_exceeds_limit',
                                                                    'registration_not_verified'):
@@ -568,6 +657,15 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
     verify_sources()
     warnings = [dict(face=f, **c['source_relative_effect_checks']) for f, c in checks.items()
         if c['source_relative_effect_checks'].get('original_effect_check_passed') is False]
+    for face, checked in checks.items():
+        shadow = checked.get('rear_shadow_correction') or {}
+        if shadow.get('status') == 'source_evidence_unavailable':
+            item_effect_warnings.append(dict(face=face, code='rear_shadow_source_evidence_unavailable',
+                message='背面已完成常规调光，镜头周边去投影证据不足。', detail=shadow['reason']))
+        elif shadow.get('status') == 'partially_applied':
+            reasons = [f"镜头 {entry['lens']+1} {entry['reason']}" for entry in shadow['skipped_lenses']]
+            item_effect_warnings.append(dict(face=face, code='rear_shadow_partially_applied',
+                message='背面已完成常规调光，部分镜头已去投影，其余镜头保留常规调光。', detail='、'.join(reasons)))
     all_stages = all(value == 'complete' for value in state.values())
     processed = all_stages and not warnings and not item_effect_warnings
     status = 'processed_needs_visual_review' if processed else 'full_stages_effect_warning_needs_review' if all_stages else 'source_preserved_needs_review'
@@ -591,6 +689,7 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
         candidate=str(candidate), lighting_checks=checks, structure_checks=structural['checks'] if structural else {},
         frame_uv_seam_checks=seam_report, source_hashes_unchanged=True,
         final_canvas_checks=final_canvas_checks, back_standard_canvas=back_canvas_proof,
+        back_ready_for_backfill=bool(back_canvas_proof and back_canvas_proof.get('back_ready_for_backfill')),
         final_sha256={f: w.sha(p) for f, p in final.items()})
     if side_review is not None:
         result.update(current_side_review=side_review,

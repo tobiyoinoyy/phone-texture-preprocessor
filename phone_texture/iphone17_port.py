@@ -45,56 +45,165 @@ def _measure(image, thresholds, filter_print=False):
         holes=np.asarray(left+right)
         if any(np.std(np.diff(np.asarray(group)[:,0]))>1.5 for group in (left,right)):
             raise ValueError('Standard hole pitch is inconsistent')
-        screws=[p for p in circles if pc[0]+.06*w<p[0]<pc[0]+.12*w]
+        screws=sorted([p for p in circles if .06*w<abs(p[0]-pc[0])<.12*w])
+        if not screws or len({p[0]<pc[0] for p in screws}) != len(screws):
+            raise ValueError('Standard screw missing or ambiguous')
         readings.append(dict(port=pc,holes=holes,screw=screws))
     holes=np.median(np.asarray([r['holes'] for r in readings]),axis=0)
     port=np.median(np.asarray([r['port'] for r in readings]),axis=0)
     if np.ptp(np.asarray([r['holes'] for r in readings]),axis=0).max()>3:
         raise ValueError('Standard hole coordinates are unstable')
-    first=readings[0]
     mirrored=int(np.sum(holes[:,0]<port[0]))==5
     nominal=np.sort(WIDTH_MM-DRAWING_HOLES) if mirrored else DRAWING_HOLES.copy()
-    screw=np.median(np.asarray([r['screw'][0] for r in readings if len(r['screw'])==1]),axis=0) if any(len(r['screw'])==1 for r in readings) else None
-    return dict(holes=holes,nominal=nominal,port=port,screw=screw,mirrored=mirrored)
+    screw_rows=[r['screw'] for r in readings]
+    if len({len(row) for row in screw_rows}) != 1 or np.ptp(screw_rows,axis=0).max()>2:
+        raise ValueError('Standard screw coordinates are unstable')
+    return dict(holes=holes,nominal=nominal,port=port,screws=np.median(screw_rows,axis=0),mirrored=mirrored)
+
+
+def _dark_rail(gray):
+    h, w = gray.shape
+    metal = gray[int(.35*h):int(.65*h), int(.12*w):int(.18*w)]
+    return metal.size > 0 and np.median(metal) < 140
 
 
 def measure(image):
-    try:
-        return _measure(image, (80,100,120))
-    except ValueError as original:
-        for start in (80,90,100,70,60,110):
-            try:
-                measured = _measure(image, (start,start+10,start+20), filter_print=True)
-                if measured['screw'] is not None:
-                    return measured
-            except ValueError:
-                continue
-        # On dark metal the four sides of the USB rim are separable only
-        # within a narrow tonal interval. Independently match the rounded
-        # optical outline and require four consecutive complete hole groups.
-        from .bottom_rectify import port_rounded_rect, Rejected
-        gray=np.asarray(image.convert('L'))
-        h,w=gray.shape
-        if np.median(gray[int(.35*h):int(.65*h),int(.12*w):int(.18*w)])<140:
-            for start in range(40,111,5):
-                try:
-                    levels=tuple(range(start,start+16,5))
-                    m=_measure(image,levels,filter_print=True)
-                    single=[_measure(image,(t,),True) for t in levels]
-                    proposals=[s['port'] for s in single]
-                    if (any(s['screw'] is None for s in single)
-                            or np.ptp(proposals,axis=0).max()>2):
-                        continue
-                    port,spread,_,_=port_rounded_rect(gray,proposals,w/1000)
-                    if spread<=2 and abs(port[0]-m['port'][0])<=2:
-                        m['port']=port
-                        return m
-                except (ValueError,Rejected):
-                    continue
-        raise original
+    from .bottom_rectify import port_rounded_rect
+    gray = np.asarray(image.convert('L'))
+    runs = []
+    run = []
+    for level in range(5, 255, 5):
+        try:
+            single = _measure(image, (level,), filter_print=True)
+        except ValueError:
+            run = []
+            continue
+        run.append((level, single))
+        if len(run) < 4:
+            continue
+        window = run[-4:]
+        samples = [m for _, m in window]
+        if (len({len(m['screws']) for m in samples}) != 1
+                or any(np.ptp([m[k] for m in samples],axis=0).max()>limit
+                       for k,limit in [('port',2),('holes',2),('screws',2)])):
+            continue
+        runs.append(window)
+    # Prefer the most stable complete layout. Distinct viable hole rows
+    # cannot be resolved by choosing a more convenient threshold.
+    if not runs:
+        raise ValueError('No stable grayscale interval for asymmetric holes, screw and USB-C rim')
+    reference = runs[0][0][1]
+    if any(m['mirrored'] != reference['mirrored'] or
+           abs(m['holes'] - reference['holes']).max() > 3 for window in runs for _, m in window):
+        raise ValueError('Competing stable asymmetric hole layouts')
+    runs.sort(key=lambda window: np.ptp([m['port'] for _,m in window],axis=0).max())
+    tried=set()
+    for window in runs:
+        levels, samples = zip(*window)
+        proposals = [m['port'] for m in samples]
+        seed=tuple(np.median(proposals,axis=0))
+        if seed in tried:
+            continue
+        tried.add(seed)
+        try:
+            port, spread, _, evidence = port_rounded_rect(gray, proposals, image.width/1000)
+        except ValueError:
+            continue
+        if spread <= 2 and abs(port[0]-seed[0]) <= 2:
+            result = _measure(image, levels, filter_print=True)
+            result.update(port=port, selected_thresholds=list(levels), port_contour_evidence=evidence)
+            return result
+    raise ValueError('No independently supported complete USB-C rim')
 
 
 def mapping(image):
+    try:
+        return _component_mapping(image)
+    except ValueError as first_error:
+        from . import bottom_rectify
+        try:
+            mx, _, _, check, measurements = bottom_rectify.plan(
+                np.asarray(image.convert('RGBA')), 'iphone17', allow_local_contrast=_dark_rail(np.asarray(image.convert('L'))))
+        except bottom_rectify.Rejected as error:
+            raise ValueError(str(first_error) + ' (' + str(error) + ')') from error
+        holdout = max(abs(v) for v in check['holdout_only_errors_px'])
+        if (holdout > 1.5 or check['hole_fit_max_px'] > 1.5
+                or abs(check['port_holdout_error_px']) > 2.5
+                or max(map(abs, check['screw_holdout_errors_px'])) > 2.5):
+            raise first_error
+        center = float(np.interp(measurements['port'][0], mx[0], np.arange(image.width)))
+        if abs(center - (image.width-1)/2) > 2.5:
+            raise first_error
+        check.update(source_visible_screw_sides=['left' if s[0]<measurements['port'][0] else 'right'
+                                                 for s in measurements['screws']],
+                     reference=APPLE_DRAWING, reference_sheet=1, port_after_x=center,
+                     holdout_holes_max_error_px=holdout, measurement_method='independent_whole_port',
+                     source_sampling_scale_range=check['sampling_derivative_range'])
+        return mx[0], check
+
+
+def final_port(image, proof):
+    from .bottom_rectify import PROFILES, measure as measure_groups
+    a = np.asarray(image.convert('RGBA'))
+    causes = {}
+    nominal = np.asarray(proof['hole_nominal_mm'])
+    px_per_mm = (image.width - 1) / WIDTH_MM
+    for rendered_contrast in ('adaptive_gray', 'raw', 'local'):
+        try:
+            if rendered_contrast == 'adaptive_gray':
+                measured = measure(image)
+            else:
+                measured = measure_groups(a, 'iphone17', rendered_contrast, rendered=True)
+        except ValueError as error:
+            causes[rendered_contrast] = str(error)
+            continue
+        if not np.array_equal(measured['nominal'], nominal):
+            causes[rendered_contrast] = 'hole_orientation_changed'
+            continue
+        offsets = measured['holes'][:, 0] - nominal * px_per_mm
+        if len(offsets) != 8 or np.max(abs(offsets)) > 1.5:
+            causes[rendered_contrast] = 'rendered_holes_outside_tolerance'
+            continue
+        screws = np.asarray(PROFILES['iphone17']['screws'])
+        if measured['mirrored']:
+            screws = np.sort(WIDTH_MM - screws)
+        checks = []
+        for side, coordinate in zip(('left', 'right'), screws):
+            found = [s[0] for s in measured['screws']
+                     if (s[0] < measured['port'][0]) == (side == 'left')]
+            target = float(coordinate * px_per_mm)
+            error = float(found[0] - target) if len(found) == 1 else None
+            status = ('not_observed' if not found else 'ambiguous' if len(found) > 1 else
+                      'confirmed' if abs(error) <= 2.5 else 'outside_tolerance')
+            checks.append(dict(side=side, target_x=target, measured_x=float(found[0]) if len(found) == 1 else None,
+                               error_px=error, status=status))
+        statuses = {c['status'] for c in checks}
+        confirmed = {c['side'] for c in checks if c['status']=='confirmed'}
+        if (not confirmed or not set(proof.get('source_visible_screw_sides', ())) <= confirmed
+                or not statuses <= {'confirmed', 'not_observed'}):
+            causes[rendered_contrast] = 'rendered_screws_outside_tolerance_or_ambiguous'
+            continue
+        proof.update(rendered_port_method='whole_rounded_port_with_independent_holes_and_screws',
+                     rendered_hole_errors_px=offsets.tolist(), rendered_screw_checks=checks,
+                     rendered_hole_contrast=rendered_contrast,
+                     rendered_hole_thresholds=measured['selected_thresholds'],
+                     rendered_port_contour=measured['port_contour_evidence'])
+        return measured['port']
+    raise ValueError(f'Final USB-C witnesses: {causes}')
+
+
+def verify_export(path, proof):
+    from .workspace import sha
+    with Image.open(path) as image:
+        port = final_port(image, proof)
+        error = float(port[0] - (image.width-1)/2)
+    if abs(error)>2.5:
+        raise ValueError('Final rendered USB-C centre failed independent measurement')
+    proof.update(final_measured_port_x=float(port[0]), final_rendered_center_error_px=error,
+                 final_verified_sha256=sha(path))
+
+
+def _component_mapping(image):
     m=measure(image);w,h=image.size;x=m['nominal'];observed=m['holes'][:,0]
     scale=float(np.median(np.diff(observed[:3]))/2.255)
     def project(p,points):return (p[0]*points+p[1])/(1+p[2]*points)
@@ -129,11 +238,16 @@ def mapping(image):
         port_nominal_holdout_error_px=port_residual,source_sampling_scale_range=[float(jac.min()),float(jac.max())],
         native_endcaps_fixed_px=cap,unobserved_surface_generated=False,model_uv_verified=False,
         scope='bottom-plane image registration; photographed endcaps retained, not full curved-surface metric rectification')
-    if m['screw'] is not None:
-        nominal_screw=42.65 if m['mirrored'] else 42.65
-        screw_error=float(m['screw'][0]-project(fit.x,nominal_screw))
-        if abs(screw_error)>2.5:raise ValueError('Independent screw holdout rejects standard bottom fit')
-        proof['screw_holdout_error_px']=screw_error
+    from .bottom_rectify import PROFILES
+    screws=np.asarray(PROFILES['iphone17']['screws'])
+    if m['mirrored']:
+        screws=np.sort(WIDTH_MM-screws)
+    errors=[float(s[0]-project(fit.x,screws[int(s[0]>m['port'][0])])) for s in m['screws']]
+    if max(map(abs,errors))>2.5:
+        raise ValueError('Independent screw holdout rejects standard bottom fit')
+    proof.update(source_visible_screw_sides=['left' if s[0]<m['port'][0] else 'right' for s in m['screws']],
+                 selected_thresholds=m['selected_thresholds'], port_contour_evidence=m['port_contour_evidence'],
+                 visible_screw_count=len(errors), screw_holdout_errors_px=errors)
     return mx,proof
 
 

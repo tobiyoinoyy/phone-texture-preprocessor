@@ -130,13 +130,73 @@ def hole_contrast_image(a, scale):
     return np.clip(160+25*residual/max(spread,1.),0,255).astype('uint8')
 
 
-def measure(a, model, contrast='raw'):
+def _stable_port_seed_runs(proposals, step, scale):
+    by_level = {}
+    for sample in proposals:
+        by_level.setdefault(sample['threshold'], []).append(sample)
+    stable = []
+    for first in proposals:
+        run = [first]
+        pos = first['threshold']
+        initial = np.asarray(first['port'])
+        while True:
+            pos += step
+            matches = []
+            for candidate in by_level.get(pos, []):
+                box = np.asarray(candidate['port'])
+                if (max(abs(box[:2] - initial[:2])) <= 2*scale
+                        and max(abs(box[4:] / initial[4:] - 1)) <= .12):
+                    matches.append(candidate)
+            if len(matches) != 1:
+                break
+            run.append(matches[0])
+        if len(run) >= 3:
+            stable.append(run)
+    return stable
+
+
+def _repeated_port_seeds(proposals, step, scale):
+    """Discard transient fragments only when all repeated port centres agree."""
+    stable = [p for run in _stable_port_seed_runs(proposals, step, scale) for p in run]
+    if not stable or np.ptp([p['port'][:2] for p in stable],axis=0).max() > 3*scale:
+        raise Rejected('port_seed_clusters_ambiguous')
+    return list({(p['threshold'],tuple(p['port'])):p for p in stable}.values())
+
+
+def _rendered_port_consensus(gray, proposals, step, scale):
+    """Thresholds can outline different layers of the same rendered socket."""
+    windows = []
+    fits = []
+    for run in sorted(_stable_port_seed_runs(proposals, step, scale), key=len, reverse=True):
+        seeds = [p['port'] for p in run]
+        center = np.median(seeds, axis=0)
+        if any(max(abs(center[:2] - old[:2])) <= 2*scale and
+               max(abs(center[4:] / old[4:] - 1)) <= .12 for old in windows):
+            continue
+        windows.append(center)
+        port, spread, tracks, evidence = port_rounded_rect(gray, seeds, scale)
+        fits.append((port, spread, tracks, evidence, run))
+    if not fits:
+        raise Rejected('port_seed_clusters_ambiguous')
+    geometry = np.array([f[0] for f in fits])
+    if (np.ptp(geometry[:, :2], axis=0).max() > 2*scale or
+            np.any(np.ptp(geometry[:, 4:], axis=0) > .12*np.min(geometry[:, 4:], axis=0))):
+        raise Rejected('competing_rendered_usb_c_contours')
+    best = max(fits, key=lambda f: f[3]['selected']['score'])
+    best[3]['agreeing_rendered_windows'] = [
+        dict(thresholds=[r['threshold'] for r in f[4]], fit=f[3]['selected'])
+        for f in fits]
+    return best
+
+
+def measure(a, model, contrast='raw', *, rendered=False):
     """contrast='local' is the dark-colour fallback: holes are thresholded on
     metal-relative darkness with filled rings at 5-level steps, and the screw
     is confirmed separately (largest agreeing group) rather than per hole level."""
     profile=PROFILES[model];h,w=a.shape[:2];scale=w/1030
     gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
     local=contrast=='local';step=5 if local else 10
+    stable_screws = model == 'iphone17' or not local
     feature=hole_contrast_image(a,scale) if local else None
     readings=[];failures=[];port_proposals=[]
     for threshold in range(30,151,step):
@@ -185,7 +245,7 @@ def measure(a, model, contrast='raw'):
                        and p[2]>.016*w and p[3]>.12*h])
         if not screws or len(screws)>2:
             failures.append(dict(threshold=threshold,reason='independent_screw_missing_or_ambiguous'))
-            if not local:continue
+            if stable_screws:continue
             screws=[]
         readings.append(dict(threshold=threshold,holes=left+right,counts=[len(left),len(right)],screws=screws))
     stable=[]
@@ -193,8 +253,8 @@ def measure(a, model, contrast='raw'):
         run=[readings[i]]
         for r in readings[i+1:]:
             if r['threshold']-run[-1]['threshold']!=step or r['counts']!=run[0]['counts']:break
-            if not local and len(r['screws'])!=len(run[0]['screws']):break
-            if any(np.ptp([q[k] for q in run+[r]],axis=0)[...,:2].max()>2*scale for k in (['holes'] if local else ['holes','screws'])):break
+            if stable_screws and len(r['screws'])!=len(run[0]['screws']):break
+            if any(np.ptp([q[k] for q in run+[r]],axis=0)[...,:2].max()>2*scale for k in (['holes','screws'] if stable_screws else ['holes'])):break
             run.append(r)
         if len(run)>=3:stable.append(run)
     audit=dict(readings=readings,failures=failures,port_seed_proposals=port_proposals)
@@ -217,6 +277,7 @@ def measure(a, model, contrast='raw'):
     # separated seed clusters. Three consecutive thresholds are still required
     # for hole coordinates, but are no longer falsely required for ALL features.
     clusters=[]
+    rendered_fit=None
     for proposal in port_proposals:
         p=np.array(proposal['port'])
         def same_object(q):
@@ -224,18 +285,30 @@ def measure(a, model, contrast='raw'):
             iy=max(0,min(p[3]+p[5],q[3]+q[5])-max(p[3],q[3]))
             return ix>=.75*min(p[4],q[4]) and ix*iy>=.65*min(p[4]*p[5],q[4]*q[5])
         near=[c for c in clusters if same_object(np.median([q['port'] for q in c],axis=0))]
-        if len(near)>1:raise Rejected('port_seed_clusters_ambiguous',audit)
+        if len(near)>1:
+            if model!='iphone17':
+                raise Rejected('port_seed_clusters_ambiguous',audit)
+            try:
+                clusters=[_repeated_port_seeds(port_proposals,step,scale)]
+            except Rejected:
+                if not rendered:
+                    raise Rejected('port_seed_clusters_ambiguous',audit) from None
+                rendered_fit=_rendered_port_consensus(gray,port_proposals,step,scale)
+            break
         if near:near[0].append(proposal)
         else:clusters.append([proposal])
-    clusters=[c for c in clusters if len({r['threshold'] for r in c})>=2]
-    if len(clusters)!=1:raise Rejected('port_seed_not_unique',audit)
-    seeds=clusters[0]
-    try:port,port_spread,port_tracks,edgeproof=port_rounded_rect(gray,[r['port'] for r in seeds],scale)
-    except Rejected as e:
-        e.evidence.update(hole_thresholds=[r['threshold'] for r in chosen],
-                          port_seed_thresholds=sorted({r['threshold'] for r in seeds}),
-                          detection_audit=audit)
-        raise
+    if rendered_fit is not None:
+        port,port_spread,port_tracks,edgeproof,seeds=rendered_fit
+    else:
+        clusters=[c for c in clusters if len({r['threshold'] for r in c})>=2]
+        if len(clusters)!=1:raise Rejected('port_seed_not_unique',audit)
+        seeds=clusters[0]
+        try:port,port_spread,port_tracks,edgeproof=port_rounded_rect(gray,[r['port'] for r in seeds],scale)
+        except Rejected as e:
+            e.evidence.update(hole_thresholds=[r['threshold'] for r in chosen],
+                              port_seed_thresholds=sorted({r['threshold'] for r in seeds}),
+                              detection_audit=audit)
+            raise
     spread=max(float(np.ptp([r['holes'] for r in chosen],axis=0)[...,:2].max()),
                float(np.ptp(screw_readings,axis=0)[...,:2].max()))
     # Port fits only gate the result (holes alone drive the correction), so their
@@ -278,13 +351,14 @@ def smoothstep(x):
     return t*t*(3-2*t)
 
 
-def plan(a,model):
+def plan(a,model, *, allow_local_contrast=True):
     h,w=a.shape[:2];unit=w/1030;profile=PROFILES[model]
     try:m=measure(a,model)
     except Rejected as error:
         # Dark colours: holes barely darker than the metal, or a dark port that only
         # separates from dark metal at one level. Retry on local contrast only then.
-        if str(error) not in ('independent_hole_consensus_failed','port_seed_not_unique'):raise
+        if not allow_local_contrast or str(error) not in ('independent_hole_consensus_failed','port_seed_not_unique'):
+            raise
         m=measure(a,model,'local')
     x=m['nominal'];observed=m['holes'][:,0]
     hold=[1,len(x)-2];train=[i for i in range(len(x)) if i not in hold]
