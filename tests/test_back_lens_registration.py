@@ -67,6 +67,22 @@ def test_delivered_model_specific_back_has_a_level_rail_and_three_aligned_disks(
     assert len(check['distances_px']) == 3 and max(check['distances_px']) <= .30
     assert abs(report['top_rail']['before']['left_minus_right_px']) > 2
     assert abs(check['rail']['left_minus_right_px']) <= .5
+    assert check['empty_canvas_rows'] == dict(top=0, bottom=0)
+    assert report['canvas_edge_normalization']['verified']
     fx, fy = np.rint(np.array(bl.STANDARD[model]['flash'])*[width,h]).astype(int)
     actual = np.asarray(Image.open(result))
     np.testing.assert_array_equal(actual[fy-45:fy+45,fx-45:fx+45], source[fy-45:fy+45,fx-45:fx+45])
+
+
+@pytest.mark.parametrize('model', ['iphone17pro', 'iphone17promax'])
+def test_legacy_empty_outer_rows_fail_independent_back_acceptance(tmp_path, model):
+    from phone_texture.back_inspection import inspect_back
+    source = synthetic_back(model)
+    source[..., 3] = 255
+    source[:4, :, 3] = 0
+    source[-2:, :, 3] = 0
+    path = tmp_path/'legacy-back.png'
+    Image.fromarray(source).save(path)
+    check = inspect_back(path, model)
+    assert not check['verified']
+    assert check['empty_canvas_rows'] == dict(top=4, bottom=2)

@@ -264,6 +264,18 @@ _SOURCE_SIDE_LOCK = Lock()
 
 def recognize(path, exclude_group=None):
     result = _recognize_atlas(path, exclude_group)
+    if (result['suggested_face'] in ('left','right') and
+            max(result.get('scores',{}).get(face,0) for face in ('left','right'))>=.85):
+        from .side_camera_position import classify
+        try:
+            camera = classify(read_rgb(path))
+        except (OSError,ValueError,cv2.error):
+            camera = dict(face=None,reason='Source photograph unavailable for camera-end measurement')
+        result['camera_position_proof'] = camera
+        if camera['face'] is not None:
+            result.update(face=camera['face'],suggested_face=camera['face'],
+                          method=camera['method'],reason=None)
+            return result
     if (result['face'] is None and result['suggested_face'] in ('top','bottom')
             and result['score']>=.90):
         from .source_cap_recognition import classify

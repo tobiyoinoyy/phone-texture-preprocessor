@@ -80,7 +80,7 @@ def _current_seam_readings(files, chains, masks, sigma):
             after_p95_deltaE76=float(np.quantile(delta,.95)),after_mean_deltaE76=float(delta.mean())))
     return readings
 
-def finish_frames(files, work, output, records, *, review_alignment=None):
+def _match_frames(files, work, output, records, *, review_alignment=None):
     # Use the same source-bound domains and registration as the approved images.
     # Only terminal metal participates. Buttons, paper, holes and antennas are
     # separated from the blend even where they approach an end.
@@ -205,6 +205,24 @@ def finish_frames(files, work, output, records, *, review_alignment=None):
     if input_readings is not None:
         result['input_seams'] = input_readings
     return result
+
+
+def finish_frames(files, work, output, records, *, review_alignment=None):
+    from .frame_end_color import effect_notes, finish as finish_end_color
+    baseline = records/'matched-frames'
+    report = _match_frames(files, work, baseline, records, review_alignment=review_alignment)
+    masks = {f: np.array(Image.open(records/(f+'-metal.png')).convert('L')) > 0 for f in FRAMES}
+    end_color = finish_end_color(baseline, output, records/'end-color', masks, resized_chains(w.read(PROFILE), files),
+                                 sigma=2, width_units=.18)
+    report['end_color'] = end_color
+    report['end_color_notes'] = effect_notes(end_color)
+    resolution = end_color.get('continuity_resolution') or {}
+    if resolution.get('warning_limit'):
+        report.setdefault('continuity_warnings', []).append(dict(resolution, stage='end_color'))
+    if end_color['status'] == 'applied':
+        report.update(initial_seams=report['seams'], seams=end_color['seams'],
+                      output_sha256=end_color['output_sha256'], already_matched=False)
+    return report
 
 
 def verified_frame_finish(report, hashes):

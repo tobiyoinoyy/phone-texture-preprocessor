@@ -26,8 +26,12 @@ def inspect_back(path, model):
     offsets = disks[:, :2] - targets
     distances = np.linalg.norm(offsets, axis=1)
     rail = top_measure(pixels[..., 3])
+    top_clear = int(np.argmax(pixels[...,3].any(axis=1)))
+    bottom_clear = int(np.argmax(pixels[::-1,:,3].any(axis=1)))
     verified = (distances.max() <= .30 and abs(rail['left_minus_right_px']) <= .5
-                and rail['central_span_p95_px'] <= 1.1)
+                and rail['central_span_p95_px'] <= 1.1
+                and top_clear==bottom_clear==0)
     return dict(model=model, verified=bool(verified), size=list(size), sha256=w.sha(path),
                 targets=targets.tolist(), centers=disks[:, :2].tolist(), offsets=offsets.tolist(),
-                distances_px=distances.tolist(), rail=rail)
+                distances_px=distances.tolist(), rail=rail,
+                empty_canvas_rows=dict(top=top_clear,bottom=bottom_clear))

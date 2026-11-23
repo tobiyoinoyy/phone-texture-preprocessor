@@ -87,3 +87,9 @@ AI 不能准确恢复已经过曝或死黑的信息，也不能确认被遮住�
 ## 历史局部去高光模式
 
 以下资源从不锈钢技能继承，仅为明确选择的旧式局部去高光任务保留：`composite_natural_highlights.py`、`composite_highlights.py`、`finalize_restore.py` 及 [references/edit-prompt.md](references/edit-prompt.md)、[references/postprocess.md](references/postprocess.md)、[references/work-order.md](references/work-order.md)。不要把其中“只有高光区可变”“不统一颜色”等约束套到默认多面光照统一流程，也不要把为旧材质建立的周期纹理参数直接用于铝材质。`finalize_restore.py` 的整面候选替换不能用于默认流程。
+
+### 17 系列边框两端发灰
+
+六面工坊在四角接缝初次通过后，对本机四条边框运行 `phone_texture/frame_end_color.py`。沿每个端部向内在稳定、不透明的同材质金属上分窗取色，分别测量明度和色偏。超过容差的端部施加沿长轴连续衰减的 RGB 校正，保留圆角起伏和细纹。稳定窗口不够时记录原因并沿用原端部。标准版、Pro 和 Pro Max 均使用各自模型的实际四角接缝复测。只有修正端部更接近参考、四角 P95 ΔE76 均不超过 2、alpha 和金属域外像素逐像素相同时才采用候选。初次接缝成品独立留档，端部修正未通过时沿用初次成品并记录处理提示。
+
+当前默认采用用户验收的 A1.5。A1 四角通过后，仅对同色金属端部沿原色相增加彩度，目标增幅最多 12%，绝对增量最多 5 C*。从同一份 A1 逐档重试，并按当前机型模型复测四角。低彩度样本沿用 A1。

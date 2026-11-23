@@ -83,7 +83,7 @@ def segment_face(normalizer, raw, max_side):
 def geometry_face(matte, raw, face, capture):
     if face in pipeline.FRAMES:
         try:
-            image, evidence = frame_geometry(matte, face, capture, source_image=raw, separate_support_edge=False)
+            image, evidence = frame_geometry(matte, face, capture, source_image=raw, separate_support_edge=False, model='iphone17')
         except ValueError as original:
             if face != 'bottom':
                 raise
@@ -95,7 +95,7 @@ def geometry_face(matte, raw, face, capture):
             evidence['previous_bottom_geometry_error'] = str(original)
     else:
         paper, info = paper_mask(matte, face)
-        image, evidence = plate_geometry(matte, face, paper, capture, source_image=raw, reconstruct_paper_tail=False)
+        image, evidence = plate_geometry(matte, face, paper, capture, source_image=raw, reconstruct_paper_tail=False, prefer_front_closure=face=='front')
         evidence['paper'] = info
     paper = None if face == 'bottom' else paper_mask(image, face)[0]
     image, trim = trim_visible_canvas(image, paper)

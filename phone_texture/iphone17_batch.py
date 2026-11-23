@@ -62,7 +62,8 @@ def process_case(args):
                        structure='complete' if complete else 'blocked', seam='complete' if seam_checked else 'blocked'),
                    item_effect_warnings=report.get('item_effect_warnings', []) + [dict(code='frame_seam_correction_gradient', face=item['face'],
                        message='四角色差通过，局部校色过渡较陡', error=str(round(item['max_step_deltaE76'], 2)))
-                       for item in (report.get('model_frame_finish') or {}).get('continuity_warnings', [])],
+                       for item in (report.get('model_frame_finish') or {}).get('continuity_warnings', [])]
+                       + (report.get('model_frame_finish') or {}).get('end_color_notes', []),
                    blocked_checks=report.get('blocked_checks', []), face_processing=face_stages,
                    degraded_lighting=report.get('degraded_lighting', {}),
                    per_face_stages={f: dict(selected_stage=stage, lighting='complete' if f in lit else

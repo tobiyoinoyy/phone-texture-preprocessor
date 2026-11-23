@@ -110,7 +110,7 @@ def run(work, sku, model, output, records, *, model_sha256=None, terminal_source
     # Explicit paired UVs don't need a second mesh extraction at runtime.
     write(records/'scene.json', {})
     job = dict(scene=str(records/'scene.json'), seam_chains=str(chains_path),
-        views=views, output_dir=str(output), records_dir=str(records/'engine'),
+        views=views, output_dir=str(records/'matched-frames'), records_dir=str(records/'engine'),
         width_units=.20, sigma=3, guard_pixels=18, protection_feather=0,
         max_lab_shift=[25,15,15], minimum_joint_coverage=.98,
         maximum_p95_deltaE76=2.0, sampling_refinements=3 if terminal_sources else 2,
@@ -122,6 +122,19 @@ def run(work, sku, model, output, records, *, model_sha256=None, terminal_source
     module = seam_engine()
     with contextlib.redirect_stdout(io.StringIO()):
         report = module.run(records/'job.json')
+    from .frame_end_color import finish as finish_end_color
+    masks = {f: (np.array(Image.open(v['editable_mask'])) > 0)
+                & (np.array(Image.open(v['protected_mask']).convert('L')) == 0) for f,v in views.items()}
+    end_color = finish_end_color(records/'matched-frames', output, records/'end-color', masks, resized_chains(data, files),
+                                 sigma=job['sigma'], width_units=job['width_units'])
+    if end_color['status'] == 'applied':
+        report['initial_seams'] = report['seams']
+        report['seams'] = end_color['seams']
+        resolution = end_color.get('continuity_resolution') or {}
+        if resolution.get('warning_limit'):
+            report['initial_continuity_resolution'] = report.get('continuity_resolution')
+            report['continuity_resolution'] = resolution
+    report['end_color'] = end_color
     for face in ('front','back'):
         shutil.copy2(files[face], output/(face+'.png'))
     # Local RGB correction cannot touch antennas, hardware, paper or alpha.

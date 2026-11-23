@@ -28,18 +28,20 @@ def standardize(source, target, model):
         original = image.size
         resized = image.convert('RGBa').resize(size, Image.Resampling.LANCZOS).convert('RGBA')
     import numpy as np
-    from .back_geometry import top_measure, level_top
+    from .back_geometry import top_measure, normalize_back_edges
     from .back_lens import register
     try:
         before = top_measure(np.asarray(resized)[..., 3])
-        resized, after = level_top(resized)
-        rail = dict(verified=True, before=before, after=after)
+        resized, edges = normalize_back_edges(resized)
+        rail = dict(verified=True, before=before, after=edges['top'])
+        edges = dict(edges, verified=True)
     except ValueError as error:
         rail = dict(verified=False, reason=str(error))
+        edges = dict(verified=False, reason=str(error))
     registered, lens_proof = register(np.asarray(resized), model)
     Image.fromarray(registered).save(Path(target))
     return dict(method='premultiplied_lanczos_fixed_model_canvas', model=model,
                 source_size=list(original), output_size=list(size),
                 scale_x=size[0]/original[0], scale_y=size[1]/original[1],
-                top_rail=rail, lens_registration=lens_proof,
+                top_rail=rail, canvas_edge_normalization=edges, lens_registration=lens_proof,
                 back_ready_for_backfill=rail['verified'] and lens_proof.get('verified',False))

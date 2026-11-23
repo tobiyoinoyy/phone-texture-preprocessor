@@ -74,26 +74,42 @@ def top_measure(alpha):
                 central_span_p95_px=float(np.percentile(heights, 95)-np.percentile(heights, 5)))
 
 
-def level_top(image):
+def level_top(image, *, target_edge=3.5):
     a = np.array(image)
     alpha = a[..., 3]
     x, edge = top_rail(alpha)
     broad = ndimage.gaussian_filter1d(ndimage.median_filter(edge, size=11, mode='nearest'), 6)
     if np.percentile(abs(edge-broad), 95) > 1.25 or np.ptp(broad) > 16:
         raise ValueError('Photographed top rail lacks a stable straight section')
-    if np.max(abs(broad - 3.5)) > 14:
+    if np.max(abs(broad - target_edge)) > 14:
         raise ValueError('Top rail would require unsupported displacement')
     # Continue the measured displacement across each native rounded corner.
     # Fade before the lens assembly and side antenna marks.
-    offset = np.interp(np.arange(image.width), x, broad - 3.5)
-    h = round(.059 * image.width)
-    y, xx = np.mgrid[:h, :image.width].astype(np.float32)
+    offset = np.interp(np.arange(image.width), x, broad - target_edge)
+    a = _move_upper_band(a,offset,retain_edge_coverage=target_edge<1.)
+    result = top_measure(a[..., 3])
+    if abs(result['left_minus_right_px']) > .5 or result['central_span_p95_px'] > 1.1:
+        raise ValueError('Final top rail still has unequal headroom')
+    return Image.fromarray(a), result
+
+
+
+def _move_upper_band(a,offset,*,retain_edge_coverage=False):
+    if retain_edge_coverage:
+        # A native corner may start above the extrapolated straight rail.
+        # Keep that first antialiased source pixel in the sampling footprint.
+        visible = a[...,3] >= 64
+        first = visible.argmax(axis=0)
+        offset = np.minimum(offset, np.where(visible.any(axis=0), first+.5, offset))
+    h = round(.059 * a.shape[1])
+    y, xx = np.mgrid[:h, :a.shape[1]].astype(np.float32)
     t = np.clip((h-1-y)/(h-14), 0, 1)
     sy = y + offset * (t*t*(3-2*t))
     if np.min(np.diff(sy, axis=0)) < .5:
         raise ValueError('Top alignment would compress the photographed edge')
-    clipped = np.arange(16)[:,None] + .5 < sy[0]
-    if (alpha[:16][clipped] >= 64).any():
+    clipped = (np.arange(16)[:,None] + .5 < sy[0] if not retain_edge_coverage
+               else np.arange(16)[:,None] + 1 < sy[0])
+    if (a[:16,...,3][clipped] >= 64).any():
         raise ValueError('Top alignment would clip a photographed corner')
     # Premultiplied interpolation avoids dark fringes around metal on transparency.
     pm = a[:h+2].astype(np.float32)
@@ -101,7 +117,43 @@ def level_top(image):
     moved = cv2.remap(pm, xx, sy.astype('float32'), cv2.INTER_LINEAR)
     moved[..., :3] *= 255 / np.maximum(moved[..., 3:], 1e-8)
     a[:h] = np.clip(moved.round(), 0, 255).astype('uint8')
-    result = top_measure(a[..., 3])
-    if abs(result['left_minus_right_px']) > .5 or result['central_span_p95_px'] > 1.1:
-        raise ValueError('Final top rail still has unequal headroom')
-    return Image.fromarray(a), result
+    return a
+
+
+def normalize_back_edges(image):
+    """Fit the visible top and bottom to the existing canvas without moving lenses."""
+    source=np.asarray(image.convert('RGBA'))
+    top_target=0.
+    try:
+        leveled,top=level_top(image,target_edge=top_target)
+    except ValueError as error:
+        if str(error)!='Final top rail still has unequal headroom':
+            raise
+        # Broad photographed antialiasing can need a subpixel allowance to
+        # retain its first visible pixel; all flatness/empty-row checks remain.
+        top_target=.75
+        leveled,top=level_top(image,target_edge=top_target)
+    a=np.array(leveled)
+    flipped=a[::-1].copy()
+    strength=flipped[...,3].max(axis=1)
+    rows=np.flatnonzero(strength>=128)
+    if not len(rows):
+        raise ValueError('Back has no opaque photographed edge')
+    row=int(rows[0])
+    previous=float(strength[row-1]) if row else 0.
+    boundary=row-1+(128-previous)/max(1.,float(strength[row])-previous)
+    offset=np.full(image.width,boundary-.25)
+    if abs(offset[0])>8:
+        raise ValueError('Bottom canvas margin exceeds bounded local correction')
+    shifted=_move_upper_band(flipped,offset,retain_edge_coverage=True)
+    result=Image.fromarray(shifted[::-1].copy())
+    final=np.asarray(result)
+    band=round(.059*image.width)
+    if not np.array_equal(source[band:-band],final[band:-band]):
+        raise ValueError('Back edge normalization moved the central body or lenses')
+    if not final[0,:,3].any() or not final[-1,:,3].any():
+        raise ValueError('Back retains an empty outer canvas row')
+    return result,dict(top=top,bottom_original_edge_px=float(boundary),
+                       bottom_local_shift_px=float(offset[0]),central_pixels_unchanged=True,
+                       top_empty_canvas_rows=0,bottom_empty_canvas_rows=0,
+                       boundary_band_height_px=band,top_target_edge_px=top_target,bottom_target_edge_px=.25)

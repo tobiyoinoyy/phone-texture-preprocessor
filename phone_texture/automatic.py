@@ -230,14 +230,14 @@ def process_one(task):
                     pre_trim_image=None;analysis_stage='geometry'
                     try:
                         if face in pipeline.FRAMES:
-                            image,evidence=frame_geometry(matte,face,capture,source_image=raw)
+                            image,evidence=frame_geometry(matte,face,capture,source_image=raw,model=model)
                         else:
                             if protection_policy=='none':
                                 paper,paper_info=paper_mask(matte,face,resolve_end=False)
-                                image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw,reconstruct_paper_tail=False)
+                                image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw,reconstruct_paper_tail=False,prefer_front_closure=face=='front')
                             else:
                                 paper,paper_info=paper_mask(matte,face)
-                                image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw)
+                                image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw,prefer_front_closure=face=='front')
                             evidence['source_paper_proposal']=paper_info
                         pre_trim_image=image
                         analysis_stage='paper_before_visible_canvas_trim'

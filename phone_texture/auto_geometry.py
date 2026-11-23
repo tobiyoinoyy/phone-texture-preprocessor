@@ -435,7 +435,7 @@ def _bottom_upper_body_rail(rgba, raw, top, bottom, extent):
                       original_rail=top.tolist(),window_residuals_px=residuals)
 
 
-def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_support_edge=True):
+def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_support_edge=True, *, model=None):
     a=np.array(matte.convert('RGBA')); original=a.copy()
     raw=np.array(source_image.convert('RGB')) if source_image else None
     if face == 'top':
@@ -451,6 +451,14 @@ def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_suppo
                 proof['original_failure'] = str(failure)
                 return recovered, proof
             except ValueError as unsupported:
+                if model is not None:
+                    from .top_body_template import normalize_top
+                    try:
+                        return normalize_top(matte,source_image,model,stage_sink,
+                                             previous_error=f'{failure} (source contact check: {unsupported})')
+                    except ValueError as template_error:
+                        raise TopCalibrationError(f'{failure} (source contact check: {unsupported}; '
+                                                  f'thickness template: {template_error})') from template_error
                 raise TopCalibrationError(f'{failure} (source contact check: {unsupported})') from unsupported
     else:
         try:
@@ -580,7 +588,9 @@ def front_lower_closure(mask,raw_rgb,x0,x1,last_body_row,source_alpha=None):
     xx=np.arange(int(x0+.1*bw),int(x1-.1*bw));bottom=h-np.argmax(mask[::-1,xx],axis=0)
     witnesses=abs(bottom-np.polyval(line,xx+.5))<=6
     if witnesses.sum()<.4*bw:raise ValueError('Front lower conservation witnesses are insufficient')
-    core=mask if source_alpha is None else np.asarray(source_alpha)>=240
+    # Conservation and the exposed-edge witnesses must refer to the same
+    # phone component. Disconnected matte specks cannot extend its lower end.
+    core=mask if source_alpha is None else (np.asarray(source_alpha)>=240)&mask
     core_bottom=h-np.argmax(core[::-1,xx],axis=0)
     outward=max(0.,float(np.max(core_bottom[witnesses]-np.polyval(line,xx[witnesses]+.5))))
     if outward>3:raise ValueError('Front lower contour needs unsupported outward extension')
@@ -599,6 +609,7 @@ def front_lower_closure(mask,raw_rgb,x0,x1,last_body_row,source_alpha=None):
         alpha_residual_p95_px=residual,alpha_samples=len(x),source_conservation_outward_px=outward,source_core_alpha_threshold=240,
         glass_background_contrast_medians=[float(np.median(v)) for v in groups],
         dark_glass_closure_fractions=fractions,observed_body_width_fraction=body_width_fraction,
+        source_conservation_component='principal_phone',
         RGB_does_not_set_inward_cut=True)
     return 2*residual,line,line,len(x),[.30,.45],proof
 
@@ -653,6 +664,17 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
         if error>3:continue
         clear_options.append((ce+re,cline,rline,int(clear.sum()),[lo,hi]))
     lower_plane_proof=None
+    if _front_closure_evidence and face=='front':
+        try:
+            closure = front_lower_closure(mask,raw_rgb,x0,x1,rows[-1],a[...,3])
+        except ValueError:
+            closure = None
+        if closure is not None:
+            old = min(clear_options,key=lambda item:item[0]) if clear_options else None
+            center = (x0+x1)/2
+            if old is None or np.polyval(old[2],center)-np.polyval(closure[2],center)>3:
+                score,al,rl,n,bands,lower_plane_proof=closure
+                clear_options=[(score,al,rl,n,bands)]
     if not clear_options:
         try:
             if _front_closure_evidence:
@@ -779,10 +801,32 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
         rgb_painted=False,axis_evidence=axis_proof,review_reasons=['heuristic_support_cut','complete_outline_requires_review'])
 
 
-def plate_geometry(matte,face,paper=None,stage_sink=None,source_image=None,reconstruct_paper_tail=True):
+def check_front_support_residue(image):
+    """Reject a bright attached tail; this check never invents a crop line."""
+    a=np.asarray(image.convert('RGBA'));mask=principal(a[...,3])
+    widths=mask.sum(axis=1);wide=np.flatnonzero(widths>widths.max()*.8)
+    last=int(np.flatnonzero(mask.any(axis=1))[-1]);end=int(wide[-1])
+    depth=last-end
+    if depth<=max(12,.04*widths.max()):
+        return dict(narrow_tail_rows=depth,bright_support_residue=False)
+    gray=a[...,:3].mean(axis=2)
+    tail=mask.copy();tail[:end+1]=False
+    inside=mask[max(0,end-30):max(1,end-15)]
+    body=gray[max(0,end-30):max(1,end-15)][inside]
+    contrast=float(np.median(gray[tail])-np.median(body))
+    if contrast>40:
+        raise ValueError('Front retains a bright narrow stand projection below body')
+    return dict(narrow_tail_rows=depth,tail_contrast=contrast,bright_support_residue=False)
+
+
+def plate_geometry(matte,face,paper=None,stage_sink=None,source_image=None,reconstruct_paper_tail=True,*,prefer_front_closure=False):
     """Keep accepted geometry unchanged; recover a different exposed source gap."""
     try:
-        return _plate_geometry_strict(matte,face,paper,stage_sink,source_image,reconstruct_paper_tail)
+        image,proof = _plate_geometry_strict(matte,face,paper,stage_sink,source_image,reconstruct_paper_tail,
+                                            _front_closure_evidence=prefer_front_closure)
+        if face=='front':
+            proof['front_support_residue_check']=check_front_support_residue(image)
+        return image,proof
     except ValueError as original:
         if str(original)!='Plate lower boundary is uncertain' or face!='front':raise
         try:
@@ -794,4 +838,5 @@ def plate_geometry(matte,face,paper=None,stage_sink=None,source_image=None,recon
             raise original
         proof['lower_plane_evidence']['recovery']='independent_exposed_gap_between_attached_support_contacts'
         proof['lower_plane_evidence']['original_failure']=str(original)
+        proof['front_support_residue_check']=check_front_support_residue(image)
         return image,proof

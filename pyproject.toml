@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "phone-texture-preprocessor"
-version = "1.6.2"
+version = "1.6.3"
 description = "Phone six-view standardization, frame deskew and UV-aware structure alignment"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,7 +22,7 @@ phone-normalizer = "phone_normalizer.cli:main"
 phone-normalizer-uv = "phone_normalizer.uv_cli:main"
 
 [tool.setuptools.package-data]
-phone_texture = ["web_assets/*", "recognition_data/*", "seam_profiles/*.json"]
+phone_texture = ["web_assets/*", "recognition_data/*", "seam_profiles/*.json", "top_body_profiles.json"]
 phone_normalizer = ["profiles/*.json"]
 texture_alignment = ["annotator.html"]
 

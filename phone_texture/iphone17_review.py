@@ -164,16 +164,27 @@ def continue_review(case, sku, review_dir=None):
         notes.append(dict(stage='seam',error=str(exc)))
     from .iphone17_back_finish import finish_back
     camera_finish = None
+    back_edges = None
     try:
         if geometry_states['back'] != 'geometry':
             raise ValueError('背图轮廓尚未确认，无法校验双镜位置和顶边')
         aligned_back, camera_finish = finish_back(Image.open(selected['back']))
+        back_edges = camera_finish.get('canvas_edge_normalization')
         back_path = review/'checks'/'back-finish.png'
         aligned_back.save(back_path)
         camera_finish['output_sha256'] = w.sha(back_path)
         selected['back'] = back_path
     except ValueError as exc:
         notes.append(dict(face='back', stage='camera_registration', error=str(exc)))
+        # Canvas margins can be corrected independently of lens acceptance.
+        from .back_geometry import normalize_back_edges
+        try:
+            edge_candidate, back_edges = normalize_back_edges(Image.open(selected['back']))
+            edge_path = review/'checks'/'back-canvas-edges.png'
+            edge_candidate.save(edge_path)
+            selected['back'] = edge_path
+        except ValueError as edge_error:
+            notes.append(dict(face='back', stage='back_canvas_edges', error=str(edge_error)))
     hashes = {}
     for face, source in selected.items():
         dest = review/'candidates'/(face+'.png')
@@ -197,6 +208,7 @@ def continue_review(case, sku, review_dir=None):
                   candidate=str(review/'candidates'), final_sha256=hashes,
                   degraded_lighting=degraded_lighting,model_frame_finish=frame_finish,
                   model_camera_registration=camera_finish,
+                  back_canvas_edge_normalization=back_edges,
                   degraded_geometry=[n['face'] for n in notes if n.get('candidate_status')],
                   visual_review_passed=False, model_uv_verified=False)
     w.save(review/'review.json', report)

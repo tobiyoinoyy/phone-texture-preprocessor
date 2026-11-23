@@ -104,6 +104,28 @@ def run_stages(case, files, geometry, manifest):
         'none', 'accepted-shadow-lift-v1', lambda *a, **k: None, lambda *a: None)
 
 
+def test_stand_exposed_after_transforms_keeps_six_files_but_blocks_geometry(tmp_path, monkeypatch):
+    case, files, geometry, manifest = checkpoint(tmp_path)
+    fake_stages(monkeypatch)
+    original = stages.frame_seams.run
+    def transformed(*args, **kwargs):
+        report = original(*args, **kwargs)
+        front = args[3]/'front.png'
+        a = np.asarray(Image.open(front)).copy()
+        a[60:,:,3] = 0
+        a[60:,10:30] = [230,230,230,255]
+        Image.fromarray(a).save(front)
+        report['output_sha256']['front'] = stages.w.sha(front)
+        return report
+    monkeypatch.setattr(stages.frame_seams,'run',transformed)
+    result = run_stages(case, files, geometry, manifest)
+    assert result['six_faces_generated'] and not result['six_faces_processed']
+    assert result['stage_status'] == dict(geometry='degraded',lighting='complete',structure='complete',seam='complete')
+    assert not result['final_front_support_check']['verified']
+    assert any(b['stage']=='geometry' and 'stand projection' in b['error'] for b in result['blocked_checks'])
+    assert len(result['final_sha256']) == 6
+
+
 def test_failed_back_lighting_does_not_stop_other_faces_or_supported_structure(tmp_path, monkeypatch):
     case, files, geometry, manifest = checkpoint(tmp_path)
     observed = fake_stages(monkeypatch, failed_faces=('back',))

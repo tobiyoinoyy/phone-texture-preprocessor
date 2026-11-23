@@ -584,6 +584,8 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                 case/'work/seam-candidates'/sku, case/'work/seam-records', **options)
             verify_sources()
             selected = {f: case/'work/seam-candidates'/sku/(f+'.png') for f in pipeline.FACES}
+            from .frame_end_color import effect_notes
+            item_effect_warnings.extend(effect_notes(seam_report.get('end_color', {})))
             selected_hashes = seam_report['output_sha256']
             state['seam'] = 'complete'
             resolution = seam_report.get('continuity_resolution') or {}
@@ -655,6 +657,14 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
     pipeline.publish(final_staged.parent, candidate)
     final = pipeline.batch_files(candidate)[sku]
     verify_sources()
+    from .auto_geometry import check_front_support_residue
+    try:
+        final_front_check = dict(check_front_support_residue(Image.open(final['front'])), verified=True)
+    except ValueError as error:
+        final_front_check = dict(verified=False, reason=str(error))
+        state['geometry'] = 'degraded'
+        blocked.append(dict(stage='geometry', face='front', error=str(error),
+                            candidate_status='final_stand_residue_retained_for_source_boundary_repair'))
     warnings = [dict(face=f, **c['source_relative_effect_checks']) for f, c in checks.items()
         if c['source_relative_effect_checks'].get('original_effect_check_passed') is False]
     for face, checked in checks.items():
@@ -688,12 +698,13 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
         item_effect_warnings=item_effect_warnings,
         candidate=str(candidate), lighting_checks=checks, structure_checks=structural['checks'] if structural else {},
         frame_uv_seam_checks=seam_report, source_hashes_unchanged=True,
-        final_canvas_checks=final_canvas_checks, back_standard_canvas=back_canvas_proof,
+        final_canvas_checks=final_canvas_checks, final_front_support_check=final_front_check,
+        back_standard_canvas=back_canvas_proof,
         back_ready_for_backfill=bool(back_canvas_proof and back_canvas_proof.get('back_ready_for_backfill')),
         final_sha256={f: w.sha(p) for f, p in final.items()})
     if side_review is not None:
         result.update(current_side_review=side_review,
-            side_candidate_review_complete=side_review['complete'] and all(
+            side_candidate_review_complete=side_review['complete'] and final_front_check['verified'] and all(
                 per_face[face]['lighting'] in ('complete', 'effect_warning')
                 for face in ('front', 'back', 'top', 'bottom')),
             side_candidate_review_attempted=True,

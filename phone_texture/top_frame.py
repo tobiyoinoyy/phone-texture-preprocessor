@@ -41,7 +41,7 @@ def _fast_lower_plateau(distance, observed, width, gradients, xx):
         raw_rgb_alpha_offset_p95_px=float(np.percentile(np.abs(offsets[valid]),95)),plateau=plateau)
 
 
-def _calibrate_top(rgba, raw_rgb, exposed_lower=False):
+def _calibrate_top(rgba, raw_rgb, exposed_lower=False, *, allow_taper=False):
     if raw_rgb is None or raw_rgb.shape != rgba[..., :3].shape:
         raise TopCalibrationError('TOP_SOURCE_REQUIRED: original RGB required')
     alpha = rgba[..., 3]
@@ -123,7 +123,7 @@ def _calibrate_top(rgba, raw_rgb, exposed_lower=False):
     rotation=float(np.degrees(np.mean(np.arctan([upper[0],lower[0]]))))
     residual=np.abs(rail_angles-rotation)
     if (np.min(thickness) < .07*width or np.max(thickness) > .17*width or
-            residual.max() > .15 or
+            (residual.max() > .15 and not allow_taper) or
             max(abs(upper[0]), abs(lower[0])) > np.tan(np.deg2rad(4))):
         raise TopCalibrationError('TOP_BODY_RAILS_DISAGREE')
     # Raw surface transition across the body is independent of the silhouette
