@@ -203,6 +203,7 @@ def apply(job, face, folder, profile=NAME):
         from .rear_shadow import InsufficientRearShadowEvidence, prepare
         camera=next((d for d in view['domains'] if d['name']=='camera_surround'),None)
         if camera is not None:
+            view['camera_metal_layout'] = 'triple'
             material=np.array(Image.open(camera['mask']).convert('L'))>0
             try:
                 plan=prepare(a,material,view['source_sha256'],render.digest(camera['mask']))

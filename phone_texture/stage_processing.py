@@ -250,6 +250,8 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
         checked = measure_masks(source, candidate, allowed, paper)
         if any('rear_shadow_correction' in v or 'rear_shadow_notice' in v for v in job.get('views', [])):
             checked['rear_shadow_correction'] = report['views'][face]['rear_shadow_correction']
+        if any(v.get('camera_metal_layout') for v in job.get('views', [])):
+            checked['camera_metal'] = report['views'][face]['camera_metal']
         if protection_policy == 'none':
             checked['actual_no_zone_effects'] = no_zone_effects(source, candidate, analysis)
         return checked

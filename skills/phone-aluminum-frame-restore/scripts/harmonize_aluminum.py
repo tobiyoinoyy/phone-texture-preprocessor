@@ -161,6 +161,26 @@ def preserve_chroma_in_gamut(desired, source):
     return result, int(bad.sum())
 
 
+def bounded_lab_offset(current, proposed):
+    """Approach the same-metal target continuously when an RGB channel would clip."""
+    linear = lab_to_linear_rgb(proposed)
+    limited = np.any((linear < -1e-7) | (linear > 1+1e-7), axis=1)
+    if not limited.any():
+        return proposed, 0
+    start = current[limited]
+    change = proposed[limited] - start
+    lo, hi = np.zeros(len(start)), np.ones(len(start))
+    for _ in range(16):
+        mid = (lo+hi)/2
+        trial = lab_to_linear_rgb(start+mid[:,None]*change)
+        fits = np.all((trial >= -1e-7) & (trial <= 1+1e-7), axis=1)
+        lo = np.where(fits, mid, lo)
+        hi = np.where(fits, hi, mid)
+    result = proposed.copy()
+    result[limited] = start+lo[:,None]*change
+    return result, int(limited.sum())
+
+
 def color_mode(config):
     mode = config.get('color_mode', 'source_lightness')
     if mode not in ('source_lightness', 'shared_color'):
@@ -831,7 +851,7 @@ def process_view(item, target, defaults):
         raise ValueError('Gamut continuity requires source_lightness')
     rear_shadow=item.get('rear_shadow_notice')
     if item.get('rear_shadow_correction'):
-        from phone_texture.rear_shadow import InsufficientRearShadowEvidence, correction
+        from phone_texture.rear_shadow import InsufficientRearShadowEvidence, correction, guard_secondary_arcs
         plan=item['rear_shadow_correction']
         if item.get('name')!='back' or mode!='source_lightness':
             raise ValueError('Rear shadow correction requires a source-lightness back')
@@ -847,9 +867,43 @@ def process_view(item, target, defaults):
         else:
             desired=out_lab.copy();desired[...,0]+=extra
             safe,limited=preserve_chroma_in_gamut(desired,lab)
+            actual=np.where(scope[...,None],safe,out_lab)
+            guarded,restored=guard_secondary_arcs(out_lab,lab,actual,material,plan,rear_shadow)
+            if restored.any():
+                revised=guarded[restored]
+                linear=lab_to_linear_rgb(revised)
+                outside=np.any((linear < -1e-7) | (linear > 1+1e-7),axis=-1)
+                if outside.any():
+                    revised[outside],_=preserve_chroma_in_gamut(revised[outside],lab[restored][outside])
+                safe[restored]=revised
+                limited+=int(outside.sum())
+                scope|=restored
             # Preserve every other material/field exactly, including the logo.
             out_lab[scope]=safe[scope]
             rear_shadow.update(gamut_limited_pixels=limited,scope_outside_material_pixels=int(np.count_nonzero(scope&~material)))
+    camera_metal = None
+    if item.get('camera_metal_notice'):
+        camera_metal = dict(status='source_evidence_unavailable',reason=item['camera_metal_notice'])
+    if item.get('camera_metal_layout'):
+        from phone_texture import camera_metal as camera
+        layout = item['camera_metal_layout']
+        if item['name'] != 'back' or mode != 'source_lightness' or item.get('source_sha256') != before_hash:
+            raise ValueError('Camera metal requires a source-bound back lighting job')
+        region = domain_masks['camera_capsule' if layout=='dual' else 'camera_surround']
+        try:
+            camera_plan = camera.measure(src, layout)
+        except ValueError as exc:
+            camera_metal = dict(status='source_evidence_unavailable',reason=str(exc))
+        else:
+            corrected,active,camera_metal = camera.apply(src,lab,out_lab,region,camera_plan,item.get('rear_shadow_correction'))
+            proposed = corrected[active]
+            top = out_lab[:len(corrected)]
+            current = top[active]
+            pixels,limited = bounded_lab_offset(current,proposed)
+            applied = int(np.count_nonzero(np.any(abs(pixels-current)>1e-6,axis=1)))
+            top[active] = pixels
+            camera_metal.update(status='applied' if applied else 'no_supported_change',
+                                applied_pixels=applied,gamut_limited_pixels=limited)
     dst = src.copy()
     converted = lab_to_rgb(out_lab)
     quantization=[]
@@ -867,7 +921,7 @@ def process_view(item, target, defaults):
         raise RuntimeError('Source changed during processing')
     return dst, allowed_union, protect, {'source':str(path),'source_sha256':before_hash,
         'size':[w,h], 'domains':domains, 'color_mode':mode,
-        'gamut_limited_pixels':gamut_limited,'correction_blends':blends,'rear_shadow_correction':rear_shadow,
+        'gamut_limited_pixels':gamut_limited,'correction_blends':blends,'rear_shadow_correction':rear_shadow,'camera_metal':camera_metal,
         'gamut_continuity':gamut_continuity,'quantization_continuity':quantization,
         'required_editable_pixels':int(required.sum()),
         'required_editable_missing':0,

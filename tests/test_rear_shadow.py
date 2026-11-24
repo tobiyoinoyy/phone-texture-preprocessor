@@ -54,6 +54,40 @@ def test_uniform_plate_does_not_acquire_a_bright_halo():
     assert field.max()<.25
 
 
+@pytest.mark.parametrize('radius', [62., 105.])
+def test_extra_lift_cannot_reveal_a_second_line_outside_the_true_rim(radius):
+    y, x = np.ogrid[:330, :330]
+    distance = np.hypot(x-165, y-165) - radius*1.14
+    angle = np.rad2deg(np.arctan2(y-165, x-165))
+    material = distance > 0
+    lens = dict(ellipse=[165, 165, 2*radius, 2*radius, 0],
+                hardware_radii=[1.14]*rear_shadow.ANGLES)
+    # A single dark joint fades into the photographed metal. The artificial
+    # lift introduces a second trough while leaving the photographed joint intact.
+    raw = np.zeros((*material.shape, 3))
+    raw[..., 0] = 34 - 22*np.exp(-np.maximum(distance, 0)/4.5)
+    raw[..., 2] = -18 + 10*np.exp(-((distance-8)/3)**2)
+    base = raw.copy()
+    base[..., 0] += 5.
+    untouched = base.copy()
+    assert rear_shadow._restore_secondary_arc(base, raw, untouched, material, lens)['status'] == 'clear'
+    assert np.array_equal(untouched, base)
+    broad_arc = np.abs(angle) < 38
+    fixed = base.copy()
+    fixed[..., 0] += 21*np.exp(-((distance-5)/1.8)**2)*broad_arc
+    original = fixed.copy()
+    report = rear_shadow._restore_secondary_arc(base, raw, fixed, material, lens)
+    assert report['status'] == 'guarded'
+    assert report['reconstructed_angles'] > 20
+    assert report['same_material_color_pixels'] > 0
+    assert np.array_equal(fixed[distance <= 2], original[distance <= 2])
+    assert np.array_equal(fixed[np.abs(angle) > 55], original[np.abs(angle) > 55])
+    centre_arc = np.abs(angle) < 12
+    crest, valley = [(distance > lo)&(distance < hi)&centre_arc for lo, hi in [(4, 6), (8, 10)]]
+    assert np.median(fixed[crest, 0]) - np.median(fixed[valley, 0]) < 1.
+    assert np.median(np.abs(fixed[valley, 2]+18)) < 2.5
+
+
 def test_narrow_joint_directional_darkening_is_reduced_without_editing_bright_rim():
     a,m,_,ring=scene(shadow=False)
     yy,xx=np.indices(m.shape)

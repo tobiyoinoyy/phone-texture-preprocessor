@@ -224,6 +224,7 @@ def job(source,face,folder,structure):
     sticker,sticker_proof=paper(image,face);visible=a[...,3]>0
     domains=[];allowed=np.zeros((h,w),bool);regions=[]
     proof=dict(source_sha256=digest(source),paper=sticker_proof)
+    camera_plan = None
     if face=='front':
         rim,rim_proof=front_metal(image);proof['rim']=rim_proof
         regions=[('main_surface',rim,[max(18,h*.012),2.],True)]
@@ -231,6 +232,21 @@ def job(source,face,folder,structure):
         rim,rim_proof,body=glass_back_rim(image,sticker);proof['rim']=rim_proof
         body_path=save_mask(folder/'body-contour.png',body)
         regions=[('rear_perimeter',rim,[max(18,h*.012),2.],True)]
+        from .camera_metal import dual_scope, measure
+        try:
+            camera_plan = measure(a, 'dual')
+        except ValueError as error:
+            proof['camera_metal_notice'] = str(error)
+        else:
+            if all(sum(lens['supported']) >= 210 for lens in camera_plan['lenses']):
+                capsule = dual_scope((h,w), camera_plan) & (a[...,3]==255) & ~rim & ~sticker
+                if capsule.sum() >= 100:
+                    regions.append(('camera_capsule',capsule,[3.,3.],False))
+                else:
+                    proof['camera_metal_notice'] = '双摄凸台可用范围不足'
+            else:
+                proof['camera_metal_notice'] = '双摄金属框的原图边界证据不足'
+
     else:
         remaining=visible&~sticker
         if face in ('left','right'):
@@ -307,6 +323,8 @@ def job(source,face,folder,structure):
         if (mask&(a[...,3]>=240)).sum()<20:raise ValueError('Insufficient material evidence: '+name)
         path=save_mask(folder/(name+'.png'),mask);ref=reference_box(a,mask);allowed|=mask
         d=dict(name=name,mask=path,reference_boxes=[ref],sigma=sigma,strength=[.72,0,0],feather=0,correction_smooth=1.5)
+        if name=='camera_capsule':
+            d['strength']=[0.,0.,0.]
         if contour:
             reliable=mask&(a[...,3]>=240)
             shoulder=float(ndimage.distance_transform_edt(~reliable)[mask&(a[...,3]>=128)].max())
@@ -320,4 +338,9 @@ def job(source,face,folder,structure):
     view=dict(name=face,source=str(Path(source).resolve()),source_sha256=digest(source),
         protection_policy='none' if face=='bottom' else 'sticker_only',sticker_mask=sticker_path,protected_mask=sticker_path,
         required_editable_mask=required,reference_boxes=domains[0]['reference_boxes'],domains=domains)
+    if face=='back':
+        if 'camera_metal_notice' in proof:
+            view['camera_metal_notice'] = proof['camera_metal_notice']
+        else:
+            view['camera_metal_layout'] = 'dual'
     return dict(color_mode='source_lightness',defaults=dict(max_lab_shift=[35,0,0],feather=0),views=[view]),proof,allowed,sticker

@@ -118,9 +118,11 @@ def light_face(source, face, work, light, structure):
     spec.update(output_dir=str(light.resolve()),records_dir=str(records.resolve()))
     jp=assets/'job.json';w.save(jp,spec);w.save(assets/'analysis.json',proof)
     with (assets/'engine.log').open('w') as log,contextlib.redirect_stdout(log):
-        lighting.run('aluminum',jp)
+        lighting_report = lighting.run('aluminum',jp)
     dest=light/(face+'.png')
     check=measure_masks(source,dest,allowed,sticker)
+    if face=='back' and lighting_report:
+        check['camera_metal'] = lighting_report['views'][face].get('camera_metal')
     before=np.asarray(Image.open(source).convert('RGBA'));after=np.asarray(Image.open(dest).convert('RGBA'))
     delta=lightness(after[...,:3])-lightness(before[...,:3])
     if abs(delta[allowed]).max()>35.5:raise ValueError('Standard illumination exceeded the frozen source correction limit')
