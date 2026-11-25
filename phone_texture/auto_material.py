@@ -1002,10 +1002,23 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
             # never smooth source RGB or let paper seed the metal correction.
             domains[-1].update(gamut_continuity_step_L=(.2 if face in ('top','bottom') else .6),
                               gamut_continuity_opaque_seeds=True)
+            if face in ('top', 'bottom') and name == 'main_surface':
+                # Top/bottom rails use a gentle 0.2 L/px propagation step where
+                # a single 2-4 px white scuff/ding can otherwise stamp a 40 px
+                # dark diamond halo. Left/right already use follow_source_edges
+                # and require exact per-pixel antenna-bevel highlight continuity.
+                domains[-1].update(gamut_continuity_seed_quantile=15,
+                                  gamut_continuity_seed_window=9)
         if face=='back' and name in ('camera_surround','main_surface'):
             # Saturated source highlights can make the final per-pixel gamut
             # limiter discontinuous well away from a material-domain seam.
-            domains[-1]['gamut_continuity_step_L']=REAR_GAMUT_CONTINUITY_STEP_L
+            # Use an edge-preserving local quantile so 1-6 px metallic grain
+            # glints never stamp dark pox-mark craters into shadowed metal.
+            domains[-1].update(
+                gamut_continuity_step_L=REAR_GAMUT_CONTINUITY_STEP_L,
+                gamut_continuity_seed_quantile=15,
+                gamut_continuity_seed_window=9,
+            )
         if face=='back' and name=='main_surface' and mark.any():
             domains[-1].update(field='feature_excluded_gaussian',feature_mask=mark_path)
         if name=='rear_perimeter' or (face=='front' and name=='main_surface'):

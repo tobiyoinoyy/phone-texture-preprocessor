@@ -241,10 +241,17 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
             # never smooth source RGB or let paper seed the metal correction.
             domains[-1].update(gamut_continuity_step_L=(.2 if face in ('top','bottom') else .6),
                               gamut_continuity_opaque_seeds=True)
+            if face in ('top', 'bottom') and name == 'main_surface':
+                domains[-1].update(gamut_continuity_seed_quantile=15,
+                                  gamut_continuity_seed_window=9)
         if face=='back' and name in ('camera_surround','main_surface'):
             # Saturated source highlights can make the final per-pixel gamut
             # limiter discontinuous well away from a material-domain seam.
-            domains[-1]['gamut_continuity_step_L']=REAR_GAMUT_CONTINUITY_STEP_L
+            domains[-1].update(
+                gamut_continuity_step_L=REAR_GAMUT_CONTINUITY_STEP_L,
+                gamut_continuity_seed_quantile=15,
+                gamut_continuity_seed_window=9,
+            )
         if name=='rear_perimeter' or (face=='front' and name=='main_surface'):
             domains[-1].update(field='contour',sigma=[max(18,h*.012),max(5,w*.006)])
         if name=='rear_perimeter':domains[-1].update(reference_profile='contour_depth_lift',strength=[.92,0,0],max_lab_shift=[48,0,0],contour_alpha_mask=body_path,source_body_contour=body_proof,

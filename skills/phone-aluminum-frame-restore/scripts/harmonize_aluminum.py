@@ -274,16 +274,26 @@ def _min_plus_sweep(cap, mask, step, *, eight_connected=False, edge_costs=None):
 
 def continuous_gamut_limits(desired, safe, source, mask, max_step, seed_mask=None,
                             follow_field=False, follow_source_edges=False,
-                            source_edge_weight=None):
+                            source_edge_weight=None, seed_quantile=None,
+                            seed_window=0):
     """Propagate actual gamut caps through one material's correction field.
 
     Only reduce L displacement toward the source. Source texture/chroma are
     never filtered, and an unbounded field is returned exactly unchanged.
     Paper, other materials and opposite-sign corrections block propagation.
+    When ``seed_quantile`` and ``seed_window >= 3`` are set, isolated micro-grain
+    glints below that local spatial coverage do not seed wide dark craters; an
+    edge-preserving local quantile supplies the propagated cap while each pixel
+    still obeys its own exact in-gamut ``safe`` bound.
     """
     max_step = float(max_step)
     if not np.isfinite(max_step) or max_step <= 0:
         raise ValueError('Gamut continuity step must be finite and positive')
+    if seed_quantile is not None:
+        seed_quantile = float(seed_quantile)
+        seed_window = int(seed_window)
+        if not np.isfinite(seed_quantile) or not (0. < seed_quantile < 100.) or seed_window < 3:
+            raise ValueError('Gamut seed quantile requires 0 < quantile < 100 and window >= 3')
     wanted = desired[..., 0] - source[..., 0]
     if source_edge_weight is None:
         source_edge_weight = np.ones(mask.shape)
@@ -327,14 +337,31 @@ def continuous_gamut_limits(desired, safe, source, mask, max_step, seed_mask=Non
         if not seeds.any():
             continue
         magnitude = np.maximum(0., sign * bounded)
-        cap = np.where(seeds, magnitude, np.inf)
+        if seed_quantile is not None:
+            from scipy.ndimage import percentile_filter, uniform_filter
+            seed_frac = uniform_filter(seeds.astype(float), size=seed_window, mode='nearest')
+            reg_frac = np.maximum(uniform_filter(region.astype(float), size=seed_window, mode='nearest'), 1e-6)
+            coherent = seeds & ((seed_frac / reg_frac) >= (seed_quantile / 100.0))
+            if not coherent.any():
+                continue
+            robust_mag = percentile_filter(
+                np.where(region, magnitude, np.inf),
+                percentile=seed_quantile, size=seed_window, mode='nearest',
+            )
+            robust_mag = np.where(np.isfinite(robust_mag), robust_mag, magnitude)
+            cap = np.where(coherent, robust_mag, np.inf)
+        else:
+            cap = np.where(seeds, magnitude, np.inf)
         cap = _min_plus_sweep(cap, region, max_step, eight_connected=False, edge_costs=edge_costs)
         affected = region & (cap < magnitude)
         result[affected, 0] = source[affected, 0] + sign * cap[affected]
         changed |= affected
     return result, dict(max_step_L=max_step, gamut_seed_pixels=int(limited.sum()),
                         adjusted_pixels=int(changed.sum()),
-                        method='same_material_gamut_cap_propagation',
+                        method=('robust_quantile_gamut_cap_propagation' if seed_quantile is not None
+                                else 'same_material_gamut_cap_propagation'),
+                        seed_quantile=seed_quantile,
+                        seed_window=int(seed_window) if seed_quantile is not None else 0,
                         follows_fitted_correction_gradient=bool(follow_field),
                         follows_source_edges=bool(follow_source_edges))
 
@@ -926,7 +953,9 @@ def process_view(item, target, defaults):
                 out_lab, proof = continuous_gamut_limits(desired, out_lab, lab,
                     domain_masks[name], domain['gamut_continuity_step_L'], seed_mask,
                     domain.get('gamut_continuity_follow_field', False),
-                    domain.get('gamut_continuity_follow_source_edges', False), edge_weight)
+                    domain.get('gamut_continuity_follow_source_edges', False), edge_weight,
+                    seed_quantile=domain.get('gamut_continuity_seed_quantile'),
+                    seed_window=domain.get('gamut_continuity_seed_window', 0))
                 proof['opaque_seeds_only'] = seed_mask is not None
                 gamut_continuity.append(dict(name=name, **proof))
         if audit_rail:

@@ -54,17 +54,54 @@ def _disks(a):
             right = max(disks, key=lambda v: v[0])
             left = sorted([d for d in disks if d is not right], key=lambda v: v[1])
             readings.append(left + [right])
-    if len(readings) < 3:
+    if len(readings) >= 3:
+        arr = np.asarray(readings)
+        # Extreme thresholds can clip a rim highlight or, on dark bodies, merge the
+        # lens with its dark bezel. Keep the largest group of readings that agree
+        # within 1.5 px with one of them.
+        groups = [np.abs(arr[:, :, :2] - ref[:, :2]).max(axis=(1, 2)) <= 1.5 for ref in arr]
+        agree = max(groups, key=lambda g: g.sum())
+        if agree.sum() >= 3:
+            return np.median(arr[agree], axis=0), int(agree.sum())
+
+    # On dark bodies (e.g. deep blue), cast shadows merge into individual lenses
+    # at different gray thresholds, preventing three simultaneous coarse readings
+    # from agreeing within 1.5 px. Sweep finer thresholds and require independent
+    # per-slot spatial consensus plus the standard triple-lens triangle geometry.
+    h, w = a.shape[:2]
+    roi = _gray(a)[:int(.3 * h), :int(.6 * w)]
+    by_slot = [[], [], []]
+    for threshold in range(25, 89, 3):
+        binary = cv2.morphologyEx((roi < threshold).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        n, _, stats, centres = cv2.connectedComponentsWithStats(binary, 8)
+        disks = []
+        for i in range(1, n):
+            x, y, bw, bh, area = stats[i]
+            if .12 * w < bw < .3 * w and .7 < bw / bh < 1.4 and area / (np.pi * bw * bh / 4) >= .8:
+                disks.append((centres[i][0], centres[i][1], (bw + bh) / 4))
+        if len(disks) == 3:
+            right = max(disks, key=lambda v: v[0])
+            left = sorted([d for d in disks if d is not right], key=lambda v: v[1])
+            for k, disk in enumerate(left + [right]):
+                by_slot[k].append(disk)
+    out, counts = [], []
+    for slot_pts in by_slot:
+        if len(slot_pts) < 4:
+            return None, len(readings)
+        pts = np.asarray(slot_pts)
+        groups = [pts[np.max(np.abs(pts[:, :2] - p[:2]), axis=1) <= 1.8] for p in pts]
+        best = max(groups, key=len)
+        if len(best) < 4:
+            return None, len(readings)
+        out.append(np.median(best, axis=0))
+        counts.append(len(best))
+    out = np.asarray(out)
+    if (abs(out[0, 0] - out[1, 0]) > .04 * w
+            or (out[1, 1] - out[0, 1]) < .08 * h
+            or (out[2, 0] - max(out[0, 0], out[1, 0])) < .15 * w
+            or not (out[0, 1] < out[2, 1] < out[1, 1])):
         return None, len(readings)
-    readings = np.asarray(readings)
-    # Extreme thresholds can clip a rim highlight or, on dark bodies, merge the
-    # lens with its dark bezel. Keep the largest group of readings that agree
-    # within 1.5 px with one of them.
-    groups = [np.abs(readings[:, :, :2] - ref[:, :2]).max(axis=(1, 2)) <= 1.5 for ref in readings]
-    agree = max(groups, key=lambda g: g.sum())
-    if agree.sum() < 3:
-        return None, len(readings)
-    return np.median(readings[agree], axis=0), int(agree.sum())
+    return out, int(min(counts))
 
 
 def lens_centres(a):

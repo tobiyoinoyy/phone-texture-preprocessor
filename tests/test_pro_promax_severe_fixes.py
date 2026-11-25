@@ -392,3 +392,143 @@ def test_current_seam_readings_mirrors_terminal_transparent_corner_tip_tolerance
     masks_bad["right"] = m
     with pytest.raises(ValueError, match="jointly editable photographed metal"):
         _current_seam_readings(files, [chain], masks_bad, sigma=2)
+
+
+def test_back_lens_disks_per_slot_consensus_recovers_dark_body_lenses():
+    import cv2
+    from phone_texture.back_lens import _disks
+
+    # Dark blue plateau (gray ~ 56) with three lenses whose asymmetric shadow halos
+    # shift individual lenses slightly across coarse thresholds (breaking joint 1.5px).
+    h, w = 1000, 500
+    a = np.full((h, w, 4), 255, dtype=np.uint8)
+    a[..., :3] = 56
+    centres = [(98, 92, 46), (100, 224, 46), (225, 158, 47)]
+    for cx, cy, r in centres:
+        cv2.circle(a, (cx, cy), r, (18, 18, 18, 255), -1)
+        # Soft dark shadow halo shifting slightly off-center at higher gray thresholds.
+        cv2.circle(a, (cx + 4, cy), r + 3, (46, 46, 46, 255), 3)
+    disks, count = _disks(a)
+    assert disks is not None and count >= 3
+    for got, (cx, cy, _) in zip(disks, centres):
+        assert np.hypot(got[0] - cx, got[1] - cy) < 3.0
+
+
+def test_rear_shadow_plateau_core_accepts_coherent_top_bottom_ledges():
+    from phone_texture.rear_shadow import InsufficientRearShadowEvidence, _plateau_core
+
+    h, w = 1000, 500
+    yy, xx = np.indices((h, w))
+    # Rounded-rectangle camera plateau [32..465, 32..268] with corner radius 40.
+    r = 40.0
+    cx = np.clip(xx, 32.0 + r, 465.0 - r)
+    cy = np.clip(yy, 32.0 + r, 268.0 - r)
+    inside = ((xx - cx) ** 2 + (yy - cy) ** 2) <= r * r
+    L = np.where(inside, 74.0, 82.0)
+    # Soften bottom step in left 2/3 of the bottom check span (.57..80 of w = 285..400)
+    # so 2 of 3 windows have ~0.85 L/px gradient while all 3 agree on exact row 268.
+    L[(~inside) & (yy >= 268) & (xx >= 285) & (xx < 365)] = 76.2
+    bounds, proof = _plateau_core(L)
+    assert abs(bounds[3] - 268) <= 8
+
+    # Completely flat featureless image must still fail closed.
+    with pytest.raises(InsufficientRearShadowEvidence):
+        _plateau_core(np.full((h, w), 80.0, dtype=float))
+
+
+def test_camera_metal_align_plateau_shadows_lifts_masked_cast_shadow_only():
+    from phone_texture.camera_metal import _align_plateau_shadows
+
+    h, w = 360, 500
+    yy, xx = np.indices((h, w))
+    # Masked flat plateau excluding one circular camera lens at (120, 140), outer r=55.
+    dist = np.hypot(xx - 120.0, yy - 140.0) - 55.0
+    flat = (yy >= 20) & (yy < 330) & (xx >= 20) & (xx < 470) & (dist > 2.0)
+    raw = np.zeros((h, w, 3), dtype=float)
+    raw[..., 0] = 32.0
+    raw[..., 1] = 4.0
+    raw[..., 2] = -16.0
+    lab = raw.copy()
+    lab[..., 0] = 36.0
+    # Add a coherent cast shadow crescent to the right of the lens (dist 3..26 px).
+    shadow = flat & (dist > 2.5) & (dist < 26.0) & (xx > 165) & (np.abs(yy - 140) < 42)
+    raw[shadow, 0] -= 9.0
+    lab[shadow, 0] -= 8.0
+    lab[shadow, 2] += 4.5  # Shadow desaturated/grayish shift.
+
+    before_open = lab[flat & (xx > 320)].copy()
+    before_lens = lab[~flat].copy()
+    rep = _align_plateau_shadows(raw, lab, flat, [((120.0, 140.0, 48.0), dist, None, None)], None, scale=0.5)
+    assert rep["status"] == "applied" and rep["pixels"] > 200
+    # Shadow crescent aligned toward normal plateau lightness and blue chroma.
+    assert float(np.median(lab[shadow, 0])) > 33.5
+    assert float(np.median(lab[shadow, 2])) < -13.5
+    # Open unshaded plateau and masked lens interior stay untouched.
+    np.testing.assert_allclose(lab[flat & (xx > 320)], before_open, atol=0.1)
+    np.testing.assert_array_equal(lab[~flat], before_lens)
+
+
+def test_continuous_gamut_limits_robust_quantile_eliminates_grain_craters():
+    from phone_texture.lighting import engine
+
+    alum = engine("aluminum")
+    h, w = 120, 160
+    yy, xx = np.indices((h, w))
+    mask = np.ones((h, w), dtype=bool)
+    # Shadowed Cosmic Orange surface (L=62, a=35, b=33) with a few isolated 2x2
+    # bright sandblasted aluminum glints (L=74) + a broad bright highlight block on the right.
+    source = np.zeros((h, w, 3), dtype=float)
+    source[:] = [62.0, 35.0, 33.0]
+    for gy, gx in ((30, 35), (60, 55), (85, 40)):
+        source[gy:gy + 2, gx:gx + 2, 0] = 74.0
+    source[:, 110:, 0] = 74.0  # Genuine broad saturated highlight band.
+    desired = source.copy()
+    desired[..., 0] += 10.0
+    safe, _ = alum.preserve_chroma_in_gamut(desired, source)
+
+    legacy, _ = alum.continuous_gamut_limits(desired, safe, source, mask, 0.6)
+    robust, proof = alum.continuous_gamut_limits(
+        desired, safe, source, mask, 0.6, seed_quantile=15, seed_window=9
+    )
+    assert proof["method"] == "robust_quantile_gamut_cap_propagation"
+    # Legacy punches a deep dark crater around the isolated glint at (60, 55).
+    assert float(legacy[60, 62, 0] - source[60, 62, 0]) < 6.0
+    # Robust quantile prevents isolated glints from cratering surrounding metal!
+    assert float(robust[60, 62, 0] - source[60, 62, 0]) > 9.5
+    # Genuine broad highlight band on the right still propagates smoothly!
+    assert float(robust[60, 108, 0] - source[60, 108, 0]) < 4.5
+    # Every pixel remains inside its own exact sRGB safe bound.
+    assert np.all(robust[..., 0] <= safe[..., 0] + 1e-6)
+
+
+def test_top_frame_isolated_white_ding_does_not_create_dark_diamond_halo(tmp_path):
+    from phone_texture import auto_material, lighting
+
+    h, w = 80, 600
+    # Shaded Cosmic Orange top frame with a brighter right-side reference and one
+    # isolated 3x3 white scuff/ding at (y=36..39, x=240..243).
+    rgb = np.full((h, w, 3), [195, 118, 76], dtype=np.uint8)
+    rgb[:, 420:540] = [232, 146, 102]
+    rgb[36:39, 240:243] = [252, 250, 248]
+    src = np.full((h, w, 4), 255, dtype=np.uint8)
+    src[..., :3] = rgb
+    path = tmp_path / "top.png"
+    Image.fromarray(src).save(path)
+
+    job, _, _, _ = auto_material.propose_job(path, "top", tmp_path / "materials")
+    item = job["views"][0]
+    item["domains"][0]["reference_boxes"] = [[460, 25, 467, 32]]
+    eng = lighting.engine("aluminum")
+    target, _ = eng.target_color(job)
+    out, _, _, proof = eng.process_view(
+        item, target, dict(job["defaults"], color_mode=job["color_mode"])
+    )
+    sL = eng.rgb_to_lab(src[..., :3])[..., 0]
+    oL = eng.rgb_to_lab(out[..., :3])[..., 0]
+    dL = oL - sL
+    # Surrounding metal 8 px away from the 3x3 white ding must keep full lift
+    # (no 40 px dark diamond halo pulled down by 0.2 L/px propagation!).
+    far_lift = float(np.median(dL[25:55, 160:190]))
+    near_lift = float(np.median(dL[34:41, 249:254]))
+    assert far_lift - near_lift < 1.0
+    assert proof["gamut_continuity"][0]["seed_quantile"] == 15.0

@@ -44,7 +44,7 @@ def _verified_glass(source, seed):
 
     x, y, radius = seed
     candidates = []
-    for fraction in (0., -.03, .03):
+    for fraction in (0., -.03, .03, .06):
         trial = [[x, y, radius * (1 + fraction)]]
         try:
             first = measure_glass_edges(source, trial, search_width=6.)[0]
@@ -82,11 +82,20 @@ def measure(source, layout):
             boosted[: roi.shape[0], : roi.shape[1], :3] = enhanced[..., None]
             seeds, _ = _disks(boosted)
             windows = None
+            ind_seeds = None
             if seeds is None:
                 seeds, windows = _independent_seeds(boosted)
             centres, slots = [], []
             for slot, seed in enumerate(seeds):
                 measured = _verified_glass(source, seed) if seed is not None else None
+                if measured is None and windows is None:
+                    if ind_seeds is None:
+                        ind_seeds, windows = _independent_seeds(boosted)
+                    alt = ind_seeds[slot] if slot < len(ind_seeds) else None
+                    if alt is not None:
+                        measured = _verified_glass(source, alt)
+                        if measured is not None:
+                            seed = alt
                 if measured is not None:
                     centres.append(measured)
                     slots.append(slot)
@@ -263,6 +272,84 @@ def _cast_shadows(raw, lab, flat, geometry, lenses, lit_edges):
     ]
 
 
+def _align_plateau_shadows(raw, lab, flat, geometry, flash_dist, scale):
+    """Align residual cast shadows on the masked flat camera plateau to normal plateau Lab.
+
+    All camera lenses, metallic rings, flash, mic and LiDAR are already excluded
+    from ``flat``. Fit a robust 2-D reference plane to open, unshaded plateau
+    metal away from the lenses and smoothly align coherent darker shadow zones
+    near the lenses in both lightness and shadow-shifted chroma while preserving
+    fine anodized grain.
+    """
+    if not flat.any() or not geometry:
+        return dict(status="not_applicable", pixels=0)
+    h, w = flat.shape
+    ring_dist = np.full((h, w), np.inf, dtype=float)
+    for _, dist, _, _ in geometry:
+        ring_dist = np.minimum(ring_dist, dist)
+    quiet = flat & (ring_dist > 42 * scale)
+    if flash_dist is not None:
+        quiet &= flash_dist > 35 * scale
+    if int(quiet.sum()) < max(1200, int(1500 * scale * scale)):
+        return dict(status="insufficient_quiet_plateau", pixels=0)
+    q_lit = lab[quiet]
+    q_src = raw[quiet, 0]
+    lo_l, hi_l = np.percentile(q_lit[:, 0], [30, 90])
+    inlier = (q_lit[:, 0] >= lo_l) & (q_lit[:, 0] <= hi_l)
+    if int(inlier.sum()) < 500:
+        return dict(status="insufficient_inliers", pixels=0)
+    qy, qx = np.nonzero(quiet)
+    A = np.column_stack([
+        np.ones(int(inlier.sum())),
+        (qx[inlier] - w / 2.0) / max(w, 1),
+        (qy[inlier] - h / 2.0) / max(h, 1),
+    ])
+    if np.linalg.matrix_rank(A) < 3:
+        return dict(status="rank_deficient_reference", pixels=0)
+    yy, xx = np.ogrid[:h, :w]
+    gx = (xx - w / 2.0) / max(w, 1)
+    gy = (yy - h / 2.0) / max(h, 1)
+    ref_lit = np.zeros((h, w, 3), dtype=float)
+    for c in range(3):
+        coef, *_ = np.linalg.lstsq(A, q_lit[inlier, c], rcond=None)
+        if c == 0 and float(np.median(np.abs(q_lit[inlier, 0] - A @ coef))) > 3.5:
+            return dict(status="inconsistent_plateau_reference", pixels=0)
+        ref_lit[..., c] = coef[0] + coef[1] * gx + coef[2] * gy
+    coef_s, *_ = np.linalg.lstsq(A, q_src[inlier], rcond=None)
+    ref_src_l = coef_s[0] + coef_s[1] * gx + coef_s[2] * gy
+
+    sigma = max(1.5, 3.5 * scale)
+    f_w = ndi.gaussian_filter(flat.astype(float), sigma)
+    denom = np.maximum(f_w, 1e-6)
+    lit_sm = np.stack([ndi.gaussian_filter(lab[..., c] * flat, sigma) / denom for c in range(3)], axis=-1)
+    src_sm_l = ndi.gaussian_filter(raw[..., 0] * flat, sigma) / denom
+
+    lit_def = ref_lit[..., 0] - lit_sm[..., 0]
+    src_def = ref_src_l - src_sm_l
+    strength = (
+        ease((lit_def - 0.6) / 2.2)
+        * ease((src_def - 0.5) / 2.5)
+        * ease((ring_dist - 2.0) / 2.5)
+        * ease((58.0 * scale - ring_dist) / (18.0 * scale))
+        * ease((f_w - 0.35) / 0.45)
+        * flat
+    )
+    active = strength > 0.01
+    if not active.any():
+        return dict(status="clear", pixels=0)
+    shift = np.clip(ref_lit[active] - lit_sm[active], [0.0, -6.0, -10.0], [22.0, 6.0, 10.0])
+    delta = strength[active, None] * shift
+    available = np.maximum(raw[..., 0][active] + 44.0 - lab[..., 0][active], 0.0)
+    delta *= np.minimum(1.0, available / np.maximum(delta[:, 0], 1e-7))[:, None]
+    lab[active] += delta
+    changed = int(np.count_nonzero(delta[:, 0] > 0.1))
+    return dict(
+        status="applied" if changed else "no_supported_change",
+        pixels=changed,
+        max_added_L=float(delta[:, 0].max()) if changed else 0.0,
+    )
+
+
 def apply(source, source_lab, output_lab, allowed, plan, plateau=None, *, exterior_only=False):
     """Work in the source geometry before resizing. Recover detail from this photograph."""
     from .rear_shadow import _plateau_core, _ring_material, InsufficientRearShadowEvidence
@@ -321,11 +408,13 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None, *, exteri
         # When the rim cannot be measured, omit the complete flash search window.
         fh, fw = source.shape[:2]
         flat[int(0.026 * fh) : int(0.148 * fh), int(0.69 * fw) : int(0.93 * fw)] = False
+    flash_dist = None
     if flash is not None:
         yy, xx = np.ogrid[:bottom, : shape[1]]
         x, y, r = flash
         # Allow for the transition between the reflective face and its outer bezel.
         distance = np.hypot(xx - x, yy - y) - (r + max(3, 0.10 * r))
+        flash_dist = distance
         flat &= distance > 2
     # Remove isolated dark hardware (mic and LiDAR) from the flat-metal field.
     if flat.any():
@@ -462,6 +551,8 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None, *, exteri
         lab[..., 0][changed], raw[..., 0][changed] - 34, raw[..., 0][changed] + 34
     )
     report["lens_cast_shadow"] = _cast_shadows(raw, lab, flat, geometry, lenses, lit_edges)
+    if plan["layout"] == "triple":
+        report["plateau_shadow_align"] = _align_plateau_shadows(raw, lab, flat, geometry, flash_dist, scale)
     review('exterior', 'cast_shadow', flat)
     from .lens_rim_continuity import review as review_rim_continuity
     report['rim_continuity'] = [review_rim_continuity(raw, lab, metal, lens, flat) for lens in lenses]

@@ -52,9 +52,14 @@ def _plateau_core(L):
             s=np.median(window,axis=0);near=indices[abs(indices-anchor)<=4]
             position=int(near[np.argmax(abs(s[near]))]);positions.append(position);strength.append(float(abs(s[position])))
         strict_ok=min(strength)>=1.2 and np.ptp(positions)<=4
-        dark_top_ok=(name=='top' and np.ptp(positions)<=1
-                     and float(np.median(strength))>=1.2 and min(strength)>=.6)
-        if not (strict_ok or dark_top_ok):
+        # On dark top rims or ultra-bright silver bottom bevels, one edge window
+        # can dip slightly below 1.2 L/px even when all three windows lock onto
+        # the exact same straight ledge. Require tight position coherence.
+        coherent_tight_ok=(name in ('top','bottom') and np.ptp(positions)<=1
+                           and max(strength)>=1.2 and min(strength)>=.6)
+        coherent_mild_ok=(name in ('top','bottom') and np.ptp(positions)<=3
+                          and float(np.median(strength))>=1.1 and min(strength)>=.95)
+        if not (strict_ok or coherent_tight_ok or coherent_mild_ok):
             raise InsufficientRearShadowEvidence('Rear shadow: plateau '+name+' lacks three-window source evidence')
         edges[name]=max(positions)+6 if name in ('left','top') else min(positions)-6
         proof[name]=dict(positions=positions,strengths=strength)
