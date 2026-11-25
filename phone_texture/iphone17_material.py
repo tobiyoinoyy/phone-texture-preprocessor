@@ -217,6 +217,64 @@ def glass_back_rim(image,sticker=None, *, allow_partial=False):
         edge_measurements=measurements,body_contour=body_proof),body
 
 
+def _bottom_apertures(a, gray, remaining):
+    """Locate recessed bottom ports, speaker holes and screws relative to local metal.
+
+    A fixed global threshold cuts across dark anodized aluminum grain and splits
+    smooth metal into dark patches when lighting lifts the surrounding frame.
+    Estimate column-wise rail metal outside the central aperture band, then
+    require compact solid geometry and local contrast against adjacent metal.
+    """
+    h, w = gray.shape
+    vis = remaining & (a[..., 3] >= 128)
+    rail = vis.copy()
+    rail[:int(h * .14), :] = False
+    rail[int(h * .86):, :] = False
+    rail[int(h * .26):int(h * .74), :] = False
+    mid_rail = rail.copy()
+    mid_rail[:, :int(w * .15)] = False
+    mid_rail[:, int(w * .85):] = False
+    if mid_rail.sum() < 40:
+        return np.zeros((h, w), bool)
+    metal_med = float(np.median(gray[mid_rail]))
+    min_col = max(2, int(h * .05))
+    col_metal = np.full(w, metal_med, dtype=float)
+    for x in range(w):
+        vals = gray[rail[:, x], x]
+        if len(vals) >= min_col:
+            col_metal[x] = float(np.median(vals))
+    smooth_metal = ndimage.median_filter(
+        col_metal, size=max(15, int(w * .21)) | 1, mode='nearest')
+    threshold = np.minimum(145., smooth_metal * .72)
+    dark = (gray.astype(float) < threshold[None, :]) & remaining
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(dark.astype('uint8'), 8)
+    holes = np.zeros((h, w), bool)
+    pad = 8
+    for i in range(1, n):
+        x, y, bw, bh, area = [int(v) for v in stats[i]]
+        cx, cy = x + bw / 2, y + bh / 2
+        if not (.12 * w < cx < .88 * w and .25 * h < cy < .75 * h
+                and bh >= h * .14 and bw >= h * .14
+                and area > 25 and bw < w * .18 and .3 < bw / max(1, bh) < 5):
+            continue
+        y0, y1 = max(0, y - pad), min(h, y + bh + pad)
+        x0, x1 = max(0, x - pad), min(w, x + bw + pad)
+        raw = labels[y0:y1, x0:x1] == i
+        comp = ndimage.binary_fill_holes(raw)
+        if int(comp.sum()) / max(1, bw * bh) < .55:
+            continue
+        ring = (ndimage.binary_dilation(comp, iterations=7)
+                & ~ndimage.binary_dilation(comp, iterations=2)
+                & vis[y0:y1, x0:x1])
+        ring_med = float(np.median(gray[y0:y1, x0:x1][ring])) if ring.sum() >= 10 else metal_med
+        if ring_med > max(metal_med + 35., 210.) and bw < w * .08:
+            continue
+        if ring_med - float(np.median(gray[y0:y1, x0:x1][raw])) < max(20., ring_med * .22):
+            continue
+        holes[y0:y1, x0:x1] |= comp
+    return holes
+
+
 def job(source,face,folder,structure):
     from PIL import Image
     image=Image.open(source).convert('RGBA');a=np.array(image);h,w=a.shape[:2]
@@ -269,25 +327,21 @@ def job(source,face,folder,structure):
                     regions.append((f'hardware_{index}_{suffix}',mask,[max(6,h*.008),max(2,w*.05)],False))
                 remaining &= ~hw
         else:
-            # Apertures have geometric shape support as well as darkness.
+            # Apertures exist only on the bottom rail and need local-contrast
+            # darkness plus compact geometric shape support.
             gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
-            n,labels,stats,_=cv2.connectedComponentsWithStats(((gray<145)&remaining).astype('uint8'),8)
-            holes=np.zeros((h,w),bool)
-            for i in range(1,n):
-                x,y,bw,bh,area=stats[i];cx=x+bw/2;cy=y+bh/2
-                if (.25*h<cy<.75*h and bh>h*.08 and bw>h*.08 and
-                    area>25 and bw<w*.18 and .3< bw/max(1,bh)<5):
-                    holes|=ndimage.binary_fill_holes(labels==i)
-            if holes.any():
-                # Isolated dark fringes lack a material reference. Keep them
-                # in the broad source-lightness field instead of deriving a
-                # separate illumination from scratches, print or partial rims.
-                try:
-                    reference_box(a, holes & remaining)
-                except ValueError:
-                    holes[:]=False
-            if holes.any():
-                regions.append(('apertures',holes,[max(3,h*.05),max(3,w*.008)],False));remaining &= ~holes
+            if face=='bottom':
+                holes=_bottom_apertures(a,gray,remaining)
+                if holes.any():
+                    # Isolated dark fringes lack a material reference. Keep them
+                    # in the broad source-lightness field instead of deriving a
+                    # separate illumination from scratches, print or partial rims.
+                    try:
+                        reference_box(a, holes & remaining)
+                    except ValueError:
+                        holes[:]=False
+                if holes.any():
+                    regions.append(('apertures',holes,[max(3,h*.05),max(3,w*.008)],False));remaining &= ~holes
             # A full-thickness antenna is a supported vertical stripe, not a
             # global lightness threshold applied to arbitrary materials.
             y0,y1=int(h*.2),int(h*.8)

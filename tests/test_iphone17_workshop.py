@@ -112,3 +112,77 @@ def test_dark_hardware_uses_closed_source_contours():
     assert mask[400,55] and not mask[355,34]
     with pytest.raises(ValueError,match='expected 4'):
         hardware(Image.new('RGBA',im.size,(32,32,32,255)),'left')
+
+
+def test_dark_bottom_apertures_exclude_metal_grain_and_sticker_ink(tmp_path):
+    from PIL import ImageDraw
+    h, width = 122, 1035
+    rng = np.random.default_rng(7)
+    base = np.full((h, width, 4), 255, np.uint8)
+    # Dark anodized aluminum spanning right across the old global 145 cutoff,
+    # with natural darkening at the curved ends and fine grain noise.
+    x = np.arange(width)
+    metal = 148 - 72 * np.exp(-np.minimum(x, width - 1 - x) / 48)
+    grain = np.clip(metal[None, :] + rng.normal(0, 6, (h, width)), 40, 170)
+    # Add slightly darker smooth metal patches around gray=136..142 near the holes.
+    grain[22:45, 620:670] = np.clip(grain[22:45, 620:670] - 10, 125, 144)
+    grain[75:96, 680:740] = np.clip(grain[75:96, 680:740] - 10, 125, 144)
+    base[..., :3] = np.rint(grain).astype(np.uint8)[..., None]
+    im = Image.fromarray(base)
+    draw = ImageDraw.Draw(im)
+    # White QC sticker with dark printed characters.
+    draw.rectangle((365, 0, 440, 106), fill=(248, 248, 248, 255))
+    draw.rectangle((382, 32, 396, 46), fill=(95, 95, 95, 255))
+    draw.rectangle((406, 48, 424, 66), fill=(85, 85, 85, 255))
+    # Real recessed bottom hardware: USB-C port, screw, 5 left + 3 right speaker holes.
+    draw.rounded_rectangle((450, 32, 594, 88), radius=24, fill=(32, 32, 32, 255))
+    draw.ellipse((612, 47, 638, 73), fill=(52, 52, 52, 255))
+    for cx in (212, 246, 280, 314, 348, 694, 728, 762):
+        draw.ellipse((cx - 12, 48, cx + 12, 72), fill=(40, 40, 40, 255))
+    # Antenna stripe on the right.
+    draw.rectangle((815, 0, 830, h - 1), fill=(76, 76, 76, 255))
+    png = tmp_path / 'bottom.png'
+    im.save(png)
+
+    job, _, _, _ = iphone17_material.job(png, 'bottom', tmp_path / 'mat', {})
+    domains = {d['name']: d for d in job['views'][0]['domains']}
+    assert set(domains) == {'apertures', 'antenna', 'main_surface'}
+    ap = np.asarray(Image.open(domains['apertures']['mask']).convert('L')) > 0
+    # True hardware interiors are in apertures.
+    assert ap[60, 520] and ap[60, 625]
+    assert all(ap[60, cx] for cx in (212, 246, 280, 314, 348, 694, 728, 762))
+    # Smooth dark metal patches and sticker ink stay out of apertures.
+    assert not ap[22:45, 620:670].any()
+    assert not ap[75:96, 680:740].any()
+    assert not ap[:, 365:440].any()
+
+    # Lighting the dark bottom leaves smooth metal free of dark blotches.
+    from phone_texture import lighting
+    job.update(output_dir=str((tmp_path / 'out').resolve()),
+               records_dir=str((tmp_path / 'rec').resolve()))
+    jp = tmp_path / 'job.json'
+    w.save(jp, job)
+    lighting.run('aluminum', jp)
+    lit = np.asarray(Image.open(tmp_path / 'out' / 'bottom.png').convert('RGB'))
+    # Patch near the screw keeps its natural contrast without dropping into dark blotches.
+    src_patch = float(np.median(base[22:45, 620:670, :3]))
+    src_ref = float(np.median(base[22:45, 690:760, :3]))
+    patch_med = float(np.median(lit[22:45, 620:670]))
+    ref_med = float(np.median(lit[22:45, 690:760]))
+    assert abs((patch_med - ref_med) - (src_patch - src_ref)) < 4
+    assert patch_med > 120
+
+
+def test_top_rail_never_creates_apertures_domain(tmp_path):
+    from PIL import ImageDraw
+    h, width = 122, 1035
+    im = Image.new('RGBA', (width, h), (138, 140, 142, 255))
+    draw = ImageDraw.Draw(im)
+    draw.ellipse((490, 44, 525, 79), fill=(48, 48, 48, 255))
+    draw.rectangle((815, 0, 830, h - 1), fill=(72, 72, 72, 255))
+    png = tmp_path / 'top.png'
+    im.save(png)
+    job, _, _, _ = iphone17_material.job(png, 'top', tmp_path / 'mat', {})
+    names = {d['name'] for d in job['views'][0]['domains']}
+    assert 'apertures' not in names
+    assert names == {'antenna', 'main_surface'}
