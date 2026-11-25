@@ -151,30 +151,37 @@ def _continuity_candidate(error, job, path, face, source, scope, allowed, paper,
     """Retry the same measured metal field after a local continuity rejection."""
     import re
     from .shadow_lift_profile import NAME
-    target_domains = {'left': 'main_surface', 'right': 'main_surface', 'back': 'rear_perimeter'}
     def local_step(failure):
         return re.fullmatch(
             r'Lighting (?:pixel )?correction discontinuity at '
-            r'(?:antenna_[01]_(?:left|right)_metal|rear_button_(?:left|right)_[0-9]+): [0-9.]+ L',
+            r'(?:antenna_[01]_(?:left|right)_metal|rear_button_(?:left|right)_[0-9]+|'
+            r'rear_upper_join_(?:left|center|right)): [0-9.]+ L',
             str(failure))
-    if profile != NAME or face not in target_domains or not local_step(error):
+    if profile != NAME or face not in ('left', 'right', 'back') or not local_step(error):
         raise error
+    if face in ('left', 'right'):
+        domain_names = ('main_surface',)
+    elif 'rear_upper_join_' in str(error):
+        domain_names = ('camera_surround', 'main_surface')
+    else:
+        domain_names = ('rear_perimeter',)
     measure = lighting_review.measure_perimeter if face == 'back' else lighting_review.measure_local
     for mode in ('rounding', 'smooth_field', 'moderate_lift'):
         trial = copy.deepcopy(job)
         view, = trial['views']
-        material = next((d for d in view['domains'] if d['name'] == target_domains[face]), None)
-        if material is None:
+        materials = [next((d for d in view['domains'] if d['name'] == name), None) for name in domain_names]
+        if any(m is None for m in materials):
             raise error
         # Use the complete independently classified material. The verification
         # patches are never used to select the pixels that will change.
-        view.setdefault('quantization_continuity', []).append(
-            dict(mask=material['mask'], max_added_step_L=1.25))
-        if mode == 'smooth_field':
-            material.update(correction_smooth=4., gamut_continuity_step_L=.4,
-                            gamut_continuity_follow_field=True)
-        elif mode == 'moderate_lift':
-            material['strength'][0] *= .75
+        for material in materials:
+            view.setdefault('quantization_continuity', []).append(
+                dict(mask=material['mask'], max_added_step_L=1.25))
+            if mode == 'smooth_field':
+                material.update(correction_smooth=4., gamut_continuity_step_L=.4,
+                                gamut_continuity_follow_field=True)
+            elif mode == 'moderate_lift':
+                material['strength'][0] *= .75
         folder = path.parent / ('continuity-' + mode)
         folder.mkdir()
         trial.update(output_dir=str(folder/'output'), records_dir=str(folder/'records'))
@@ -197,7 +204,7 @@ def _continuity_candidate(error, job, path, face, source, scope, allowed, paper,
 def process_stages(case, sku, geometry, files, manifest, model, protection_policy,
                    lighting_profile, progress, stage, *, allow_partial=True, bottom_fallback=None,
                    source_body_reference_review=False, source_body_reference_metadata=None,
-                   bottom_quality=None, side_candidate_review=False):
+                   bottom_quality=None, side_candidate_review=False, debug_evidence=False):
     """Run every independent face, then both-side structure and eligible seams.
 
     Geometry-derived landmarks are measured before illumination, but failure to
@@ -250,8 +257,10 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
         checked = measure_masks(source, candidate, allowed, paper)
         if any('rear_shadow_correction' in v or 'rear_shadow_notice' in v for v in job.get('views', [])):
             checked['rear_shadow_correction'] = report['views'][face]['rear_shadow_correction']
-        if any(v.get('camera_metal_layout') for v in job.get('views', [])):
+        if any(v.get('camera_metal_layout') or v.get('camera_metal_notice') for v in job.get('views', [])):
             checked['camera_metal'] = report['views'][face]['camera_metal']
+        if report and report['views'][face].get('rail_spot_review') is not None:
+            checked['rail_spot_review'] = report['views'][face]['rail_spot_review']
         if protection_policy == 'none':
             checked['actual_no_zone_effects'] = no_zone_effects(source, candidate, analysis)
         return checked
@@ -357,7 +366,8 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                     checked = check_lit_pixels(face, source, candidate, allowed, paper, analysis, job, lighting_report)
                 checked['source_relative_effect_checks'] = effect
                 attempt_phase = 'evidence'
-                lighting_review.evidence_images(scope, source, candidate, assets/'effect-visual-review')
+                if debug_evidence:
+                    lighting_review.evidence_images(scope, source, candidate, assets/'effect-visual-review')
                 verify_sources()
                 if attempt_bindings:
                     from .bottom_quality_selection import verify_bindings
@@ -444,7 +454,8 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                     from .lighting_continuation import recover
                     fallback = case/'work/degraded-lighting'/(face+'.png')
                     try:
-                        degradation = recover(source, face, fallback, assets, metal_back=True)
+                        degradation = recover(source, face, fallback, assets, metal_back=True,
+                                      review_camera=lighting_profile == 'accepted-shadow-lift-v2')
                     except (ValueError, RuntimeError) as retry_error:
                         row['lighting_fallback_error'] = str(retry_error)
                     else:
@@ -503,7 +514,7 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                     hashes[str(relative)]=w.sha(original_asset)
             write(canonical/'material-selection.json',dict(source_sha256=w.sha(files[face]),
                 selected_assets=str(assets),selected_job=jobs[face],copied_assets_sha256=hashes))
-        shutil.copy2(selected[face], light/(face+'.png'))
+        w.clone_file(selected[face], light/(face+'.png'))
         if w.sha(light/(face+'.png')) != w.sha(selected[face]):
             raise ValueError('Selected lighting stage changed during copy')
         selected[face] = light/(face+'.png')
@@ -634,7 +645,7 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
         dest = final_staged/(face+'.png')
         if face == 'back':
             from .back_canvas import standardize
-            back_canvas_proof = standardize(source, dest, model)
+            back_canvas_proof = standardize(source, dest, model, plateau_source=files['back'])
             back_canvas_proof['source_sha256'] = w.sha(source)
             rail = back_canvas_proof.get('top_rail') or {}
             if rail.get('verified') is False:
@@ -650,7 +661,7 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
                         'shift_exceeds_limit': '偏差 %.1fpx 超过 8px 上限' % lens.get('max_shift_px', 0),
                         'registration_not_verified': '校准后复测未通过'}[lens['reason']]))
         else:
-            shutil.copy2(source, dest)
+            w.clone_file(source, dest)
             if w.sha(dest) != w.sha(source):
                 raise ValueError('Final selected stage changed during copy')
         per_face[face]['selected_sha256'] = w.sha(dest)
@@ -671,7 +682,18 @@ def process_stages(case, sku, geometry, files, manifest, model, protection_polic
         if c['source_relative_effect_checks'].get('original_effect_check_passed') is False]
     for face, checked in checks.items():
         shadow = checked.get('rear_shadow_correction') or {}
-        if shadow.get('status') == 'source_evidence_unavailable':
+        camera = checked.get('camera_metal') or {}
+        casts = camera.get('lens_cast_shadow', [])
+        recovered = {slot for slot, cast in zip(camera.get('measured_slots', []), casts)
+                     if cast.get('status') == 'applied' and cast.get('pixels', 0) > 0}
+        if shadow.get('status') == 'source_evidence_unavailable' and recovered:
+            missing = sorted({0, 1, 2} - recovered)
+            if missing:
+                names = ['左上', '左下', '中间']
+                item_effect_warnings.append(dict(face=face, code='rear_shadow_partially_applied',
+                    message='已逐镜头修正有依据的框外投影。',
+                    detail='其余镜头未应用专项去投影：' + '、'.join(names[i] for i in missing)))
+        elif shadow.get('status') == 'source_evidence_unavailable':
             item_effect_warnings.append(dict(face=face, code='rear_shadow_source_evidence_unavailable',
                 message='背面已完成常规调光，镜头周边去投影证据不足。', detail=shadow['reason']))
         elif shadow.get('status') == 'partially_applied':

@@ -1,4 +1,5 @@
 """Typed adapters to the bundled lighting engines, shared by every entry point."""
+from functools import lru_cache
 import importlib.util
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ from .geometry_review import digest, write
 from .pipeline import fresh
 
 
+@lru_cache(maxsize=4)
 def engine(material):
     names = {
         'aluminum': ('phone-aluminum-frame-restore', 'harmonize_aluminum.py'),

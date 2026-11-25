@@ -4,10 +4,13 @@ Geometry and lighting stay in their maintained tools. This helper never infers
 material masks or treats a copied face as a successful lighting correction.
 """
 import argparse
+import ctypes
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 
 import numpy as np
@@ -16,6 +19,34 @@ from phone_texture.pipeline import FACES, EXTENSIONS, batch_files, separate_path
 from phone_texture.geometry_review import verify_report
 from phone_texture.protection_policy import check_sticker_only
 from phone_texture.lighting_review import freeze_scope, load_scope, measure_perimeter, measure_local, check_review, evidence_images
+
+
+_CLONEFILE = None
+if sys.platform == 'darwin':
+    try:
+        _libc = ctypes.CDLL(None)
+        _fn = _libc.clonefile
+        _fn.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32)
+        _fn.restype = ctypes.c_int
+        _CLONEFILE = _fn
+    except (OSError, AttributeError):
+        _CLONEFILE = None
+
+
+_DEFAULT_COPY2 = shutil.copy2
+
+
+def clone_file(src, dst):
+    """Copy-on-write APFS clone on macOS (isolated on write), else shutil.copy2."""
+    src_path, dst_path = Path(src), Path(dst)
+    if shutil.copy2 is not _DEFAULT_COPY2:
+        shutil.copy2(src_path, dst_path)
+        return dst_path
+    if _CLONEFILE is not None and not dst_path.exists():
+        if _CLONEFILE(os.fsencode(src_path), os.fsencode(dst_path), 0) == 0:
+            return dst_path
+    shutil.copy2(src_path, dst_path)
+    return dst_path
 
 
 def sha(path):

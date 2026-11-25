@@ -639,7 +639,13 @@ def create_overview(output, names, dest):
             with Image.open(output/sku/(face+'.png')) as original:
                 im = original.convert('RGBA'); im.thumbnail((cell_w-32, cell_h-55))
                 canvas.paste(im, (x+(cell_w-12-im.width)//2, yy+10+(cell_h-55-im.height)//2), im)
-            draw.text((x+12, yy+cell_h-38), sku, fill='#172a2a', font=font)
+            label = sku
+            max_label_w = cell_w - 24
+            if draw.textlength(label, font=font) > max_label_w:
+                while len(label) > 1 and draw.textlength(label + '…', font=font) > max_label_w:
+                    label = label[:-1]
+                label += '…'
+            draw.text((x+12, yy+cell_h-38), label, fill='#172a2a', font=font)
         y += rows_per_face*cell_h+10
     canvas.save(dest, quality=90)
 

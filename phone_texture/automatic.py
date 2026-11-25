@@ -6,6 +6,7 @@ Automatic measurements are never written as human/agent visual approvals.
 Explicit geometry resume verifies the same SKU's sources and output hashes.
 """
 from pathlib import Path
+import atexit
 import contextlib
 import concurrent.futures
 import datetime
@@ -27,11 +28,58 @@ from .auto_structure import propose
 
 PROFILE='iphone17-aluminum-studio-v10-source-material-boundaries'
 _INFERENCE_SLOTS=None
+_IN_WORKER_POOL=False
+_WORKER_NORMALIZER=None
+_WORKER_NORMALIZER_DEVICE=None
+
+
+def _close_worker_normalizer():
+    global _WORKER_NORMALIZER,_WORKER_NORMALIZER_DEVICE
+    norm=_WORKER_NORMALIZER
+    _WORKER_NORMALIZER=None
+    _WORKER_NORMALIZER_DEVICE=None
+    if norm is not None:
+        try:
+            norm.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_worker_normalizer)
 
 
 def initialize_worker(inference_slots):
-    global _INFERENCE_SLOTS
+    global _INFERENCE_SLOTS,_IN_WORKER_POOL
     _INFERENCE_SLOTS=inference_slots
+    _IN_WORKER_POOL=True
+
+
+@contextlib.contextmanager
+def _acquire_normalizer(device):
+    """Keep BiRefNet warm across SKUs inside pool workers; isolate direct calls."""
+    global _WORKER_NORMALIZER,_WORKER_NORMALIZER_DEVICE
+    from phone_normalizer.api import Normalizer,NormalizerConfig
+    if not _IN_WORKER_POOL:
+        with Normalizer(NormalizerConfig(remove_support=False,deskew=False,tight_crop=False,device=device)) as norm:
+            yield norm
+        return
+    if _WORKER_NORMALIZER is None or _WORKER_NORMALIZER_DEVICE!=device:
+        _close_worker_normalizer()
+        _WORKER_NORMALIZER=Normalizer(NormalizerConfig(remove_support=False,deskew=False,tight_crop=False,device=device))
+        _WORKER_NORMALIZER_DEVICE=device
+    yield _WORKER_NORMALIZER
+
+
+def _merge_peak_memory(first, second):
+    a=first.get('peak_process_rss_bytes')
+    b=second.get('peak_process_rss_bytes')
+    if b is None or (a is not None and a>=b):
+        return first
+    return second
+
+
+def _progress_summary(row):
+    return {k:row.get(k) for k in ('sku','status','seconds','error','six_faces_generated','six_faces_processed','stage_status')}
 
 
 def peak_process_memory():
@@ -105,8 +153,7 @@ def no_zone_effects(source,output,analysis):
     return report
 
 
-def process_one(task):
-    """Fresh processing, or explicitly bound saved-review continuation."""
+def _parse_task(task):
     protection_policy=task[6] if len(task)>=7 else 'sticker_only'
     review_fallback=task[7] if len(task)>=8 else 'fail'
     lighting_profile=task[8] if len(task)>=9 else 'baseline'
@@ -116,6 +163,8 @@ def process_one(task):
     saved_review_descriptor=task[12] if len(task)>=13 else None
     require_geometry_resume=task[13] if len(task)>=14 else False
     side_candidate_review=task[14] if len(task)>=15 else False
+    debug_evidence=task[15] if len(task)>=16 else False
+    if type(debug_evidence) is not bool:raise ValueError('debug_evidence must be an explicit bool')
     if type(side_candidate_review) is not bool:raise ValueError('side_candidate_review must be an explicit bool')
     if type(require_geometry_resume) is not bool:raise ValueError('require_geometry_resume must be an explicit bool')
     if type(source_body_reference_review) is not bool:raise ValueError('source_body_reference_review must be an explicit bool')
@@ -127,40 +176,21 @@ def process_one(task):
     if side_candidate_review and (saved_review_descriptor is not None or not source_body_reference_review
             or protection_policy!='none' or lighting_profile!='accepted-shadow-lift-v2'):
         raise ValueError('Fresh side review requires current-source normal processing with none/accepted-shadow-lift-v2')
-    if saved_review_descriptor is not None:
-        # This branch precedes normal intake/segmentation/material processing.
-        # A matched but invalid record fails; it never silently becomes a new run.
-        from .saved_review import process_saved
-        if case.exists():raise ValueError('Saved review case already exists')
-        started=time.perf_counter()
-        options=dict(model=model,protection_policy=protection_policy,review_fallback=review_fallback,
-            lighting_profile=lighting_profile,bottom_alignment=bottom_alignment,
-            source_body_reference_review=source_body_reference_review)
-        try:
-            import cv2
-            cv2.setNumThreads(0)
-            if cv2.getNumThreads()!=1:
-                raise RuntimeError('Cannot verify sequential OpenCV execution')
-            result=process_saved(saved_review_descriptor,sku=sku,source=source,case=case,options=options)
-            result['opencv_runtime']=dict(requested_native_threads=0,effective_threads=1,native_pool='disabled')
-            route='saved_review'
-        except Exception as exc:
-            case.mkdir(parents=True,exist_ok=True)
-            result=dict(sku=sku,status='failed',source=str(source),process=str(case),
-                six_faces_generated=False,six_faces_processed=False,quality_checks_complete=False,
-                visual_review_passed=False,model_uv_verified=False,saved_review_reused=False,
-                saved_review_requested=True,error=str(exc),traceback=traceback.format_exc())
-            route='saved_review_rejected'
-        result.update(seconds=time.perf_counter()-started,worker_pid=os.getpid(),
-            worker_parent_pid=os.getppid(),worker_process_group=os.getpgrp(),
-            worker_nice=os.getpriority(os.PRIO_PROCESS,0),
-            worker_thread_environment={k:os.environ.get(k) for k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','VECLIB_MAXIMUM_THREADS','NUMEXPR_NUM_THREADS')},
-            execution_route=route,**peak_process_memory())
-        write(case/'result.json',result)
-        write(case/'live-progress.json',dict(stage='complete' if result.get('six_faces_generated') else 'failed',
-            completed_units=15 if result.get('six_faces_generated') else 0,total_units=15,
-            updated_at=time.time(),seconds=result['seconds']))
-        return result
+    return dict(sku=sku,source=source,case=case,device=device,cpu_threads=cpu_threads,model=model,
+        protection_policy=protection_policy,review_fallback=review_fallback,lighting_profile=lighting_profile,
+        resume_case=resume_case,bottom_alignment=bottom_alignment,
+        source_body_reference_review=source_body_reference_review,saved_review_descriptor=saved_review_descriptor,
+        require_geometry_resume=require_geometry_resume,side_candidate_review=side_candidate_review,
+        debug_evidence=debug_evidence)
+
+
+def _run_geometry_phase(task):
+    """Intake + segmentation/geometry (or verified resume); returns (geo_state, early_result)."""
+    cfg=_parse_task(task)
+    sku,source,case,device,cpu_threads,model=cfg['sku'],cfg['source'],cfg['case'],cfg['device'],cfg['cpu_threads'],cfg['model']
+    protection_policy,review_fallback,lighting_profile=cfg['protection_policy'],cfg['review_fallback'],cfg['lighting_profile']
+    resume_case,source_body_reference_review=cfg['resume_case'],cfg['source_body_reference_review']
+    require_geometry_resume,side_candidate_review,debug_evidence=cfg['require_geometry_resume'],cfg['side_candidate_review'],cfg['debug_evidence']
     case.mkdir(parents=True,exist_ok=False);started=time.perf_counter();events=[]
     result=dict(sku=sku,status='running',profile=PROFILE,source=str(source),process=str(case),
         historical_annotations_reused=False,runtime_agent_required=False,manual_annotations_required=False,visual_review_passed=False,model_uv_verified=False,protection_policy=protection_policy,lighting_profile=lighting_profile,source_body_reference_review_enabled=source_body_reference_review,
@@ -174,7 +204,7 @@ def process_one(task):
             total_units=15,updated_at=time.time(),seconds=time.perf_counter()-started))
     progress('loading')
     def stage(name,begin):events.append(dict(stage=name,seconds=time.perf_counter()-begin))
-    geometry=None;geometry_files=None;checks={}
+    geometry=None;geometry_files=None
     try:
         import cv2
         # GCD (the installed Mac backend) ignores positive thread counts.
@@ -185,7 +215,7 @@ def process_one(task):
         result['opencv_runtime']=dict(requested_native_threads=0,effective_threads=cv2.getNumThreads(),native_pool='disabled')
         manifest=w.intake(source,case/'work',single_name=sku)
         inputs=manifest['skus'][sku]
-        from .stage_processing import resume_geometry,process_stages
+        from .stage_processing import resume_geometry
         resumed=resume_geometry(resume_case,case,sku,manifest) if resume_case else None
         if require_geometry_resume and resumed is None:
             raise ValueError('Required verified geometry checkpoint unavailable; fresh segmentation was not started')
@@ -196,7 +226,6 @@ def process_one(task):
         else:
             import torch
             torch.set_num_threads(cpu_threads)
-            from phone_normalizer.api import Normalizer,NormalizerConfig
             records=case/'work/geometry-records';records.mkdir()
             folder=records/'staged'/sku;folder.mkdir(parents=True)
             geometry=dict(mode='original_only_automatic',success=False,geometry_status='needs_review',
@@ -204,90 +233,102 @@ def process_one(task):
             device_observations=[];forward_observations=[];begin=time.perf_counter()
             geometry['contact_fallbacks'] = {}
             geometry_failures = []
-            with Normalizer(NormalizerConfig(remove_support=False,deskew=False,tight_crop=False,device=device)) as norm:
-                original_forward=norm.backend._run_model
-                def observe_forward(model,inputs,torch_module):
-                    value=original_forward(model,inputs,torch_module)
+            with _acquire_normalizer(device) as norm:
+                base_forward=getattr(norm.backend,'_base_run_model',norm.backend._run_model)
+                norm.backend._base_run_model=base_forward
+                current_face=[None]
+                def observe_forward(model_arg,inputs_arg,torch_module):
+                    value=base_forward(model_arg,inputs_arg,torch_module)
                     if norm.backend.device=='mps':
                         torch_module.mps.synchronize()
-                        forward_observations.append(dict(face=face,measurement='post_forward_before_cleanup_not_true_peak',
+                        forward_observations.append(dict(face=current_face[0],measurement='post_forward_before_cleanup_not_true_peak',
                             mps_driver_bytes=int(torch_module.mps.driver_allocated_memory()),
                             mps_tensor_bytes=int(torch_module.mps.current_allocated_memory())))
                     return value
                 norm.backend._run_model=observe_forward
-                for face in pipeline.FACES:
-                    progress('geometry',face,len(geometry['images']))
-                    item=inputs[face];raw=ImageOps.exif_transpose(Image.open(item['snapshot'])).convert('RGB')
-                    # Narrow front rims need more model pixels than the ordinary
-                    # 1024 cap. Every SKU uses the same 1536 front setting; it is
-                    # not a stored per-case fix. A shared batch semaphore bounds
-                    # simultaneous model calls, including allocator cleanup.
-                    norm.backend.max_inference_side=1536 if face=='front' else 1024
-                    with (_INFERENCE_SLOTS if _INFERENCE_SLOTS is not None else contextlib.nullcontext()):
-                        matte,info=norm.normalize(raw)
-                    stages={}
-                    def capture(name,image):stages[name]=image.copy()
-                    pre_trim_image=None;analysis_stage='geometry'
-                    try:
-                        if face in pipeline.FRAMES:
-                            image,evidence=frame_geometry(matte,face,capture,source_image=raw,model=model)
+                try:
+                    for face in pipeline.FACES:
+                        current_face[0]=face
+                        progress('geometry',face,len(geometry['images']))
+                        item=inputs[face];raw=ImageOps.exif_transpose(Image.open(item['snapshot'])).convert('RGB')
+                        # Narrow front rims need more model pixels than the ordinary
+                        # 1024 cap. Every SKU uses the same 1536 front setting; it is
+                        # not a stored per-case fix. A shared batch semaphore bounds
+                        # simultaneous model calls, including allocator cleanup.
+                        norm.backend.max_inference_side=1536 if face=='front' else 1024
+                        with (_INFERENCE_SLOTS if _INFERENCE_SLOTS is not None else contextlib.nullcontext()):
+                            matte,info=norm.normalize(raw)
+                        stages={}
+                        if debug_evidence:
+                            def capture(name,image):stages[name]=image.copy()
                         else:
+                            def capture(name,image):pass
+                        pre_trim_image=None;analysis_stage='geometry'
+                        try:
+                            if face in pipeline.FRAMES:
+                                image,evidence=frame_geometry(matte,face,capture,source_image=raw,model=model)
+                            else:
+                                if protection_policy=='none':
+                                    paper,paper_info=paper_mask(matte,face,resolve_end=False)
+                                    image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw,reconstruct_paper_tail=False,prefer_front_closure=face=='front')
+                                else:
+                                    paper,paper_info=paper_mask(matte,face)
+                                    image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw,prefer_front_closure=face=='front')
+                                evidence['source_paper_proposal']=paper_info
+                            pre_trim_image=image
                             if protection_policy=='none':
-                                paper,paper_info=paper_mask(matte,face,resolve_end=False)
-                                image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw,reconstruct_paper_tail=False,prefer_front_closure=face=='front')
+                                tight_paper=None
                             else:
-                                paper,paper_info=paper_mask(matte,face)
-                                image,evidence=plate_geometry(matte,face,paper,capture,source_image=raw,prefer_front_closure=face=='front')
-                            evidence['source_paper_proposal']=paper_info
-                        pre_trim_image=image
-                        analysis_stage='paper_before_visible_canvas_trim'
-                        tight_paper,_=paper_mask(image,face,resolve_end=False) if protection_policy=='none' else paper_mask(image,face)
-                        analysis_stage='visible_canvas_trim'
-                        image,tight_proof=trim_visible_canvas(image,None if protection_policy=='none' else tight_paper)
-                    except Exception as error:
-                        fallback_valid = False
-                        if (isinstance(error, ValueError) and analysis_stage=='geometry'
-                                and review_fallback=='preserve-source' and face in ('front', 'back')):
-                            from .geometry_continuation import recover_plate
-                            try:
-                                image, evidence = recover_plate(matte, face, error)
-                            except ValueError:
-                                pass
-                            else:
-                                geometry['contact_fallbacks'][face] = evidence
-                                stages = dict(source_matte=matte)
-                                tight_proof = evidence['visible_canvas_trim']
-                                fallback_valid = True
-                        if not fallback_valid:
-                            failed=records/'failed-source-analysis';failed.mkdir(exist_ok=True)
-                            matte.save(failed/(face+'-matte.png'))
-                            failure=dict(source=item['source'],source_sha256=item['sha256'],analysis_stage=analysis_stage)
-                            if pre_trim_image is not None:
-                                failed_image=failed/(face+'-geometry-before-final-trim.png')
-                                pre_trim_image.save(failed_image)
-                                failure.update(geometry_source_image=str(failed_image),
-                                    geometry_source_sha256=w.sha(failed_image),
-                                    geometry_source_size=list(pre_trim_image.size),
-                                    coordinate_space='post_geometry_before_visible_canvas_trim')
-                            write(failed/(face+'.json'),failure)
-                            if (review_fallback=='preserve-source' and isinstance(error, ValueError)
-                                    and face in ('top', 'bottom') and isinstance(matte, Image.Image)):
-                                geometry_failures.append(dict(face=face, stage='geometry', error=str(error)))
-                                continue
-                            raise
-                    evidence['visible_canvas_trim']=tight_proof
-                    evidence['output_size']=list(image.size)
-                    p=folder/(face+'.png');image.save(p)
-                    artifacts=gr.make_evidence(item['snapshot'],image,stages,records/'geometry-review'/sku/face)
-                    geometry['images'].append(dict(sku=sku,face=face,source=item['snapshot'],
-                        source_sha256=item['sha256'],output_sha256=w.sha(p),geometry=evidence,
-                        review_reasons=evidence['review_reasons'],geometry_evidence=artifacts))
-                    backend=norm.backend;obs=dict(face=face,device=backend.device,fallback_count=backend.fallback_count,
-                        model_input_size=list(info.model_input_size) if info.model_input_size else None)
-                    if backend.device=='mps':
-                        obs.update(mps_driver_bytes=int(torch.mps.driver_allocated_memory()),
-                            mps_tensor_bytes=int(torch.mps.current_allocated_memory()))
-                    device_observations.append(obs)
+                                analysis_stage='paper_before_visible_canvas_trim'
+                                tight_paper,_=paper_mask(image,face)
+                            analysis_stage='visible_canvas_trim'
+                            image,tight_proof=trim_visible_canvas(image,tight_paper)
+                        except Exception as error:
+                            fallback_valid = False
+                            if (isinstance(error, ValueError) and analysis_stage=='geometry'
+                                    and review_fallback=='preserve-source' and face in ('front', 'back')):
+                                from .geometry_continuation import recover_plate
+                                try:
+                                    image, evidence = recover_plate(matte, face, error)
+                                except ValueError:
+                                    pass
+                                else:
+                                    geometry['contact_fallbacks'][face] = evidence
+                                    stages = dict(source_matte=matte) if debug_evidence else {}
+                                    tight_proof = evidence['visible_canvas_trim']
+                                    fallback_valid = True
+                            if not fallback_valid:
+                                failed=records/'failed-source-analysis';failed.mkdir(exist_ok=True)
+                                matte.save(failed/(face+'-matte.png'))
+                                failure=dict(source=item['source'],source_sha256=item['sha256'],analysis_stage=analysis_stage)
+                                if pre_trim_image is not None:
+                                    failed_image=failed/(face+'-geometry-before-final-trim.png')
+                                    pre_trim_image.save(failed_image)
+                                    failure.update(geometry_source_image=str(failed_image),
+                                        geometry_source_sha256=w.sha(failed_image),
+                                        geometry_source_size=list(pre_trim_image.size),
+                                        coordinate_space='post_geometry_before_visible_canvas_trim')
+                                write(failed/(face+'.json'),failure)
+                                if (review_fallback=='preserve-source' and isinstance(error, ValueError)
+                                        and face in ('top', 'bottom') and isinstance(matte, Image.Image)):
+                                    geometry_failures.append(dict(face=face, stage='geometry', error=str(error)))
+                                    continue
+                                raise
+                        evidence['visible_canvas_trim']=tight_proof
+                        evidence['output_size']=list(image.size)
+                        p=folder/(face+'.png');image.save(p)
+                        artifacts=gr.make_evidence(item['snapshot'],image,stages,records/'geometry-review'/sku/face) if debug_evidence else []
+                        geometry['images'].append(dict(sku=sku,face=face,source=item['snapshot'],
+                            source_sha256=item['sha256'],output_sha256=w.sha(p),geometry=evidence,
+                            review_reasons=evidence['review_reasons'],geometry_evidence=artifacts))
+                        backend=norm.backend;obs=dict(face=face,device=backend.device,fallback_count=backend.fallback_count,
+                            model_input_size=list(info.model_input_size) if info.model_input_size else None)
+                        if backend.device=='mps':
+                            obs.update(mps_driver_bytes=int(torch.mps.driver_allocated_memory()),
+                                mps_tensor_bytes=int(torch.mps.current_allocated_memory()))
+                        device_observations.append(obs)
+                finally:
+                    norm.backend._run_model=base_forward
             geometry['candidates_complete']=not geometry_failures
             write(records/'report.json',geometry)
             if geometry_failures:
@@ -299,18 +340,62 @@ def process_one(task):
                 write(case/'work/stage-report.json',result)
                 write(case/'result.json',result)
                 progress('partial_review',completed=6+len(available))
-                return result
+                return None,result
             write(records/'review-template.json',dict(report_sha256=w.sha(records/'report.json'),reviewer='',
                 items={sku+'/'+face:{**dict.fromkeys(gr.CHECKS,False),'notes':'','boundary_assertions':{}} for face in pipeline.FACES}))
             stage('segmentation_geometry_and_evidence',begin)
             result['device_observations']=device_observations
             result['post_forward_memory_samples']=forward_observations
             geometry_files={f:folder/(f+'.png') for f in pipeline.FACES}
+        geo_state=dict(result=result,events=events,manifest=manifest,geometry=geometry,
+            geometry_files={f:str(p) for f,p in geometry_files.items()},
+            seg_seconds=time.perf_counter()-started,seg_memory=peak_process_memory())
+        return geo_state,None
+    except Exception as exc:
+        original_trace=traceback.format_exc()
+        result.update(status='failed',six_faces_generated=False,six_faces_processed=False,error=str(exc),traceback=original_trace)
+        for item in (geometry or {}).get('images',[]):
+            if 'source_contact_appearance_unverified' in item.get('review_reasons',[]):
+                result.setdefault('review_warnings',[]).append(dict(face=item['face'],
+                    code='source_contact_appearance_unverified',
+                    message='支架接触处保留源图混合像素，轮廓与颜色仍需视觉核对；未重建被遮挡内容'))
+        result.update(seconds=time.perf_counter()-started,events=events,**peak_process_memory())
+        write(case/'result.json',result)
+        progress('failed',completed=0)
+        return None,result
+
+
+def _run_downstream_phase(task, geo_state):
+    """Run perspective, bottom alignment, lighting, structure, seam and export."""
+    cfg=_parse_task(task)
+    sku,case,model=cfg['sku'],cfg['case'],cfg['model']
+    protection_policy,review_fallback,lighting_profile=cfg['protection_policy'],cfg['review_fallback'],cfg['lighting_profile']
+    bottom_alignment,source_body_reference_review=cfg['bottom_alignment'],cfg['source_body_reference_review']
+    side_candidate_review,debug_evidence=cfg['side_candidate_review'],cfg['debug_evidence']
+    started=time.perf_counter()
+    prior_seconds=geo_state['seg_seconds']
+    seg_memory=geo_state['seg_memory']
+    result=geo_state['result']
+    events=list(geo_state['events'])
+    manifest=geo_state['manifest']
+    inputs=manifest['skus'][sku]
+    geometry=geo_state['geometry']
+    geometry_files={f:Path(p) for f,p in geo_state['geometry_files'].items()}
+    def progress(step, face=None, completed=0):
+        write(case/'live-progress.json',dict(stage=step,face=face,completed_units=completed,
+            total_units=15,updated_at=time.time(),seconds=prior_seconds+(time.perf_counter()-started)))
+    def stage(name,begin):events.append(dict(stage=name,seconds=time.perf_counter()-begin))
+    effective_files=None
+    try:
+        import cv2
+        cv2.setNumThreads(0)
+        if cv2.getNumThreads()!=1:
+            raise RuntimeError('Cannot verify sequential OpenCV execution')
         # Original/resumed geometry stays immutable. Every downstream mask and
         # source binding is measured afresh against the selected bottom image.
         from .bottom_alignment import prepare as prepare_bottom
         from .face_perspective import prepare as prepare_perspective
-        from .stage_processing import geometry_identity
+        from .stage_processing import geometry_identity,process_stages
         geometry_identity(geometry,geometry_files,sku)
         # Default planar perspective for front/back (user decision 2026-11-05).
         # Each face is measured on its own; a rejected fit keeps the exact PNG.
@@ -348,10 +433,12 @@ def process_one(task):
             perspective_output_sha256=perspective_report['faces']['back']['output_sha256']
                 if perspective_report['faces']['back']['applied'] else None)
             if source_reference_allowed else None)
+        extra_stage_kwargs=dict(debug_evidence=True) if debug_evidence else {}
         result.update(process_stages(case,sku,effective_geometry,effective_files,manifest,model,
             protection_policy,lighting_profile,progress,stage,allow_partial=review_fallback=='preserve-source',bottom_fallback=bottom_fallback,
             source_body_reference_review=source_reference_allowed,source_body_reference_metadata=reference_metadata,
-            bottom_quality=bottom_quality,side_candidate_review=side_candidate_review and source_reference_allowed))
+            bottom_quality=bottom_quality,side_candidate_review=side_candidate_review and source_reference_allowed,
+            **extra_stage_kwargs))
         if contact_fallbacks:
             result['stage_status']['geometry'] = 'degraded'
             result.update(six_faces_processed=False, mandatory_program_checks_complete=False,
@@ -378,7 +465,8 @@ def process_one(task):
             result.setdefault('review_warnings',[]).append(dict(face=item['face'],
                 code='source_contact_appearance_unverified',
                 message='支架接触处保留源图混合像素，轮廓与颜色仍需视觉核对；未重建被遮挡内容'))
-    result.update(seconds=time.perf_counter()-started,events=events,**peak_process_memory())
+    mem=_merge_peak_memory(seg_memory,peak_process_memory())
+    result.update(seconds=prior_seconds+(time.perf_counter()-started),events=events,**mem)
     if result.get('side_candidate_review_complete') is True and result.get('six_faces_generated') is True:
         begin=time.perf_counter()
         try:
@@ -391,16 +479,73 @@ def process_one(task):
         except Exception as exc:
             result.update(status='failed',six_faces_generated=False,six_faces_processed=False,
                 portable_review_packaging_failed=True,error=str(exc),traceback=traceback.format_exc())
-        result.update(seconds=time.perf_counter()-started,events=events,**peak_process_memory())
+        mem=_merge_peak_memory(seg_memory,peak_process_memory())
+        result.update(seconds=prior_seconds+(time.perf_counter()-started),events=events,**mem)
     write(case/'result.json',result)
     progress('complete' if result.get('six_faces_generated',result.get('six_faces_processed')) else 'failed',completed=15 if result.get('six_faces_generated',result.get('six_faces_processed')) else 0)
     return result
+
+
+def process_one(task):
+    """Fresh processing, or explicitly bound saved-review continuation."""
+    cfg=_parse_task(task)
+    if cfg['saved_review_descriptor'] is not None:
+        # This branch precedes normal intake/segmentation/material processing.
+        # A matched but invalid record fails; it never silently becomes a new run.
+        from .saved_review import process_saved
+        sku,source,case,model=cfg['sku'],cfg['source'],cfg['case'],cfg['model']
+        if case.exists():raise ValueError('Saved review case already exists')
+        started=time.perf_counter()
+        options=dict(model=model,protection_policy=cfg['protection_policy'],review_fallback=cfg['review_fallback'],
+            lighting_profile=cfg['lighting_profile'],bottom_alignment=cfg['bottom_alignment'],
+            source_body_reference_review=cfg['source_body_reference_review'])
+        try:
+            import cv2
+            cv2.setNumThreads(0)
+            if cv2.getNumThreads()!=1:
+                raise RuntimeError('Cannot verify sequential OpenCV execution')
+            result=process_saved(cfg['saved_review_descriptor'],sku=sku,source=source,case=case,options=options)
+            result['opencv_runtime']=dict(requested_native_threads=0,effective_threads=1,native_pool='disabled')
+            route='saved_review'
+        except Exception as exc:
+            case.mkdir(parents=True,exist_ok=True)
+            result=dict(sku=sku,status='failed',source=str(source),process=str(case),
+                six_faces_generated=False,six_faces_processed=False,quality_checks_complete=False,
+                visual_review_passed=False,model_uv_verified=False,saved_review_reused=False,
+                saved_review_requested=True,error=str(exc),traceback=traceback.format_exc())
+            route='saved_review_rejected'
+        result.update(seconds=time.perf_counter()-started,worker_pid=os.getpid(),
+            worker_parent_pid=os.getppid(),worker_process_group=os.getpgrp(),
+            worker_nice=os.getpriority(os.PRIO_PROCESS,0),
+            worker_thread_environment={k:os.environ.get(k) for k in ('OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS','VECLIB_MAXIMUM_THREADS','NUMEXPR_NUM_THREADS')},
+            execution_route=route,**peak_process_memory())
+        write(case/'result.json',result)
+        write(case/'live-progress.json',dict(stage='complete' if result.get('six_faces_generated') else 'failed',
+            completed_units=15 if result.get('six_faces_generated') else 0,total_units=15,
+            updated_at=time.time(),seconds=result['seconds']))
+        return result
+    geo_state,early=_run_geometry_phase(task)
+    if early is not None:
+        return early
+    return _run_downstream_phase(task,geo_state)
 
 
 def worker(task):
     case=Path(task[2]);case.parent.mkdir(parents=True,exist_ok=True)
     with (case.parent/(case.name+'.log')).open('w') as log,contextlib.redirect_stdout(log),contextlib.redirect_stderr(log):
         return process_one(task)
+
+
+def geometry_worker(task):
+    case=Path(task[2]);case.parent.mkdir(parents=True,exist_ok=True)
+    with (case.parent/(case.name+'.log')).open('w') as log,contextlib.redirect_stdout(log),contextlib.redirect_stderr(log):
+        return _run_geometry_phase(task)
+
+
+def downstream_worker(task, geo_state):
+    case=Path(task[2]);case.parent.mkdir(parents=True,exist_ok=True)
+    with (case.parent/(case.name+'.log')).open('a') as log,contextlib.redirect_stdout(log),contextlib.redirect_stderr(log):
+        return _run_downstream_phase(task, geo_state)
 
 
 def concurrency_limits(jobs, inference_slots=None, experimental=False):
@@ -422,10 +567,11 @@ def export_complete_candidates(attempts,work,output):
     staged=Path(work)/'complete-candidates';pipeline.fresh(staged);staged.mkdir()
     for row in selected:
         source=Path(row['candidate'])/row['sku']
+        dest=staged/row['sku'];dest.mkdir()
         for face in pipeline.FACES:
             path=source/(face+'.png')
             if w.sha(path)!=row['final_sha256'][face]:raise ValueError('Complete candidate changed before export: '+row['sku']+'/'+face)
-        shutil.copytree(source,staged/row['sku'])
+            w.clone_file(path,dest/(face+'.png'))
     pipeline.publish(staged,output)
     for row in selected:
         package=row.get('portable_review_package')
@@ -434,7 +580,7 @@ def export_complete_candidates(attempts,work,output):
             if w.sha(source)!=package['zip_sha256']:
                 raise ValueError('Portable review package changed before export: '+row['sku'])
             target=Path(output)/row['sku']/'候选证据包.zip'
-            shutil.copy2(source,target)
+            w.clone_file(source,target)
             if w.sha(target)!=package['zip_sha256']:
                 raise RuntimeError('Portable review package changed during export: '+row['sku'])
     return [row['sku'] for row in selected]
@@ -443,8 +589,9 @@ def export_complete_candidates(attempts,work,output):
 def run(source,work=None,output=None,*,jobs=1,device='auto',skus=None,single_name='SKU_01',cpu_threads=1,
         inference_slots=None,experimental_concurrency=False,model=None,protection_policy='sticker_only',review_fallback='fail',lighting_profile='accepted-shadow-lift-v2',resume_geometry_from=None,bottom_alignment='appearance',source_body_reference_review=False,
         saved_review_manifest=None,saved_review_manifest_sha256=None,require_geometry_resume=False,
-        side_candidate_review=False):
+        side_candidate_review=False,debug_evidence=False):
     from .frame_seams import profile
+    if type(debug_evidence) is not bool:raise ValueError('debug_evidence must be an explicit bool')
     if type(source_body_reference_review) is not bool:raise ValueError('source_body_reference_review must be an explicit bool')
     if type(require_geometry_resume) is not bool:raise ValueError('require_geometry_resume must be an explicit bool')
     if type(side_candidate_review) is not bool:raise ValueError('side_candidate_review must be an explicit bool')
@@ -511,6 +658,7 @@ def run(source,work=None,output=None,*,jobs=1,device='auto',skus=None,single_nam
         source_body_reference_review_enabled=source_body_reference_review,
         side_candidate_review_enabled=side_candidate_review,
         side_candidate_generation_requires_current_sources=True,
+        debug_evidence=debug_evidence,
         saved_review_manifest=str(saved_review_manifest) if saved_review_manifest is not None else None,
         saved_review_manifest_sha256=saved_review_digest,
         saved_review_selected_skus=sorted(saved_review_descriptors),
@@ -518,17 +666,69 @@ def run(source,work=None,output=None,*,jobs=1,device='auto',skus=None,single_nam
         normal_processing_skus=[n for n in names if n not in saved_review_descriptors],
         saved_review_requires_current_sources_and_evidence=True,require_geometry_resume=require_geometry_resume)
     write(work/'protocol.json',protocol)
-    tasks=[(n,str(source if is_single else source/n),str(work/'cases'/n),device,cpu_threads,model,protection_policy,review_fallback,lighting_profile,str(resume_root/'cases'/n) if resume_root else None,bottom_alignment,source_body_reference_review,saved_review_descriptors.get(n),require_geometry_resume,side_candidate_review) for n in names]
+    tasks=[(n,str(source if is_single else source/n),str(work/'cases'/n),device,cpu_threads,model,protection_policy,review_fallback,lighting_profile,str(resume_root/'cases'/n) if resume_root else None,bottom_alignment,source_body_reference_review,saved_review_descriptors.get(n),require_geometry_resume,side_candidate_review,debug_evidence) for n in names]
     result=[]
+    progress_rows=[]
+    def record_done(row):
+        result.append(row)
+        progress_rows.append(_progress_summary(row))
+        write(work/'progress.json',dict(finished=len(result),total=len(tasks),attempts=progress_rows))
+        print(json.dumps({k:row.get(k) for k in ('sku','status','seconds','error')},ensure_ascii=False),flush=True)
     context=multiprocessing.get_context('spawn')
-    with concurrent.futures.ProcessPoolExecutor(max_workers=jobs,mp_context=context,
-            initializer=initialize_worker,initargs=(context.Semaphore(slots),)) as pool:
-        futures={pool.submit(worker,t):t[0] for t in tasks}
-        for future in concurrent.futures.as_completed(futures):
-            try:row=future.result()
-            except Exception as exc:row=dict(sku=futures[future],status='failed',six_faces_processed=False,error=str(exc))
-            result.append(row);write(work/'progress.json',dict(finished=len(result),total=len(tasks),attempts=result))
-            print(json.dumps({k:row.get(k) for k in ('sku','status','seconds','error')},ensure_ascii=False),flush=True)
+    use_two_stage=(jobs>1 and len(names)>1 and resume_root is None and not saved_review_descriptors)
+    if use_two_stage:
+        # Decouple GPU/MPS BiRefNet workers (warm model, released as soon as
+        # segmentation completes) from pure-CPU downstream lighting/seam workers.
+        seg_workers=min(slots,len(names))
+        cpu_workers=min(jobs,len(names))
+        seg_pool=concurrent.futures.ProcessPoolExecutor(max_workers=seg_workers,mp_context=context,
+            initializer=initialize_worker,initargs=(context.Semaphore(slots),))
+        cpu_pool=concurrent.futures.ProcessPoolExecutor(max_workers=cpu_workers,mp_context=context,
+            initializer=initialize_worker,initargs=(None,))
+        seg_closed=False
+        try:
+            seg_futures={seg_pool.submit(geometry_worker,t):t for t in tasks}
+            cpu_futures={}
+            while seg_futures or cpu_futures:
+                done,_=concurrent.futures.wait(
+                    set(seg_futures)|set(cpu_futures),
+                    return_when=concurrent.futures.FIRST_COMPLETED)
+                for fut in done:
+                    if fut in seg_futures:
+                        task=seg_futures.pop(fut)
+                        try:
+                            geo_state,early=fut.result()
+                        except Exception as exc:
+                            record_done(dict(sku=task[0],status='failed',six_faces_processed=False,error=str(exc)))
+                        else:
+                            if early is not None:
+                                record_done(early)
+                            else:
+                                cpu_futures[cpu_pool.submit(downstream_worker,task,geo_state)]=task[0]
+                    else:
+                        sku_name=cpu_futures.pop(fut)
+                        try:
+                            row=fut.result()
+                        except Exception as exc:
+                            row=dict(sku=sku_name,status='failed',six_faces_processed=False,error=str(exc))
+                        record_done(row)
+                if not seg_futures and not seg_closed:
+                    seg_pool.shutdown(wait=False)
+                    seg_closed=True
+        finally:
+            if not seg_closed:
+                seg_pool.shutdown(wait=True)
+            else:
+                seg_pool.shutdown(wait=True)
+            cpu_pool.shutdown(wait=True)
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=jobs,mp_context=context,
+                initializer=initialize_worker,initargs=(context.Semaphore(slots),)) as pool:
+            futures={pool.submit(worker,t):t[0] for t in tasks}
+            for future in concurrent.futures.as_completed(futures):
+                try:row=future.result()
+                except Exception as exc:row=dict(sku=futures[future],status='failed',six_faces_processed=False,error=str(exc))
+                record_done(row)
     result.sort(key=lambda r:r['sku']);completed=sum(r.get('six_faces_processed',False) for r in result)
     generated=sum(r.get('six_faces_generated',r.get('six_faces_processed',False)) for r in result)
     report=dict(protocol=protocol,attempts=result,processed=completed,generated=generated,source_preserved_candidates=sum(r.get('status')=='source_preserved_needs_review' for r in result),effect_warning_candidates=sum(r.get('status')=='full_stages_effect_warning_needs_review' for r in result),total=len(tasks),

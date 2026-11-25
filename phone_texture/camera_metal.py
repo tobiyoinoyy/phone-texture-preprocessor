@@ -18,18 +18,62 @@ def _scan(light, centre, offsets):
     )
 
 
+def _independent_seeds(boosted):
+    from .back_lens import _disk_readings, STANDARD
+
+    h, w = boosted.shape[:2]
+    profiles = np.array([spec['lenses'] for spec in STANDARD.values()]) * [w, h]
+    windows = np.stack((profiles.min(axis=0) - .045*w, profiles.max(axis=0) + .045*w), axis=1)
+    readings = list(_disk_readings(boosted))
+    seeds = []
+    for low, high in windows:
+        candidates = []
+        for disks in readings:
+            inside = [d for d in disks if np.all(d[:2] >= low) and np.all(d[:2] <= high)]
+            if len(inside) == 1:
+                candidates.append(inside[0])
+        points = np.array(candidates)
+        groups = [points[np.max(abs(points - p), axis=1) <= 1.5] for p in points]
+        best = max(groups, key=len, default=[])
+        seeds.append(np.median(best, axis=0) if len(best) >= 3 else None)
+    return seeds, windows
+
+
+def _verified_glass(source, seed):
+    from .back_geometry import measure_glass_edges
+
+    x, y, radius = seed
+    candidates = []
+    for fraction in (0., -.03, .03):
+        trial = [[x, y, radius * (1 + fraction)]]
+        try:
+            first = measure_glass_edges(source, trial, search_width=6.)[0]
+            second = measure_glass_edges(source, trial, search_width=9.)[0]
+        except ValueError:
+            continue
+        if np.max(abs(first - second)) <= .65:
+            reading = (first + second) / 2
+            if fraction == 0.:
+                return reading
+            candidates.append(reading)
+    if candidates and np.max(np.ptp(candidates, axis=0)) <= .65:
+        return np.mean(candidates, axis=0)
+    return None
+
+
 def measure(source, layout):
     """Keep the measured glass centre and both metal edges for each supported arc."""
     from .back_lens import _disks
     from .iphone17_model_finish import lens_pair
 
     location = "source_gray"
+    exclusions = []
+    slots = None
     if layout == "dual":
         centres = lens_pair(source)
     elif layout == "triple":
         centres, _ = _disks(source)
         if centres is None:
-            from .back_geometry import measure_glass_edges
 
             gray = cv2.cvtColor(source[..., :3], cv2.COLOR_RGB2GRAY)
             boosted = source.copy()
@@ -37,13 +81,27 @@ def measure(source, layout):
             enhanced = cv2.createCLAHE(clipLimit=2.1, tileGridSize=(8, 8)).apply(roi)
             boosted[: roi.shape[0], : roi.shape[1], :3] = enhanced[..., None]
             seeds, _ = _disks(boosted)
+            windows = None
             if seeds is None:
-                raise ValueError("三镜片灰度分档定位证据不足")
-            first = measure_glass_edges(source, seeds, search_width=6.0)
-            second = measure_glass_edges(source, seeds, search_width=9.0)
-            if np.max(abs(first - second)) > 0.65:
-                raise ValueError("增强灰度提名的位置未通过原图分区复测")
-            centres = (first + second) / 2
+                seeds, windows = _independent_seeds(boosted)
+            centres, slots = [], []
+            for slot, seed in enumerate(seeds):
+                measured = _verified_glass(source, seed) if seed is not None else None
+                if measured is not None:
+                    centres.append(measured)
+                    slots.append(slot)
+                    continue
+                if seed is not None:
+                    x, y, r = seed
+                    pad = 1.65*r
+                    box = [x-pad, y-pad, x+pad, y+pad]
+                else:
+                    low, high = windows[slot]
+                    pad = .18 * source.shape[1]
+                    box = [*(low-pad), *(high+pad)]
+                exclusions.append(dict(slot=slot, box=box))
+            if not centres:
+                raise ValueError("三枚镜头均缺少原图分区边界依据")
             location = "enhanced_gray_verified_on_source"
     else:
         raise ValueError("Unknown camera layout")
@@ -54,7 +112,8 @@ def measure(source, layout):
         lenses.append(
             dict(centre=centre.tolist(), inner=lo.tolist(), outer=hi.tolist(), supported=stable.tolist())
         )
-    return dict(layout=layout, location=location, lenses=lenses)
+    return dict(layout=layout, location=location, lenses=lenses,
+                slots=list(range(len(lenses))) if slots is None else slots, exclusions=exclusions)
 
 
 def _edges(light, centre):
@@ -192,7 +251,19 @@ def _align_exterior(lab, flat, centre, distance, angle, trust):
     return int(np.count_nonzero(blend > 0.03))
 
 
-def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
+def _cast_shadows(raw, lab, flat, geometry, lenses, lit_edges):
+    from .lens_exterior import lift as lift_cast_shadow
+
+    margin_reference = flat.copy()
+    for centre, distance, _, _ in geometry:
+        margin_reference &= distance > 0.20 * centre[2]
+    return [
+        lift_cast_shadow(raw, lab, flat, lens, hi, ok, margin_reference)
+        for lens, (hi, ok) in zip(lenses, lit_edges)
+    ]
+
+
+def apply(source, source_lab, output_lab, allowed, plan, plateau=None, *, exterior_only=False):
     """Work in the source geometry before resizing. Recover detail from this photograph."""
     from .rear_shadow import _plateau_core, _ring_material, InsufficientRearShadowEvidence
 
@@ -202,6 +273,9 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
     raw = source_lab[:bottom]
     metal = allowed[:bottom] & (source[:bottom, :, 3] == 255)
     shape = metal.shape
+    for entry in plan.get('exclusions', []):
+        x0, y0, x1, y1 = entry['box']
+        metal[max(0, int(y0)):int(np.ceil(y1))+1, max(0, int(x0)):int(np.ceil(x1))+1] = False
     flat = metal.copy()
     if plan["layout"] == "triple":
         try:
@@ -215,11 +289,13 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
     rings = np.zeros(shape)
     geometry = []
     confirmed_angles = []
+    lit_edges = []
     for lens in lenses:
         ring, distance, angle, trust = _geometry(shape, lens)
         # A re-read of the lit image catches apparent displaced edges. Only
         # the overlap of both observed metal bands receives the shared colour.
         lit_lo, lit_hi, lit_ok = _edges(lab[..., 0], lens["centre"])
+        lit_edges.append((lit_hi, lit_ok))
         lo = np.asarray(lens["inner"])
         hi = np.asarray(lens["outer"])
         corroborated = dict(
@@ -233,8 +309,13 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
         rings = np.maximum(rings, np.minimum(ring, common_ring) * metal)
         flat &= distance > 2
         geometry.append((lens["centre"], distance, angle, trust))
-    if any(sum(lens["supported"]) < 210 for lens in lenses):
-        flat[:] = False
+    for lens, (centre, distance, _, _) in zip(lenses, geometry):
+        if sum(lens["supported"]) < 210:
+            if plan["layout"] == "dual":
+                flat[:] = False
+            else:
+                # Keep a weak rim and its shade out of every shared metal sample.
+                flat &= distance > .55 * centre[2]
     flash = _flash(source, shape) if plan["layout"] == "triple" and flat.any() else None
     if flash is None and plan["layout"] == "triple":
         # When the rim cannot be measured, omit the complete flash search window.
@@ -258,6 +339,8 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
     report = dict(
         layout=plan["layout"],
         location=plan["location"],
+        measured_slots=plan.get("slots", list(range(len(lenses)))),
+        excluded_slots=[e["slot"] for e in plan.get("exclusions", [])],
         ring_confirmed_angles=confirmed_angles,
         supported_angles=[int(np.sum(v["supported"])) for v in lenses],
     )
@@ -298,6 +381,20 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
     for centre, d, angle, trust in geometry:
         exterior.append(_align_exterior(lab, flat, centre, d, angle, trust))
     report["lens_exterior_pixels"] = exterior
+    if exterior_only:
+        # A continuation has authority only for the verified exterior shadow.
+        # Reuse the same field and source/target rim tests as the ordinary path.
+        report["lens_cast_shadow"] = _cast_shadows(raw, lab, flat, geometry, lenses, lit_edges)
+        weight = np.zeros(shape)
+        for centre, distance, _, trust in geometry:
+            # The measured falling edge can be on the INNER side of the dark
+            # physical joint. Keep that joint intact on a fallback photograph.
+            radial = distance / centre[2]
+            weight = np.maximum(weight, trust * ease((radial - .052) / .025)
+                                * ease((.30 - radial) / .05))
+        lab = output_lab[:bottom] + weight[..., None] * (lab - output_lab[:bottom])
+        active = flat & (weight > 0) & np.any(abs(lab - output_lab[:bottom]) > 1e-6, axis=-1)
+        return lab, active, report
     report["flash_exterior_pixels"] = 0
     if flash is not None:
         angle = np.rad2deg(np.arctan2(yy - flash[1], xx - flash[0])) % 360
@@ -321,6 +418,13 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
             fade = ease((ndi.distance_transform_edt(flat) - 8) / 10)
             light += fade * delta
             report["warm_metal_pixels"] = int(np.count_nonzero(abs(fade * delta) > 0.1))
+    from .lighting_spot_review import camera_arc
+    spot_checks = []
+    def review(zone, stage, mask):
+        checks = [camera_arc(raw, lab, mask, lens, zone) for lens in lenses]
+        spot_checks.append(dict(stage=stage, zone=zone, lenses=checks))
+
+    review('exterior', 'shared_field_and_exterior', flat)
     inside = rings > 0.9
     report["ring_pixels"] = 0
     if inside.sum() > 100:
@@ -338,6 +442,7 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
         )
         lab[use] += rings[use, None] * (wanted - lab[use])
         report["ring_pixels"] = int(use.sum())
+    review('ring', 'ring_lighting', metal)
     from .rear_shadow import _restore_secondary_arc
 
     report["secondary_arc_guard"] = []
@@ -352,8 +457,14 @@ def apply(source, source_lab, output_lab, allowed, plan, plateau=None):
             _restore_secondary_arc(output_lab[:bottom], raw, lab, valid, measured)
         )
     changed = np.max(abs(lab - output_lab[:bottom]), axis=-1) > 1e-6
-    # The standard lighting contract bounds the total change relative to the photo.
+    # Bound the base illumination relative to the photo before the independent cast-shadow pass.
     lab[..., 0][changed] = np.clip(
         lab[..., 0][changed], raw[..., 0][changed] - 34, raw[..., 0][changed] + 34
     )
+    report["lens_cast_shadow"] = _cast_shadows(raw, lab, flat, geometry, lenses, lit_edges)
+    review('exterior', 'cast_shadow', flat)
+    from .lens_rim_continuity import review as review_rim_continuity
+    report['rim_continuity'] = [review_rim_continuity(raw, lab, metal, lens, flat) for lens in lenses]
+    report['spot_review'] = spot_checks
+    changed = np.max(abs(lab - output_lab[:bottom]), axis=-1) > 1e-6
     return lab, changed, report

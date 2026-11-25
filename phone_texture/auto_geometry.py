@@ -772,6 +772,12 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
             if len(near)>=max(20,exposed.sum()*.6) and abs(float(np.median(near)))<=5 and np.percentile(near,75)<=4:
                 options.append((float(np.polyval(fitted,(x0+x1)/2)),fitted,error,float(kept.mean())))
     if not options:
+        if face == 'back' or _front_closure_evidence:
+            from .joined_stand import cut_joined_stand
+            try:
+                return cut_joined_stand(matte, mask, raw_rgb, paper, x0, x1, rows[-1], axis_proof, stage_sink)
+            except ValueError:
+                pass
         raise ValueError('Plate lower boundary is uncertain')
     _,line,residual,inlier_fraction=max(options,key=lambda v:v[0])
     yy=np.arange(h)[:,None];xx=np.arange(w)[None,:]+.5;limit=np.polyval(line,xx)+1.

@@ -58,6 +58,17 @@ def tolerated_unsupported(missing, alpha, supported):
             and int(fringe.sum()) <= SOFT_FRINGE_UNSUPPORTED_TOLERANCE_PX)
 
 
+_SRGB_TO_XYZ = np.array([[.4124564, .3575761, .1804375],
+                         [.2126729, .7151522, .0721750],
+                         [.0193339, .1191920, .9503041]])
+_XYZ_TO_SRGB = np.linalg.inv(_SRGB_TO_XYZ)
+_SRGB_TO_XYZ_T = np.ascontiguousarray(_SRGB_TO_XYZ.T)
+_XYZ_TO_SRGB_T = np.ascontiguousarray(_XYZ_TO_SRGB.T)
+_D65_WHITE = np.array([.95047, 1., 1.08883])
+_LAB_EPS = (6. / 29.) ** 3
+_LAB_KAPPA_INV = 3. * (6. / 29.) ** 2
+
+
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -65,11 +76,8 @@ def digest(path):
 def rgb_to_lab(rgb):
     s = np.asarray(rgb, dtype=float) / 255
     lin = np.where(s <= .04045, s / 12.92, ((s + .055) / 1.055) ** 2.4)
-    xyz = np.einsum('...j,ij->...i', lin, np.array([[.4124564, .3575761, .1804375],
-                          [.2126729, .7151522, .0721750],
-                          [.0193339, .1191920, .9503041]]))
-    v = xyz / np.array([.95047, 1., 1.08883])
-    f = np.where(v > (6/29)**3, np.cbrt(v), v / (3*(6/29)**2) + 4/29)
+    v = (lin @ _SRGB_TO_XYZ_T) / _D65_WHITE
+    f = np.where(v > _LAB_EPS, np.cbrt(v), v / _LAB_KAPPA_INV + 4/29)
     return np.stack([116*f[...,1]-16, 500*(f[...,0]-f[...,1]),
                      200*(f[...,1]-f[...,2])], axis=-1)
 
@@ -77,12 +85,9 @@ def rgb_to_lab(rgb):
 def lab_to_linear_rgb(lab):
     fy = (lab[...,0]+16)/116
     f = np.stack([fy+lab[...,1]/500, fy, fy-lab[...,2]/200], axis=-1)
-    xyz = np.where(f > 6/29, f**3, 3*(6/29)**2*(f-4/29))
-    xyz *= np.array([.95047, 1., 1.08883])
-    lin = np.einsum('...j,ij->...i', xyz, np.linalg.inv(np.array([[.4124564,.3575761,.1804375],
-                                      [.2126729,.7151522,.0721750],
-                                      [.0193339,.1191920,.9503041]])))
-    return lin
+    xyz = np.where(f > 6/29, f**3, _LAB_KAPPA_INV*(f-4/29))
+    xyz *= _D65_WHITE
+    return xyz @ _XYZ_TO_SRGB_T
 
 
 def lab_to_rgb(lab):
@@ -113,7 +118,7 @@ def quantize_continuous_illumination(lab, source_rgb, region, max_step):
     srgb=np.clip(np.where(lin<=.0031308,lin*12.92,1.055*lin**(1/2.4)-.055)*255,0,255)
     corners=[];corrections=[];cost=[]
     for code in range(8):
-        corner=np.stack([np.ceil(srgb[...,k]) if code&(1<<k) else np.floor(srgb[...,k]) for k in range(3)],axis=-1).astype(np.uint8)
+        corner=np.stack([np.minimum(255,np.floor(srgb[...,k])+1) if code&(1<<k) else np.floor(srgb[...,k]) for k in range(3)],axis=-1).astype(np.uint8)
         corners.append(corner);corrections.append(rgb_to_lab(corner)[...,0]-source[...,0]);cost.append(np.sum((corner.astype(float)-srgb)**2,axis=2))
     corners=np.array(corners);corrections=np.array(corrections);cost=np.array(cost)
     h,w=mask.shape;xx=np.arange(w);back=np.zeros((h,8,w),np.uint8);dp=cost[:,0].copy();restarts=0
@@ -145,18 +150,34 @@ def preserve_chroma_in_gamut(desired, source):
     linear = lab_to_linear_rgb(result)
     bad = np.any((linear < -1e-7) | (linear > 1+1e-7), axis=-1)
     if bad.any():
-        src, dst = source[bad], result[bad]
-        delta = dst[..., 0] - src[..., 0]
-        lo, hi = np.zeros(len(src)), np.ones(len(src))
+        src_L = source[bad, 0]
+        dst = result[bad]
+        delta = dst[:, 0] - src_L
+        da = dst[:, 1] / 500.
+        db = dst[:, 2] / 200.
+        fy_src = (src_L + 16.) / 116.
+        dfy = delta / 116.
+        m00, m01, m02 = _XYZ_TO_SRGB[0] * _D65_WHITE
+        m10, m11, m12 = _XYZ_TO_SRGB[1] * _D65_WHITE
+        m20, m21, m22 = _XYZ_TO_SRGB[2] * _D65_WHITE
+        t_cut = 6. / 29.
+        c_lin = 4. / 29.
+        lo, hi = np.zeros(len(src_L)), np.ones(len(src_L))
         for _ in range(24):
-            mid = (lo+hi)/2
-            trial = dst.copy()
-            trial[..., 0] = src[..., 0] + delta*mid
-            rgb = lab_to_linear_rgb(trial)
-            valid = np.all((rgb >= -1e-7) & (rgb <= 1+1e-7), axis=-1)
+            mid = 0.5 * (lo + hi)
+            fy = fy_src + dfy * mid
+            fx = fy + da
+            fz = fy - db
+            x = np.where(fx > t_cut, fx * fx * fx, _LAB_KAPPA_INV * (fx - c_lin))
+            y = np.where(fy > t_cut, fy * fy * fy, _LAB_KAPPA_INV * (fy - c_lin))
+            z = np.where(fz > t_cut, fz * fz * fz, _LAB_KAPPA_INV * (fz - c_lin))
+            r = m00 * x + m01 * y + m02 * z
+            g = m10 * x + m11 * y + m12 * z
+            b = m20 * x + m21 * y + m22 * z
+            valid = (r >= -1e-7) & (r <= 1+1e-7) & (g >= -1e-7) & (g <= 1+1e-7) & (b >= -1e-7) & (b <= 1+1e-7)
             lo = np.where(valid, mid, lo)
             hi = np.where(valid, hi, mid)
-        dst[..., 0] = src[..., 0] + delta*lo
+        dst[:, 0] = src_L + delta * lo
         result[bad] = dst
     return result, int(bad.sum())
 
@@ -188,6 +209,69 @@ def color_mode(config):
     return mode
 
 
+def _min_plus_sweep(cap, mask, step, *, eight_connected=False, edge_costs=None):
+    """Exact Gauss-Seidel fast-sweeping fixed point for masked min-plus propagation."""
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return cap
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    sub = cap[y0:y1, x0:x1].copy()
+    m = mask[y0:y1, x0:x1]
+    h, w = sub.shape
+    if eight_connected:
+        from scipy.ndimage import minimum_filter1d
+        for _ in range(max(4, h + w)):
+            prev = sub.copy()
+            for y in range(1, h):
+                up = minimum_filter1d(sub[y - 1], size=3, mode='constant', cval=np.inf)
+                sub[y] = np.where(m[y], np.minimum(sub[y], up + step), np.inf)
+            for y in range(h - 2, -1, -1):
+                dn = minimum_filter1d(sub[y + 1], size=3, mode='constant', cval=np.inf)
+                sub[y] = np.where(m[y], np.minimum(sub[y], dn + step), np.inf)
+            for x in range(1, w):
+                lf = minimum_filter1d(sub[:, x - 1], size=3, mode='constant', cval=np.inf)
+                sub[:, x] = np.where(m[:, x], np.minimum(sub[:, x], lf + step), np.inf)
+            for x in range(w - 2, -1, -1):
+                rt = minimum_filter1d(sub[:, x + 1], size=3, mode='constant', cval=np.inf)
+                sub[:, x] = np.where(m[:, x], np.minimum(sub[:, x], rt + step), np.inf)
+            if np.array_equal(sub, prev):
+                break
+    elif edge_costs is not None:
+        c_up = edge_costs['up'][y0:y1, x0:x1]
+        c_dn = edge_costs['down'][y0:y1, x0:x1]
+        c_lf = edge_costs['left'][y0:y1, x0:x1]
+        c_rt = edge_costs['right'][y0:y1, x0:x1]
+        for _ in range(max(4, h + w)):
+            prev = sub.copy()
+            for y in range(1, h):
+                sub[y] = np.where(m[y], np.minimum(sub[y], sub[y - 1] + c_up[y]), np.inf)
+            for y in range(h - 2, -1, -1):
+                sub[y] = np.where(m[y], np.minimum(sub[y], sub[y + 1] + c_dn[y]), np.inf)
+            for x in range(1, w):
+                sub[:, x] = np.where(m[:, x], np.minimum(sub[:, x], sub[:, x - 1] + c_lf[:, x]), np.inf)
+            for x in range(w - 2, -1, -1):
+                sub[:, x] = np.where(m[:, x], np.minimum(sub[:, x], sub[:, x + 1] + c_rt[:, x]), np.inf)
+            if np.array_equal(sub, prev):
+                break
+    else:
+        for _ in range(max(4, h + w)):
+            prev = sub.copy()
+            for y in range(1, h):
+                sub[y] = np.where(m[y], np.minimum(sub[y], sub[y - 1] + step), np.inf)
+            for y in range(h - 2, -1, -1):
+                sub[y] = np.where(m[y], np.minimum(sub[y], sub[y + 1] + step), np.inf)
+            for x in range(1, w):
+                sub[:, x] = np.where(m[:, x], np.minimum(sub[:, x], sub[:, x - 1] + step), np.inf)
+            for x in range(w - 2, -1, -1):
+                sub[:, x] = np.where(m[:, x], np.minimum(sub[:, x], sub[:, x + 1] + step), np.inf)
+            if np.array_equal(sub, prev):
+                break
+    out = cap.copy()
+    out[y0:y1, x0:x1] = sub
+    return out
+
+
 def continuous_gamut_limits(desired, safe, source, mask, max_step, seed_mask=None,
                             follow_field=False, follow_source_edges=False,
                             source_edge_weight=None):
@@ -197,7 +281,6 @@ def continuous_gamut_limits(desired, safe, source, mask, max_step, seed_mask=Non
     never filtered, and an unbounded field is returned exactly unchanged.
     Paper, other materials and opposite-sign corrections block propagation.
     """
-    from scipy.ndimage import minimum_filter
     max_step = float(max_step)
     if not np.isfinite(max_step) or max_step <= 0:
         raise ValueError('Gamut continuity step must be finite and positive')
@@ -228,8 +311,16 @@ def continuous_gamut_limits(desired, safe, source, mask, max_step, seed_mask=Non
         limited &= seed_mask
     result = safe.copy()
     changed = np.zeros(mask.shape, bool)
-    # Four-neighbor paths cannot jump diagonally across a material/label gap.
-    cross = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], bool)
+    edge_costs = None
+    if follow_field or follow_source_edges:
+        edge_costs = {}
+        for name, axis, offset in (('up', 0, 1), ('down', 0, -1), ('left', 1, 1), ('right', 1, -1)):
+            slope = np.abs(wanted - np.roll(wanted, offset, axis)) if follow_field else 0.
+            if follow_source_edges:
+                weight = np.minimum(source_edge_weight, np.roll(source_edge_weight, offset, axis))
+                impulse_edge = feature_support | np.roll(feature_support, offset, axis)
+                slope = slope + weight * impulse_edge * np.abs(feature - np.roll(feature, offset, axis))
+            edge_costs[name] = max_step + slope
     for sign in (1., -1.):
         region = mask & (sign * wanted > 0)
         seeds = region & limited
@@ -237,42 +328,7 @@ def continuous_gamut_limits(desired, safe, source, mask, max_step, seed_mask=Non
             continue
         magnitude = np.maximum(0., sign * bounded)
         cap = np.where(seeds, magnitude, np.inf)
-        # Beyond this radius even a zero cap cannot reduce the largest shift.
-        for _ in range(int(np.ceil(float(magnitude[region].max()) / max_step)) + 1):
-            if follow_field or follow_source_edges:
-                # A narrow photographic shadow needs a steep *smooth* L lift.
-                # A fixed displacement slope incorrectly propagates bright
-                # pixels' small gamut budgets into that dark rail. Allow the
-                # already fitted correction gradient, while spreading only
-                # additional gamut reductions. Never filter source RGB/Lab.
-                updated = cap.copy()
-                for axis in (0, 1):
-                    for offset in (-1, 1):
-                        neighbor = np.roll(cap, offset, axis)
-                        slope = (np.abs(wanted - np.roll(wanted, offset, axis))
-                                 if follow_field else 0.)
-                        if follow_source_edges:
-                            # A real bright scratch can have almost no gamut
-                            # headroom while the adjacent shadowed metal has
-                            # plenty. Its source contrast bounds the permitted
-                            # cap discontinuity; do not turn that tiny feature
-                            # into a broad dark halo. Source RGB is untouched.
-                            weight = np.minimum(source_edge_weight,
-                                np.roll(source_edge_weight, offset, axis))
-                            impulse_edge = feature_support | np.roll(feature_support, offset, axis)
-                            slope = slope + weight * impulse_edge * np.abs(feature -
-                                np.roll(feature, offset, axis))
-                        edge = [slice(None), slice(None)]
-                        edge[axis] = 0 if offset == 1 else -1
-                        neighbor[tuple(edge)] = np.inf
-                        updated = np.minimum(updated, neighbor + max_step + slope)
-                updated = np.where(region, updated, np.inf)
-            else:
-                updated = np.where(region, np.minimum(cap, minimum_filter(
-                    cap, footprint=cross, mode='constant', cval=np.inf) + max_step), np.inf)
-            if np.array_equal(updated, cap):
-                break
-            cap = updated
+        cap = _min_plus_sweep(cap, region, max_step, eight_connected=False, edge_costs=edge_costs)
         affected = region & (cap < magnitude)
         result[affected, 0] = source[affected, 0] + sign * cap[affected]
         changed |= affected
@@ -287,6 +343,10 @@ def gaussian(arr, sigma):
     """Float separable Gaussian; reflection padding avoids dark image borders."""
     out = np.asarray(arr, dtype=float)
     sy, sx = sigma if isinstance(sigma, (list, tuple)) else (sigma, sigma)
+    try:
+        from scipy.ndimage import correlate1d
+    except ImportError:
+        correlate1d = None
     for axis, std in [(0, sy), (1, sx)]:
         if std <= 0:
             continue
@@ -294,10 +354,13 @@ def gaussian(arr, sigma):
         xx = np.arange(-radius, radius+1)
         kernel = np.exp(-.5*(xx/std)**2)
         kernel /= kernel.sum()
-        pad = [(0, 0)]*out.ndim
-        pad[axis] = (radius, radius)
-        p = np.pad(out, pad, mode='reflect')
-        out = np.apply_along_axis(lambda a: np.convolve(a, kernel, mode='valid'), axis, p)
+        if correlate1d is not None:
+            out = correlate1d(out, kernel, axis=axis, mode='mirror')
+        else:
+            pad = [(0, 0)]*out.ndim
+            pad[axis] = (radius, radius)
+            p = np.pad(out, pad, mode='reflect')
+            out = np.apply_along_axis(lambda a: np.convolve(a, kernel, mode='valid'), axis, p)
     return out
 
 
@@ -317,7 +380,7 @@ def shapes_mask(size, shapes):
     return np.array(im) > 0
 
 
-def supported_field(lab, fit, editable, sigma, alpha=None):
+def supported_field(lab, fit, editable, sigma, alpha=None, *, channels=(0, 1, 2)):
     """Never extrapolate an unsupported editable component from another surface.
 
     Shared by CLI and custom batch scripts. The fixed floor is a numerical
@@ -342,13 +405,15 @@ def supported_field(lab, fit, editable, sigma, alpha=None):
                          f'bounds [{x.min()}, {y.min()}, {x.max()}, {y.max()}]. '
                          'Split the component and fit its own reviewed source samples; '
                          'nearest-neighbor or median hole filling is not permitted.')
-    low = np.stack([gaussian(lab[..., c]*fit, sigma)/np.maximum(support, 1e-9)
-                    for c in range(3)], axis=-1)
+    denom = np.maximum(support, 1e-9)
+    low = np.zeros_like(lab)
+    for c in channels:
+        low[..., c] = gaussian(lab[..., c]*fit, sigma) / denom
     low[~reliable] = 0
     return low, support, reliable
 
 
-def feature_excluded_field(lab, fit, editable, sigma, feature, alpha=None):
+def feature_excluded_field(lab, fit, editable, sigma, feature, alpha=None, *, channels=(0, 1, 2)):
     """Estimate illumination around a confirmed albedo mark, not from its ink.
 
     Enlarge the normalized source convolution only where the excluded feature
@@ -360,9 +425,9 @@ def feature_excluded_field(lab, fit, editable, sigma, feature, alpha=None):
         raise ValueError('Feature field needs a nonempty excluded source feature')
     radius=float(distance_transform_edt(feature).max())
     wide_sigma=np.maximum(np.asarray(sigma,dtype=float),radius*.8).tolist()
-    wide,wide_support,_=supported_field(lab,fit,editable,wide_sigma,alpha)
+    wide,wide_support,_=supported_field(lab,fit,editable,wide_sigma,alpha,channels=channels)
     support=gaussian(fit.astype(float),sigma)
-    low,_,_=supported_field(lab,fit,editable&(support>=.008),sigma,alpha)
+    low,_,_=supported_field(lab,fit,editable&(support>=.008),sigma,alpha,channels=channels)
     t=np.clip((.65-support)/.5,0,1);weight=t*t*(3-2*t)
     # At unrelated domain edges preserve the established field exactly.
     taper=np.clip(4-distance_transform_edt(~feature)/max(wide_sigma),0,1)
@@ -456,7 +521,7 @@ def target_color(job):
     return target, info
 
 
-def smooth_material_correction(shift, reliable, fit, editable, sigma, mode='legacy'):
+def smooth_material_correction(shift, reliable, fit, editable, sigma, mode='legacy', *, channels=(0, 1, 2)):
     """Smooth an additive field without treating interpolated pixels as source.
 
     Source fit coverage continuously weights the independent fit estimate. A
@@ -465,14 +530,25 @@ def smooth_material_correction(shift, reliable, fit, editable, sigma, mode='lega
     Historical jobs retain their original smoothing unless explicitly opted in.
     """
     denominator=gaussian(reliable.astype(float),sigma)
-    original=gaussian(shift*reliable[...,None],sigma)/np.maximum(denominator[...,None],1e-9)
+    denom=np.maximum(denominator,1e-9)
+    if channels == (0, 1, 2):
+        original=gaussian(shift*reliable[...,None],sigma)/denom[...,None]
+    else:
+        original=np.zeros_like(shift)
+        for c in channels:
+            original[...,c]=gaussian(shift[...,c]*reliable,sigma)/denom
     if mode=='legacy':return original,None
     if mode!='source_fit_coverage':raise ValueError('Unknown correction smoothing mode')
     source_fit=fit&reliable
     fit_denominator=gaussian(source_fit.astype(float),sigma)
-    coverage=fit_denominator/np.maximum(denominator,1e-9)
-    result=((1-coverage[...,None])*original
-            +gaussian(shift*source_fit[...,None],sigma)/np.maximum(denominator[...,None],1e-9))
+    coverage=fit_denominator/denom
+    if channels == (0, 1, 2):
+        fit_smooth=gaussian(shift*source_fit[...,None],sigma)/denom[...,None]
+    else:
+        fit_smooth=np.zeros_like(shift)
+        for c in channels:
+            fit_smooth[...,c]=gaussian(shift[...,c]*source_fit,sigma)/denom
+    result=(1-coverage[...,None])*original+fit_smooth
     if np.any(denominator[editable]<=1e-9) or not np.isfinite(result[editable]).all():
         raise ValueError('Unsupported source-fit correction smoothing')
     no_fit=editable&(fit_denominator==0)
@@ -483,7 +559,7 @@ def smooth_material_correction(shift, reliable, fit, editable, sigma, mode='lega
     return result,info
 
 
-def supported_contour_field(lab, fit, editable, alpha, sigma, inset_depth=5., source_inset_limit=None):
+def supported_contour_field(lab, fit, editable, alpha, sigma, inset_depth=5., source_inset_limit=None, *, channels=(0, 1, 2)):
     """Tangent/normal source sampling; include curved rims and alpha fringes.
 
     Requires SciPy (included by phone-texture-preprocessor). No nearest-neighbor
@@ -541,14 +617,16 @@ def supported_contour_field(lab, fit, editable, alpha, sigma, inset_depth=5., so
     # padding is explicit or implicit; `constant` drops fractional border
     # samples wholesale and therefore changes when the canvas is padded.
     sample_mode='grid-constant' if source_inset_limit is not None else 'constant'
+    fit_f=fit.astype(float)
+    lab_fit={c: lab[...,c]*fit_f for c in channels}
     num=np.zeros((len(x),3));den=np.zeros(len(x));total=0.
     for t in np.linspace(-2.5*tangent,2.5*tangent,19):
         for n in np.linspace(-2*normal,2*normal,5):
             coordinates=[y+nx[y,x]*t+ny[y,x]*(n+inset),x-ny[y,x]*t+nx[y,x]*(n+inset)]
             weight=np.exp(-.5*(t/tangent)**2-.5*(n/normal)**2);total+=weight
-            den+=weight*map_coordinates(fit.astype(float),coordinates,order=1,mode=sample_mode,cval=0)
-            for channel in range(3):
-                num[:,channel]+=weight*map_coordinates(lab[...,channel]*fit,coordinates,order=1,mode=sample_mode,cval=0)
+            den+=weight*map_coordinates(fit_f,coordinates,order=1,mode=sample_mode,cval=0)
+            for channel in channels:
+                num[:,channel]+=weight*map_coordinates(lab_fit[channel],coordinates,order=1,mode=sample_mode,cval=0)
     strength=den/total
     missing=strength<.008
     # A few isolated edge pixels without support must not void a whole face.
@@ -611,8 +689,11 @@ def blend_correction_boundary(shift, masks, config, source_lab=None):
     distance=distance_transform_edt(~seam)
     t=np.clip(1-distance/(3*sigma),0,1);weight=t*t*(3-2*t)*union
     support=gaussian_filter(union.astype(float),sigma)
-    smooth=np.stack([gaussian_filter(shift[...,c]*union,sigma)/np.maximum(support,1e-9)
-                     for c in range(3)],axis=-1)
+    denom=np.maximum(support,1e-9)
+    smooth=np.zeros_like(shift)
+    for c in range(3):
+        if np.any(shift[...,c]):
+            smooth[...,c]=gaussian_filter(shift[...,c]*union,sigma)/denom
     result=shift+(smooth-shift)*weight[...,None]
     gamut_adjusted=0
     if source_lab is not None and kind=='same_material':
@@ -628,10 +709,7 @@ def blend_correction_boundary(shift, masks, config, source_lab=None):
             cap=np.where(union,magnitude,np.inf)
             # A min-plus envelope only reduces correction magnitude and is
             # at most 0.6 L/pixel in either axis; it never invents RGB detail.
-            for _ in range(int(np.ceil(float(magnitude[union].max())/.6))+1):
-                updated=np.where(union,np.minimum(cap,minimum_filter(cap,size=3,mode='constant',cval=np.inf)+.6),np.inf)
-                if np.array_equal(updated,cap):break
-                cap=updated
+            cap=_min_plus_sweep(cap,union,.6,eight_connected=True)
             same_sign=visible&(sign*safe_shift[...,0]>0)
             bounded[same_sign]=sign*cap[same_sign]
         continuous=safe_shift[...,0]+(bounded-safe_shift[...,0])*weight
@@ -731,23 +809,24 @@ def process_view(item, target, defaults):
             # Averaging absolute L across bright/dark facets would attribute
             # their real finish differences to lighting and create dark bands.
             field_lab=lab.copy();field_lab[...,0]-=profile
+        active_channels = (0,) if mode == 'source_lightness' else (0, 1, 2)
         if field == 'contour':
             args = (field_lab, fit, allowed, contour_alpha, sigma, domain.get('contour_inset_depth', 5.))
             try:
-                low, support, reliable = supported_contour_field(*args, domain.get('contour_source_inset_limit'))
+                low, support, reliable = supported_contour_field(*args, domain.get('contour_source_inset_limit'), channels=active_channels)
             except ValueError as error:
                 limit = domain.get('fallback_contour_source_inset_limit')
                 if limit is None or not str(error).startswith('Unsupported editable contour illumination:'):
                     raise
-                low, support, reliable = supported_contour_field(*args, limit)
+                low, support, reliable = supported_contour_field(*args, limit, channels=active_channels)
                 if profile_info is not None:
                     profile_info = dict(profile_info, fallback_source_normal_limit_px=limit)
         elif field == 'gaussian':
-            low, support, reliable = supported_field(lab, fit, allowed, sigma, src[...,3])
+            low, support, reliable = supported_field(lab, fit, allowed, sigma, src[...,3], channels=active_channels)
         elif field == 'feature_excluded_gaussian':
             if mode!='source_lightness':raise ValueError('Feature field requires source lightness')
             feature=np.array(Image.open(domain['feature_mask']).convert('L'))>0
-            low,support,reliable=feature_excluded_field(lab,fit,allowed,sigma,feature,src[...,3])
+            low,support,reliable=feature_excluded_field(lab,fit,allowed,sigma,feature,src[...,3],channels=active_channels)
         else:
             raise ValueError('Unknown illumination field')
         strengths = np.array(domain.get('strength', defaults.get('strength', [.78,.72,.72])))
@@ -782,7 +861,7 @@ def process_view(item, target, defaults):
         if smoothing_mode=='source_fit_coverage' and (mode!='source_lightness' or field!='contour'
                 or domain.get('reference_profile')!='contour_depth_lift'):
             raise ValueError('Source fit coverage smoothing requires source-lightness contour-depth-lift')
-        shift,smoothing_info=smooth_material_correction(shift,reliable,fit,allowed,smooth,smoothing_mode)
+        shift,smoothing_info=smooth_material_correction(shift,reliable,fit,allowed,smooth,smoothing_mode,channels=active_channels)
         weight = inward_weight(allowed, domain.get('feather', defaults.get('feather', 5)))
         out_lab += shift*weight[...,None]
         domains.append({'name':domain.get('name','metal'), 'editable_pixels':int(allowed.sum()),
@@ -801,6 +880,7 @@ def process_view(item, target, defaults):
     if np.any(required & ~allowed_union):
         raise ValueError('Required editable pixels missing from material domains or editable mask')
     gamut_limited = 0; gamut_continuity = []
+    rail_review = None
     if mode == 'source_lightness':
         threshold = np.asarray(defaults.get('lightness_deadband', [0, 0]), dtype=float)
         if (threshold.shape != (2,) or not np.isfinite(threshold).all()
@@ -813,6 +893,8 @@ def process_view(item, target, defaults):
             out_lab[..., 0] = lab[..., 0]+delta*t*t*(3-2*t)
         desired = out_lab
         out_lab, gamut_limited = preserve_chroma_in_gamut(desired, lab)
+        audit_rail = item.get('name') in ('left','right') and 'main_surface' in domain_masks
+        rail_ceiling = out_lab.copy() if audit_rail else None
         for domain in item['domains']:
             if 'gamut_continuity_step_L' in domain:
                 name = domain.get('name', 'metal')
@@ -847,6 +929,9 @@ def process_view(item, target, defaults):
                     domain.get('gamut_continuity_follow_source_edges', False), edge_weight)
                 proof['opaque_seeds_only'] = seed_mask is not None
                 gamut_continuity.append(dict(name=name, **proof))
+        if audit_rail:
+            from phone_texture.lighting_spot_review import side_rail
+            rail_review = side_rail(lab, out_lab, rail_ceiling, src[...,3], domain_masks['main_surface'])
     elif any('gamut_continuity_step_L' in domain for domain in item['domains']):
         raise ValueError('Gamut continuity requires source_lightness')
     rear_shadow=item.get('rear_shadow_notice')
@@ -904,6 +989,38 @@ def process_view(item, target, defaults):
             top[active] = pixels
             camera_metal.update(status='applied' if applied else 'no_supported_change',
                                 applied_pixels=applied,gamut_limited_pixels=limited)
+        if layout == 'triple':
+            from phone_texture.flash_lip import correct as correct_flash_lip
+            # Read the actual gamut-bounded lighting, including when the
+            # independent lens measurement could not establish three rims.
+            height = min(h, int(np.ceil(0.22 * h)))
+            top = out_lab[:height]
+            light = top[..., 0].copy()
+            proof = correct_flash_lip(src, lab[:height, :, 0], light,
+                                      region[:height] & (src[:height, :, 3] == 255))
+            active = light != top[..., 0]
+            if active.any():
+                proposed = top[active].copy()
+                proposed[:, 0] = light[active]
+                top[active], limited = bounded_lab_offset(top[active], proposed)
+                proof['gamut_limited_pixels'] = limited
+            camera_metal['flash_lip'] = proof
+    rim_spots = None
+    if item.get('name') == 'back' and mode == 'source_lightness' and 'rear_perimeter' in domain_masks:
+        from phone_texture.rear_rim_spots import correct as share_rim_light
+        metal = domain_masks['rear_perimeter']
+        plateau = (item.get('rear_shadow_correction') or {}).get('flat_core_bounds')
+        # On three-camera photos the same metal above the step can straddle
+        # both domain masks. The measured step excludes the bevel below it.
+        if plateau and 'camera_surround' in domain_masks:
+            metal = metal | domain_masks['camera_surround']
+        change, rim_spots = share_rim_light(lab, out_lab, metal, src[..., 3],
+                                            plateau[1] if plateau else None)
+        if change is not None:
+            active, proposal = change
+            band = out_lab[:active.shape[0]]
+            band[active], limited = bounded_lab_offset(band[active], proposal)
+            rim_spots['gamut_limited_pixels'] = limited
     dst = src.copy()
     converted = lab_to_rgb(out_lab)
     quantization=[]
@@ -922,7 +1039,7 @@ def process_view(item, target, defaults):
     return dst, allowed_union, protect, {'source':str(path),'source_sha256':before_hash,
         'size':[w,h], 'domains':domains, 'color_mode':mode,
         'gamut_limited_pixels':gamut_limited,'correction_blends':blends,'rear_shadow_correction':rear_shadow,'camera_metal':camera_metal,
-        'gamut_continuity':gamut_continuity,'quantization_continuity':quantization,
+        'gamut_continuity':gamut_continuity,'quantization_continuity':quantization,'rail_spot_review':rail_review,'rear_rim_spots':rim_spots,
         'required_editable_pixels':int(required.sum()),
         'required_editable_missing':0,
         'changed_pixels':int(np.any(dst != src,axis=-1).sum()),

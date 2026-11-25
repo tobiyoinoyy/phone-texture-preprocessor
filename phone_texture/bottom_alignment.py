@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image
 from .geometry_review import digest,write
 from .bottom_rectify import rectify,Rejected
+from .workspace import clone_file
 
 MODEL_KEYS={'iphone17':'iphone17','iphone17pro':'ip17pro','iphone17promax':'ip17promax',
             'ip17pro':'ip17pro','ip17promax':'ip17promax'}
@@ -76,7 +77,7 @@ def prepare(files,geometry,model,process,*,enabled=True):
     for face,path in files.items():
         target=selected/(face+'.png')
         if face=='bottom' and report['applied']:Image.fromarray(out).save(target)
-        else:shutil.copy2(path,target)
+        else:clone_file(path,target)
     after={f:digest(selected/(f+'.png')) for f in files}
     if any(digest(files[f])!=h for f,h in before.items()):raise ValueError('Geometry input changed during optional bottom alignment')
     if any(after[f]!=before[f] for f in files if f!='bottom'):raise ValueError('Bottom alignment changed a companion face')

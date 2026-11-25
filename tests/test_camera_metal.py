@@ -88,3 +88,74 @@ def test_saturated_metal_receives_largest_supported_part_of_correction():
     assert np.array_equal(result[1],proposed[1])
     rgb=render.lab_to_linear_rgb(result)
     assert rgb.min()>=-1e-7 and rgb.max()<=1+1e-7
+
+
+def test_lens_cast_shadow_follows_adjacent_metal_and_preserves_the_joint():
+    from phone_texture.lens_exterior import lift
+
+    y, x = np.ogrid[:320, :320]
+    distance = np.hypot(x-160, y-160) - 100
+    angle = np.arctan2(y-160, x-160)
+    outside = distance > 2
+    normal = 48 + 0.006 * x + 0.006 * y
+    texture = 0.5 * np.cos(y*2) * np.sin(x)
+    shade = 18 * np.exp(-(angle/0.38)**2) * np.exp(-((distance-7)/5.5)**4)
+    light = normal + texture - shade
+    light[~outside] = 18
+    lab = np.stack([light, 1+0.13*shade, -5-0.18*shade], axis=-1)
+    raw = lab.copy()
+    lab[..., 0] += 4
+    before = lab.copy()
+    edge = np.full(360, 100.)
+    ok = np.ones(360, bool)
+    lens = dict(centre=[160, 160, 90], outer=edge, supported=ok)
+    proof = lift(raw, lab, outside, lens, edge, ok)
+    assert proof["pixels"] > 100
+    dark = (distance > 5) & (distance < 9) & (abs(angle) < 0.14)
+    assert np.max(abs(lab[..., 0][dark] - normal[dark] - texture[dark] - 4)) < 2.5
+    assert np.max(abs(lab[..., 1][dark] - 1)) < 0.5
+    np.testing.assert_array_equal(before[~outside | (distance > 26)], lab[~outside | (distance > 26)])
+
+    # A partial near-metal strip cannot borrow reference pixels from across a bevel.
+    without_reference = outside & (distance < 15)
+    unchanged = before.copy()
+    assert lift(raw, unchanged, without_reference, lens, edge, ok)["pixels"] == 0
+    np.testing.assert_array_equal(unchanged, before)
+
+
+def test_gray_fallback_verifies_and_excludes_each_glass_independently(monkeypatch):
+    from phone_texture import back_lens, back_geometry
+
+    seeds = np.array([[50., 50., 25.], [50., 140., 25.], [130., 95., 25.]])
+    detections = iter([(None, 6), (seeds, 8)])
+    monkeypatch.setattr(back_lens, '_disks', lambda image: next(detections))
+
+    def edge(image, trial, *, search_width):
+        x, y, r = trial[0]
+        if y == 140 and r < 25:
+            return np.array([[x, y, 25.01 if search_width == 6 else 25.]])
+        if x == 50 and y == 50:
+            return np.array(trial)
+        raise ValueError('ambiguous arc')
+
+    monkeypatch.setattr(back_geometry, 'measure_glass_edges', edge)
+    image = np.zeros((600, 350, 4), np.uint8)
+    plan = camera_metal.measure(image, 'triple')
+    assert plan['slots'] == [0, 1]
+    assert [v['slot'] for v in plan['exclusions']] == [2]
+    assert abs(plan['lenses'][1]['centre'][2] - 25.) < .01
+    x0, y0, x1, y1 = plan['exclusions'][0]['box']
+    assert x0 < 105 < 155 < x1 and y0 < 70 < 120 < y1
+
+
+def test_independent_seeds_require_three_distinct_thresholds(monkeypatch):
+    from phone_texture import back_lens
+
+    # A shifting right-hand blob and two competing candidates on the lower
+    # left cannot veto a stable upper-left disk or become lighting anchors.
+    readings = [[(195., 182., 90.), (197., 440., 90.), (202., 441., 90.),
+                 (441. + 5*i, 318., 92.)] for i in range(4)]
+    monkeypatch.setattr(back_lens, '_disk_readings', lambda img: iter(readings))
+    seeds, _ = camera_metal._independent_seeds(np.zeros((2080, 1000, 4), np.uint8))
+    assert np.array_equal(seeds[0], [195., 182., 90.])
+    assert seeds[1:] == [None, None]

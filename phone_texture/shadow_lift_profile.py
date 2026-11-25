@@ -63,8 +63,9 @@ def printed_label_sigma(a, label, face):
                       source_fit_support_threshold_unchanged=True)
 
 
-def reference(a, domain, engine):
-    lab = engine.rgb_to_lab(a[..., :3])
+def reference(a, domain, engine, *, lab=None):
+    if lab is None:
+        lab = engine.rgb_to_lab(a[..., :3])
     mask = np.array(Image.open(domain.get('fit_mask', domain['mask'])).convert('L')) > 0
     mask &= a[..., 3] >= 250
     percentile = 75 if 'antenna' in domain['name'] else 85
@@ -102,6 +103,7 @@ def apply(job, face, folder, profile=NAME):
     if view['name'] != face or render.digest(view['source']) != view['source_sha256']:
         raise ValueError('Shadow lift source identity differs')
     a = np.array(Image.open(view['source']).convert('RGBA'))
+    lab = render.rgb_to_lab(a[..., :3])
     h, w = a.shape[:2]
     changes = []
     for domain in view['domains']:
@@ -113,7 +115,7 @@ def apply(job, face, folder, profile=NAME):
             # fitted perimeter model while other materials use this profile.
             # Generation and acceptance have separate references: retaining
             # the established render must not lower V2's shadow requirements.
-            box, acceptance_proof = reference(a, previous, render)
+            box, acceptance_proof = reference(a, previous, render, lab=lab)
             domain['acceptance_reference_boxes'] = [box]
             changes.append(dict(domain=domain['name'],
                 retained_generic_source_contour_model=True, parameters=previous,
@@ -121,7 +123,7 @@ def apply(job, face, folder, profile=NAME):
                 acceptance_basis='Original V2 source target; render reference retained separately',
                 acceptance_thresholds_relaxed=False))
             continue
-        box, proof = reference(a, domain, render)
+        box, proof = reference(a, domain, render, lab=lab)
         domain.update(reference_boxes=[box],
             strength=[.90 if 'antenna' in domain['name'] else .98, 0, 0],
             max_lab_shift=[60, 0, 0])
@@ -176,7 +178,7 @@ def apply(job, face, folder, profile=NAME):
                 sigma=sigma, strength=[.8, 0, 0],
                 max_lab_shift=[6, 0, 0], feather=0, correction_smooth=1.5,
                 gamut_continuity_step_L=.2, gamut_continuity_follow_field=True)
-            box, proof = reference(a, domain, render)
+            box, proof = reference(a, domain, render, lab=lab)
             domain['reference_boxes'] = [box]
             view['domains'].append(domain)
             changes.append(dict(domain='printed_label', new=domain, reference=proof,
@@ -214,6 +216,8 @@ def apply(job, face, folder, profile=NAME):
             else:
                 view['rear_shadow_correction']=dict(plan,material_mask=camera['mask'])
                 changes.append(dict(rear_shadow_correction=plan))
+        else:
+            view['camera_metal_notice'] = '本张背图缺少独立可编辑的凸台金属区域'
     view['reference_boxes'] = view['domains'][0]['reference_boxes']
     result['lighting_profile'] = profile
     return result, dict(profile=profile,

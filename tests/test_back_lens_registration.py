@@ -86,3 +86,60 @@ def test_legacy_empty_outer_rows_fail_independent_back_acceptance(tmp_path, mode
     check = inspect_back(path, model)
     assert not check['verified']
     assert check['empty_canvas_rows'] == dict(top=4, bottom=2)
+
+
+def test_large_lens_shift_keeps_the_photographed_plateau_ledge_and_corner():
+    from PIL import ImageDraw
+
+    model = 'iphone17promax'
+    a = synthetic_back(model, shift=(-1., -7.))
+    h, w = a.shape[:2]
+    # Two separate edges on the raised step, including the curved-to-straight transition.
+    mask = Image.new('L', (w, h))
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle((68, 56, 1011, 589), radius=130, fill=255)
+    core = np.asarray(mask) != 0
+    body = np.all(a[..., :3] == [90, 100, 180], axis=-1)
+    a[core & body, :3] = [190, 135, 83]
+    outline = Image.new('L', (w, h))
+    ImageDraw.Draw(outline).rounded_rectangle((68, 56, 1011, 589), radius=130, outline=255, width=3)
+    edge = np.asarray(outline) != 0
+    a[edge, :3] = [72, 48, 30]
+    out, proof = bl.register(a, model)
+    assert proof['verified'] and proof['applied'] and proof['residual_px'] <= bl.MIN_SHIFT_PX
+    assert proof['plateau_boundary'] == 'source_measured'
+    np.testing.assert_array_equal(out[edge | ~core], a[edge | ~core])
+
+
+@pytest.mark.parametrize('retry_status', ['verified', 'radius_changed', 'position_unresolved'])
+def test_one_unstable_glass_fit_retries_only_its_source_pixels(monkeypatch, retry_status):
+    model = 'iphone17promax'
+    photo = synthetic_back(model, shift=(-1.6, 1.8))
+    expected, first_proof = bl.register(photo, model)
+    assert first_proof['verified']
+    measure = bl.glass_centres
+    calls = []
+    def unstable_lower_fit(image, model):
+        disks, count = measure(image, model)
+        calls.append(image.shape)
+        if len(calls) == 2 or (len(calls) == 3 and retry_status == 'position_unresolved'):
+            disks[1, 1] += .95
+        if len(calls) == 3 and retry_status == 'radius_changed':
+            disks[1, 2] += 1.
+        return disks, count
+    monkeypatch.setattr(bl, 'glass_centres', unstable_lower_fit)
+    result, proof = bl.register(photo, model)
+    assert len(calls) == 3
+    assert proof['linear_retry_lenses'] == [1]
+    if retry_status != 'verified':
+        assert not proof['verified'] and result is photo
+        return
+    assert max(proof['per_lens_error_px']) <= bl.MIN_SHIFT_PX
+    assert max(proof['retry_radius_drift_px']) <= bl.MIN_SHIFT_PX
+    h, w = photo.shape[:2]
+    cx, cy = np.array(bl.STANDARD[model]['lenses'][1]) * [w, h]
+    y, x = np.ogrid[:h, :w]
+    outside = np.hypot(x - cx, y - cy) > 1.31 * 99
+    np.testing.assert_array_equal(result[outside], expected[outside])
+    np.testing.assert_array_equal(result[..., 3], photo[..., 3])
+    assert np.any(result != expected)

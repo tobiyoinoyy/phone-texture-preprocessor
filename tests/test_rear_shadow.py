@@ -183,3 +183,29 @@ def test_one_unsupported_lens_preserves_its_base_and_other_corrections(monkeypat
     protected = u*u + v*v <= (max(lens['start_radii']) + .42)**2
     assert not scope[protected].any()
     assert scope.any() and np.array_equal(field[~protected], complete[~protected])
+
+
+@pytest.mark.parametrize("saved_mask", [False, True])
+@pytest.mark.parametrize("tint", [(1., 1., 1.), (.48, .59, .82), (1.20, .75, .50)])
+def test_pro_fallback_reviews_cast_shadow_with_or_without_saved_plateau(tmp_path, saved_mask, tint):
+    from phone_texture.lighting_continuation import recover
+
+    source, metal, shade, hardware = scene()
+    source[..., :3] = np.clip(np.rint(source[..., :3] * tint), 0, 255).astype('uint8')
+    src = tmp_path/'source.png'
+    out = tmp_path/'back.png'
+    Image.fromarray(source).save(src)
+    if saved_mask:
+        Image.fromarray((metal * 255).astype('uint8')).save(tmp_path/'camera_surround.png')
+    # Keep a genuinely paper-covered spot inside the otherwise editable shade.
+    paper = np.zeros(shade.shape, bool)
+    paper[115:125, 207:213] = True
+    Image.fromarray((paper * 255).astype('uint8')).save(tmp_path/'paper.png')
+    proof = recover(src, 'back', out, tmp_path, metal_back=True, review_camera=True)
+    result = np.array(Image.open(out))
+    assert proof['status'] == 'degraded_lighting'
+    assert proof['camera_metal']['applied_pixels'] > 0
+    assert proof['camera_metal']['measured_slots'] == [0, 1, 2]
+    assert np.median(result[..., 0][shade & ~paper]) > np.median(source[..., 0][shade & ~paper])
+    np.testing.assert_array_equal(result[hardware | paper], source[hardware | paper])
+    np.testing.assert_array_equal(result[..., 3], source[..., 3])

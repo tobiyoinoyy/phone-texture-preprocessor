@@ -21,6 +21,7 @@ from PIL import Image
 from scipy import ndimage
 
 from .geometry_review import digest, write
+from .workspace import clone_file
 
 FACES = ('front', 'back')
 MIN_TAPER_PX = 3.0      # opposite-side length difference below this is noise
@@ -323,7 +324,7 @@ def prepare(files, geometry, process):
     for face, path in files.items():
         target = selected/(face+'.png')
         if face not in FACES:
-            shutil.copy2(path, target)
+            clone_file(path, target)
             continue
         with Image.open(path) as image:
             if image.mode != 'RGBA' or image.format != 'PNG':
@@ -344,7 +345,7 @@ def prepare(files, geometry, process):
             report['notices'].append(dict(face=face, code='perspective_rectified', severity='info',
                 message='已按面内参考纠正拍摄透视（%.1f px）。' % entry['max_corner_move_px']))
         else:
-            shutil.copy2(path, target)
+            clone_file(path, target)
         entry['output_sha256'] = digest(target)
         report['faces'][face] = entry
         row = rows[face]

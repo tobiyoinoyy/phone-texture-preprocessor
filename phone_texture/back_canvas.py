@@ -13,11 +13,14 @@ from PIL import Image
 STANDARD_BACK_SIZE = {'iphone17pro': (1000, 2080), 'iphone17promax': (1080, 2254)}
 
 
-def standardize(source, target, model):
+def standardize(source, target, model, *, plateau_source=None):
     """Write the standard-size back; premultiplied resampling keeps rim colour.
 
     The camera lenses are then registered to the model's standard positions
     (back_lens.py); a back whose lenses cannot be verified is kept as resized.
+    When *plateau_source* (the pre-lighting back PNG) is supplied, lens
+    registration can fall back to its unflattened bevel contrast if lighting
+    softened the plateau top edge.
     """
     size = STANDARD_BACK_SIZE.get(model)
     if size is None:
@@ -27,6 +30,11 @@ def standardize(source, target, model):
             raise ValueError('Final back is not RGBA PNG')
         original = image.size
         resized = image.convert('RGBa').resize(size, Image.Resampling.LANCZOS).convert('RGBA')
+    resized_plateau = None
+    if plateau_source is not None and Path(plateau_source).resolve() != Path(source).resolve():
+        with Image.open(plateau_source) as pre_image:
+            if pre_image.format == 'PNG' and pre_image.mode == 'RGBA':
+                resized_plateau = pre_image.convert('RGBa').resize(size, Image.Resampling.LANCZOS).convert('RGBA')
     import numpy as np
     from .back_geometry import top_measure, normalize_back_edges
     from .back_lens import register
@@ -38,7 +46,9 @@ def standardize(source, target, model):
     except ValueError as error:
         rail = dict(verified=False, reason=str(error))
         edges = dict(verified=False, reason=str(error))
-    registered, lens_proof = register(np.asarray(resized), model)
+    registered, lens_proof = register(
+        np.asarray(resized), model,
+        plateau_source=np.asarray(resized_plateau) if resized_plateau is not None else None)
     Image.fromarray(registered).save(Path(target))
     return dict(method='premultiplied_lanczos_fixed_model_canvas', model=model,
                 source_size=list(original), output_size=list(size),

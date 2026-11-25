@@ -121,6 +121,8 @@ def light_face(source, face, work, light, structure):
         lighting_report = lighting.run('aluminum',jp)
     dest=light/(face+'.png')
     check=measure_masks(source,dest,allowed,sticker)
+    if lighting_report and lighting_report['views'][face].get('rail_spot_review') is not None:
+        check['rail_spot_review'] = lighting_report['views'][face]['rail_spot_review']
     if face=='back' and lighting_report:
         check['camera_metal'] = lighting_report['views'][face].get('camera_metal')
     before=np.asarray(Image.open(source).convert('RGBA'));after=np.asarray(Image.open(dest).convert('RGBA'))

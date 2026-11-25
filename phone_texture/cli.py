@@ -31,6 +31,7 @@ def main(argv=None):
     command.add_argument('--protection-policy',choices=('sticker_only','none'),default='none',help='none：不使用逐像素保护区；保留材质、机身与结构质量检查')
     command.add_argument('--lighting-profile',choices=('baseline','accepted-shadow-lift-v1','accepted-shadow-lift-v2'),default='accepted-shadow-lift-v2',help='按源图调光；整合版仍需视觉审核')
     command.add_argument('--review-fallback',choices=('fail','preserve-source'),default='preserve-source',help='保留原位置像素并输出待核对候选；fail保留严格对照')
+    command.add_argument('--debug-evidence',action='store_true',help='写出完整的几何/光照多倍放大取证 PNG（体积较大，默认关闭）')
     for mode, help_text in (('standardize', '原始六面照片：抠图、去支架、四面摆正、精裁'), ('deskew', '已裁切透明贴图：只摆正选定边框，原样保留其他面')):
         command = sub.add_parser(mode, help=help_text)
         command.add_argument('input', type=Path)
@@ -136,7 +137,7 @@ def main(argv=None):
             from .automatic import run
             result = run(args.input,args.work,args.output,jobs=args.jobs,device=args.device,
                          cpu_threads=args.cpu_threads,skus=args.skus,single_name=args.single_name,
-                         inference_slots=args.inference_slots,experimental_concurrency=args.experimental_concurrency,model=args.model,protection_policy=args.protection_policy,review_fallback=args.review_fallback,lighting_profile=args.lighting_profile,resume_geometry_from=args.resume_geometry_from,require_geometry_resume=args.require_geometry_resume,bottom_alignment=args.bottom_alignment,source_body_reference_review=args.source_body_reference_review,side_candidate_review=args.side_candidate_review,saved_review_manifest=args.saved_review_manifest,saved_review_manifest_sha256=args.saved_review_manifest_sha256)
+                         inference_slots=args.inference_slots,experimental_concurrency=args.experimental_concurrency,model=args.model,protection_policy=args.protection_policy,review_fallback=args.review_fallback,lighting_profile=args.lighting_profile,resume_geometry_from=args.resume_geometry_from,require_geometry_resume=args.require_geometry_resume,bottom_alignment=args.bottom_alignment,source_body_reference_review=args.source_body_reference_review,side_candidate_review=args.side_candidate_review,saved_review_manifest=args.saved_review_manifest,saved_review_manifest_sha256=args.saved_review_manifest_sha256,debug_evidence=args.debug_evidence)
             print(json.dumps({k:result.get(k) for k in ('status','processed','generated','source_preserved_candidates','total','visual_approved','seconds','output')},ensure_ascii=False,indent=2))
             return 0 if result['status']=='processed_needs_visual_review' else 2
         elif args.command == 'start':

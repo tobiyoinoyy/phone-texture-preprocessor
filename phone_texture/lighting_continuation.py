@@ -24,7 +24,30 @@ def _mask(path, shape):
     return mask
 
 
-def recover(source, face, output, assets, *, metal_back=False):
+def _rear_exterior(source, output, material):
+    from . import camera_metal
+    from .lighting import engine
+
+    if material is None or not material.any():
+        return dict(status='source_evidence_unavailable', reason='缺少本张背图的凸台金属区域', applied_pixels=0)
+    try:
+        plan = camera_metal.measure(source, 'triple')
+    except ValueError as error:
+        return dict(status='source_evidence_unavailable', reason=str(error), applied_pixels=0)
+    render = engine('aluminum')
+    raw = render.rgb_to_lab(source[..., :3])
+    lit = render.rgb_to_lab(output[..., :3])
+    target, active, report = camera_metal.apply(source, raw, lit, material, plan, exterior_only=True)
+    band = output[:len(active), :, :3]
+    proposed, limited = render.bounded_lab_offset(lit[:len(active)][active], target[active])
+    encoded = render.lab_to_rgb(proposed)
+    changed = int(np.count_nonzero(np.any(encoded != band[active], axis=1)))
+    band[active] = encoded
+    return dict(report, status='applied' if changed else 'no_supported_change',
+                applied_pixels=changed, gamut_limited_pixels=limited)
+
+
+def recover(source, face, output, assets, *, metal_back=False, review_camera=False):
     """Apply mild correction only within reliable same-material regions."""
     source, output, assets = map(Path, (source, output, assets))
     if output.exists():
@@ -57,7 +80,27 @@ def recover(source, face, output, assets, *, metal_back=False):
         metal, _, _ = glass_back_rim(photograph, paper_guess, allow_partial=True)
         masks = [metal]
         origin = 'current_photo_individually_confirmed_rear_edges'
-    if not masks:
+    review_camera = review_camera and metal_back and face == 'back'
+    camera = _mask(assets/'camera_surround.png', opaque.shape) if review_camera else None
+    camera_basis = 'source_material_mask'
+    if review_camera and camera is None:
+        # A failed rear-panel or antenna check may precede creation of the
+        # normal material mask. Independently measure the plateau on this crop.
+        from .rear_shadow import _plateau_core, _ring_material, InsufficientRearShadowEvidence
+        from .auto_material import rear_camera_glass
+        camera_basis = 'source_plateau_edges'
+        if min(h, width) >= 100 and opaque.any():
+            light = cv2.cvtColor(rgb.astype('float32') / 255, cv2.COLOR_RGB2LAB)[..., 0]
+            try:
+                bounds, edges = _plateau_core(light)
+            except InsufficientRearShadowEvidence:
+                pass
+            else:
+                glass, _ = rear_camera_glass(a, opaque)
+                yy, xx = np.ogrid[:h, :width]
+                camera = _ring_material(opaque & ~glass, dict(flat_core_bounds=bounds,
+                    plateau_source_edges=edges, lenses=[]), yy, xx)
+    if not masks and not (camera is not None and camera.any()):
         if face not in FRAMES or min(h, width) < 18 or not 3 <= max(h, width)/min(h, width) <= 24:
             raise ValueError('No independently supported fallback metal area')
         # Both rails lie inside the opaque crop, away from the central keys,
@@ -125,6 +168,16 @@ def recover(source, face, output, assets, *, metal_back=False):
         changed_total += int(changed.sum())
         measurements.append(dict(samples=int(valid.sum()), edited=int(changed.sum()),
                                  measured_source_range=float(hi-lo), max_lift=int(delta.max())))
+    extra = {}
+    if review_camera:
+        before_camera = out.copy()
+        region = camera & opaque & ~paper if camera is not None else None
+        camera_review = _rear_exterior(a, out, region)
+        if region is not None and np.any(out[~region] != before_camera[~region]):
+            raise RuntimeError('Camera lighting escaped its verified metal region')
+        camera_review['material_basis'] = camera_basis
+        extra['camera_metal'] = camera_review
+        changed_total = int(np.count_nonzero(np.any(a != out, axis=2)))
     if not changed_total:
         raise ValueError('Fallback found no support for a nonzero lighting correction')
     if not np.array_equal(a[..., 3], out[..., 3]) or np.any(out[paper] != a[paper]) or w.sha(source) != digest:
@@ -136,5 +189,6 @@ def recover(source, face, output, assets, *, metal_back=False):
         if not np.array_equal(np.asarray(image), out):
             raise RuntimeError('Lighting fallback PNG changed on round trip')
     return dict(method=origin, status='degraded_lighting', changed_pixels=changed_total,
-                max_rgb_lift=8, measurements=measurements, original_alpha_unchanged=True,
+                max_rgb_lift=int(np.max(out[..., :3].astype(np.int16) - rgb)) if review_camera else 8,
+                measurements=measurements, **extra, original_alpha_unchanged=True,
                 source_sha256=digest, lighting_sha256=w.sha(output), visual_review_passed=False)

@@ -56,7 +56,8 @@ def finish(case, sku, manifest, geometry, files, failures, light_profile, protec
             standard_error = str(error)
         target = out/(face+'.png')
         try:
-            proof = recover(source, face, target, assets, metal_back=True)
+            proof = recover(source, face, target, assets, metal_back=True,
+                                      review_camera=light_profile == 'accepted-shadow-lift-v2')
         except (ValueError, RuntimeError, cv2.error) as error:
             stages[face] = dict(lighting='blocked', selected_stage='geometry', lighting_error=standard_error,
                                 lighting_fallback_error=str(error))

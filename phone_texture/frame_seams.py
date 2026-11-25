@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from . import structure_review as sr
+from . import structure_review as sr, workspace as w
 from .geometry_review import digest, write
 from .pipeline import FACES, fresh
 
@@ -105,8 +105,9 @@ def run(work, sku, model, output, records, *, model_sha256=None, terminal_source
         Image.fromarray(mask_array.astype('uint8')*255).save(mask_path)
         views[face] = dict(source=str(files[face]), editable_mask=str(mask_path),
                            protected_mask=str(material/'paper.png'))
+    chains = resized_chains(data, files)
     chains_path = records/'chains.json'
-    write(chains_path, dict(chains=resized_chains(data, files)))
+    write(chains_path, dict(chains=chains))
     # Explicit paired UVs don't need a second mesh extraction at runtime.
     write(records/'scene.json', {})
     job = dict(scene=str(records/'scene.json'), seam_chains=str(chains_path),
@@ -125,7 +126,7 @@ def run(work, sku, model, output, records, *, model_sha256=None, terminal_source
     from .frame_end_color import finish as finish_end_color
     masks = {f: (np.array(Image.open(v['editable_mask'])) > 0)
                 & (np.array(Image.open(v['protected_mask']).convert('L')) == 0) for f,v in views.items()}
-    end_color = finish_end_color(records/'matched-frames', output, records/'end-color', masks, resized_chains(data, files),
+    end_color = finish_end_color(records/'matched-frames', output, records/'end-color', masks, chains,
                                  sigma=job['sigma'], width_units=job['width_units'])
     if end_color['status'] == 'applied':
         report['initial_seams'] = report['seams']
@@ -136,7 +137,7 @@ def run(work, sku, model, output, records, *, model_sha256=None, terminal_source
             report['continuity_resolution'] = resolution
     report['end_color'] = end_color
     for face in ('front','back'):
-        shutil.copy2(files[face], output/(face+'.png'))
+        w.clone_file(files[face], output/(face+'.png'))
     # Local RGB correction cannot touch antennas, hardware, paper or alpha.
     for face in ('left','right'):
         before = np.asarray(Image.open(files[face]).convert('RGBA'))

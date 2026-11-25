@@ -51,7 +51,10 @@ def _plateau_core(L):
         for window in np.array_split(data,3):
             s=np.median(window,axis=0);near=indices[abs(indices-anchor)<=4]
             position=int(near[np.argmax(abs(s[near]))]);positions.append(position);strength.append(float(abs(s[position])))
-        if min(strength)<1.2 or np.ptp(positions)>4:
+        strict_ok=min(strength)>=1.2 and np.ptp(positions)<=4
+        dark_top_ok=(name=='top' and np.ptp(positions)<=1
+                     and float(np.median(strength))>=1.2 and min(strength)>=.6)
+        if not (strict_ok or dark_top_ok):
             raise InsufficientRearShadowEvidence('Rear shadow: plateau '+name+' lacks three-window source evidence')
         edges[name]=max(positions)+6 if name in ('left','top') else min(positions)-6
         proof[name]=dict(positions=positions,strengths=strength)
