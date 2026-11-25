@@ -21,6 +21,21 @@ def _span(edge, guide, sign, width):
     ]
     if not spans:
         return None
+    if len(spans) > 1 and sign == -1:
+        # Adjacent rear camera lenses seen from the bottom view can have a
+        # narrow valley between the two rings that still sits above the frame
+        # rail. Merge only closely spaced projections on the same side of center.
+        merged = [spans[0]]
+        for nxt in spans[1:]:
+            prev = merged[-1]
+            gap = nxt.start - prev.stop
+            valley_above = gap <= 0 or np.all(excursion[prev.stop:nxt.start] > 1.0)
+            same_half = (nxt.stop < width / 2) or (prev.start > width / 2)
+            if gap <= int(0.06 * width) and valley_above and same_half and (nxt.stop - prev.start) <= 0.45 * width:
+                merged[-1] = slice(prev.start, nxt.stop)
+            else:
+                merged.append(nxt)
+        spans = merged
     if len(spans) != 1:
         raise ValueError("Frame contact has competing projections")
     left, right = spans[0].start, spans[0].stop
@@ -194,6 +209,38 @@ def _exposed_top_rail(x, edge, threshold_edges, gradient):
     return line, evidence
 
 
+def _exposed_bottom_rails(x, top, bottom, alternate, gradient):
+    """Fit parallel exposed straight rails when curved bottom-frame tips dip."""
+    width = len(x)
+    lower, lower_ev = _exposed_top_rail(x, bottom, [pair[1] for pair in alternate], gradient)
+    slope = float(lower[0])
+    positions = x + .5
+    interior = (np.arange(width) >= int(.04 * width)) & (np.arange(width) <= int(.96 * width))
+    valid = interior & (top > 3) & (top < len(gradient) - 3)
+    if valid.sum() < .35 * width:
+        raise ValueError("Bottom upper rail has too few interior samples")
+    intercepts = top[valid] - slope * positions[valid]
+    lo = int(np.floor(intercepts.min()))
+    bins = np.rint(intercepts).astype(int) - lo
+    hist = ndimage.gaussian_filter1d(np.bincount(bins).astype(float), 1.)
+    level = float(hist.argmax() + lo)
+    keep = valid & (np.abs((top - slope * positions) - level) <= 2.5)
+    if keep.sum() < .35 * width:
+        raise ValueError("Bottom upper rail lacks a dominant straight plateau")
+    indices = np.flatnonzero(keep)
+    if any(np.percentile(abs(pair[0][indices] - top[indices]), 90) > 2 for pair in alternate):
+        raise ValueError("Exposed bottom upper rail depends on an ambiguous matte boundary")
+    ys = np.clip(top[indices, None] + np.arange(-3, 4), 0, len(gradient) - 1)
+    rgb_support = float((gradient[ys, x[indices, None]].max(axis=1) > 3).mean())
+    if rgb_support < .8:
+        raise ValueError("Exposed bottom upper rail lacks original RGB support")
+    upper = np.array([slope, float(np.median(top[indices] - slope * positions[indices]))])
+    return [upper, lower], dict(
+        upper=[dict(plateau_columns=int(keep.sum()), source_rgb_fraction=rgb_support)],
+        lower=lower_ev,
+    )
+
+
 def recover_frame(matte, raw_image, face, stage_sink=None, deskew=True, *, retain_small_upper_detail=False):
     if raw_image is None or raw_image.size != matte.size:
         raise ValueError("Frame contact needs its original RGB photograph")
@@ -225,6 +272,21 @@ def recover_frame(matte, raw_image, face, stage_sink=None, deskew=True, *, retai
     slopes = np.degrees(np.arctan([line[0] for line in lines]))
     angle = float(np.mean(slopes)) if deskew else 0.0
     rail_evidence = None
+    if face == "bottom" and np.mean((np.polyval(lines[0], x + 0.5) - top) > 4.0) >= 0.30:
+        gradient = np.linalg.norm(
+            np.gradient(ndimage.gaussian_filter1d(raw.astype(np.float32), .8, axis=0), axis=0), axis=2
+        )
+        try:
+            cand_lines, cand_ev = _exposed_bottom_rails(x, top, bottom, alternate, gradient)
+            cand_thickness = np.polyval(cand_lines[1], endpoints) - np.polyval(cand_lines[0], endpoints)
+            cand_slopes = np.degrees(np.arctan([line[0] for line in cand_lines]))
+            if (np.ptp(cand_slopes) <= .3 and min(cand_thickness) >= .035 * width
+                    and max(cand_thickness) <= .25 * width and max(abs(line[0]) for line in cand_lines) <= .07):
+                lines, thickness, slopes = cand_lines, cand_thickness, cand_slopes
+                angle = float(np.mean(slopes)) if deskew else 0.0
+                rail_evidence = cand_ev
+        except ValueError:
+            pass
     if np.ptp(slopes) > 0.3:
         if face != "top":
             raise ValueError("Exposed ends disagree on frame roll")

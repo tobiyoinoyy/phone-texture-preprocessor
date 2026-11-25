@@ -54,8 +54,10 @@ def aligned_metal(work, face, size, *, review_alignment=None):
 def _current_seam_readings(files, chains, masks, sigma):
     engine=seam_engine()
     low={}
+    vis={}
     for face in FRAMES:
         rgba=np.asarray(Image.open(files[face]).convert('RGBA'))
+        vis[face]=rgba[...,3]>0
         fit=masks[face] & (rgba[...,3]>=240)
         den=engine.gaussian(fit.astype(float),sigma)
         lab=engine.rgb_to_lab(rgba[...,:3])
@@ -64,6 +66,7 @@ def _current_seam_readings(files, chains, masks, sigma):
     for chain in chains:
         samples=[]
         valid=np.ones(192,dtype=bool)
+        visible_joint=np.ones(192,dtype=bool)
         arc=chain['arc']
         for side in chain['sides']:
             name=side['name']
@@ -72,8 +75,18 @@ def _current_seam_readings(files, chains, masks, sigma):
                                     for axis in positions.T])
             samples.append(engine.sample(low[name],points))
             valid &= engine.sample(masks[name][...,None],points)[:,0]>.98
+            visible_joint &= engine.sample(vis[name][...,None],points)[:,0]>.98
         if valid.mean()<.98:
-            raise ValueError('Current model seam lacks jointly editable photographed metal')
+            # Mirror match_uv_seams: allow a short contiguous transparent corner
+            # tip (< 8% of chain) when the entire visible seam stays >= 98% editable.
+            non_vis=np.flatnonzero(~visible_joint)
+            vis_cov=float(visible_joint.mean())
+            editable_on_vis=float(valid[visible_joint].mean()) if visible_joint.any() else 0.0
+            terminal_only=bool(len(non_vis) and all(
+                np.all(~visible_joint[:i+1]) or np.all(~visible_joint[i:]) for i in non_vis
+            ))
+            if not (terminal_only and vis_cov>=0.92 and editable_on_vis>=0.98):
+                raise ValueError('Current model seam lacks jointly editable photographed metal')
         delta=np.linalg.norm(samples[0]-samples[1],axis=1)[valid]
         readings.append(dict(pair=chain['names'],edge_ids=chain['edges'],
             joint_coverage=float(valid.mean()),metric_samples=int(valid.sum()),total_samples=len(valid),

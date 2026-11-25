@@ -92,7 +92,7 @@ def _native_normal_edges(mask, rgb, ys, xs, tolerance):
     return np.sum(witnesses,axis=0)>=2
 
 
-def filled_control(image, minimum_y, *, channel_witnesses=False):
+def filled_control(image, minimum_y, *, channel_witnesses=False, lighting_only=False):
     a = np.asarray(image.convert('RGBA'))
     h,w = a.shape[:2]
     rgb = cv2.GaussianBlur(a[..., :3].astype(np.float32), (0,0), 1.)
@@ -106,55 +106,67 @@ def filled_control(image, minimum_y, *, channel_witnesses=False):
     roi[:minimum_y]=False
     roi[int(.85*h):]=False
     darkness = diff @ [.299,.587,.114]
+    min_area_ratio = .72 if (channel_witnesses or lighting_only) else .80
     def components(binary):
         contours = cv2.findContours(binary.astype('uint8'),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[0]
         for contour in contours:
             x0,y,bw,bh = cv2.boundingRect(contour)
             if (.2*w<bw<.65*w and .035*h<bh<.23*h and 2<bh/bw<9
                     and .4*w<x0+bw/2<.6*w and y>minimum_y and y+bh<.85*h
-                    and cv2.contourArea(contour)>.80*bw*bh):
+                    and cv2.contourArea(contour)>min_area_ratio*bw*bh):
                 yield contour,(x0,y,bw,bh)
     seeds = []
-    for threshold in (6,12,20,32,48):
+    thresholds = (6,12,18,24,32,48) if (channel_witnesses or lighting_only) else (6,12,20,32,48)
+    for threshold in thresholds:
         for _,box in components(roi & (darkness>threshold)):
             if not any(np.max(np.abs(np.subtract(box,old)))<8 for old in seeds):
                 seeds.append(box)
     edges = cv2.Canny(np.asarray(rgb,dtype=np.uint8),4,12)
     distance = ndimage.distance_transform_edt(edges==0)
     tolerance = max(1.5,.015*w)
-    if channel_witnesses:
+    use_channels = channel_witnesses or lighting_only
+    if use_channels:
         # A single multichannel Canny map can switch to an adjacent metallic
         # reflection. Require independent native-channel edges at the mask.
         channel_distances=[ndimage.distance_transform_edt(cv2.Canny(plane,4,12)==0)
                            for plane in cv2.split(rgb.astype(np.uint8))]
     accepted=[]
+    min_lum = 10. if lighting_only else 6.
+    min_fill = .82 if lighting_only else (.85 if channel_witnesses else .98)
+    max_seed_shift = 32 if lighting_only else (18 if channel_witnesses else 10)
+    min_side_sup = .65 if lighting_only else .75
+    min_mean_sup = .85 if lighting_only else .95
+    levels = (.50,) if lighting_only else (.45,.50,.55)
     for x0,y,bw,bh in seeds:
         center=int(x0+bw/2)
         interior = diff[y+bh//4:y+3*bh//4,center-bw//6:center+bw//6]
         step = np.median(interior,axis=(0,1))
-        if step @ [.299,.587,.114] < 6:
+        if step @ [.299,.587,.114] < min_lum:
             continue
         projection = (diff@step)/float(step@step)
         local = np.zeros_like(roi)
-        local[max(0,y-12):y+bh+12, max(0,x0-12):x0+bw+12]=True
+        pad = 16 if lighting_only else 12
+        local[max(0,y-pad):y+bh+pad, max(0,x0-pad):x0+bw+pad]=True
         measurements=[]
-        for level in (.45,.50,.55):
+        for level in levels:
             binary = roi & local & (projection>level)
             found = list(components(binary))
             if len(found)!=1:
                 break
             contour,box=found[0]
             x1,y1,width,height=box
-            if np.max(abs(np.subtract(box,(x0,y,bw,bh))))>10:
+            if np.max(abs(np.subtract(box,(x0,y,bw,bh))))>max_seed_shift:
                 break
             mask=np.zeros((h,w),np.uint8)
             cv2.drawContours(mask,[contour],-1,1,-1)
             mask=mask.astype(bool)
-            if np.any(mask & (a[...,3]<240)) or binary[mask].mean()<.98:
+            if np.any(mask & (a[...,3]<240)) or binary[mask].mean()<min_fill:
                 break
-            mask=(_fit_control_edges(mask,channel_distances,rgb,step,projection) if channel_witnesses else _refine_boundary(mask,rgb,step))
+            mask=(_fit_control_edges(mask,channel_distances,rgb,step,projection) if use_channels else _refine_boundary(mask,rgb,step))
             x1,y1,width,height=cv2.boundingRect(mask.astype(np.uint8))
             if np.any(mask&(a[...,3]<240)):
+                break
+            if not (.2*w<width<.65*w and .035*h<height<.23*h and 2<height/width<9):
                 break
             shape=mask[y1:y1+height,x1:x1+width]
             yy,xx=np.indices(shape.shape);r=(width-1)/2
@@ -166,22 +178,37 @@ def filled_control(image, minimum_y, *, channel_witnesses=False):
                 break
             yy,xx=np.nonzero(mask & ~ndimage.binary_erosion(mask))
             supported=distance[yy,xx]<=tolerance
-            if channel_witnesses:
+            if use_channels:
                 nearby=np.stack([d[yy,xx]<=tolerance for d in channel_distances])
                 supported |= (nearby.sum(axis=0)>=2) | _native_normal_edges(mask,rgb,yy,xx,tolerance)
             parts=(xx<x1+width*.25,xx>x1+width*.75,yy<y1+r,yy>y1+height-r)
             support=[float(np.mean(supported[part])) for part in parts]
-            if min(support)<.75 or supported.mean()<.95:
+            if min(support)<min_side_sup or supported.mean()<min_mean_sup:
                 break
+            method=('filled_control_lighting_domain_only' if lighting_only else
+                    'filled_control_independent_channel_edges' if channel_witnesses else
+                    'filled_control_source_rgb_half_step')
             measurements.append((mask,dict(box=[x1,y1,x1+width,y1+height],pixels=int(mask.sum()),
                 capsule_iou=float(min(1,iou)),edge_support=support,boundary_support=float(supported.mean()),
-                proposal_method='filled_control_independent_channel_edges' if channel_witnesses else 'filled_control_source_rgb_half_step')))
-        if len(measurements)!=3:
+                proposal_method=method)))
+        if len(measurements)!=len(levels):
             continue
-        if np.ptp([proof['box'] for _,proof in measurements],axis=0).max()>2*tolerance:
+        if len(levels)>1 and np.ptp([proof['box'] for _,proof in measurements],axis=0).max()>2*tolerance:
             continue
-        mask,proof=measurements[1]
+        mask,proof=measurements[len(measurements)//2]
         proof['source_threshold_boxes']=[q['box'] for _,q in measurements]
         proof['interior_to_metal_rgb']=step.tolist()
         accepted.append((mask,proof))
+    if len(accepted)>1 and (channel_witnesses or lighting_only):
+        # Multiple coarse threshold seeds of the same physical control can
+        # produce slightly shifted fitted boxes; keep the best-supported fit per
+        # overlapping cluster when all fits lie within a bounded neighborhood.
+        deduped=[]
+        for mask,proof in sorted(accepted,key=lambda v:(v[1]['boundary_support'],min(v[1]['edge_support']),v[1]['capsule_iou']),reverse=True):
+            same=[old for old in deduped
+                  if np.count_nonzero(mask&old[0])/min(mask.sum(),old[0].sum())>.8
+                  and (lighting_only or np.max(np.abs(np.subtract(proof['box'],old[1]['box'])))<=3*tolerance)]
+            if not same:
+                deduped.append((mask,proof))
+        accepted=deduped
     return accepted

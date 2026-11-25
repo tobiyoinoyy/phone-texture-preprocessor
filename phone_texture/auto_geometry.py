@@ -188,6 +188,66 @@ def fixed_slope_consensus(x,y,slope,tolerance=3):
     return np.array([slope,offset]),keep,float(np.percentile(residual[keep],95))
 
 
+def _top_corner_sag_model(mask, wide_rows, max_taper_px=24.0):
+    """Fit left/right plate sides (allowing mild trapezoid perspective taper)
+    and build normalized top-corner sag lookup tables."""
+    h, w = mask.shape
+    ys = wide_rows[int(len(wide_rows) * .2):int(len(wide_rows) * .8)]
+    left = np.argmax(mask[ys], axis=1).astype(float)
+    right = (w - 1 - np.argmax(mask[ys, ::-1], axis=1)).astype(float)
+    l, _, _ = consensus_line(ys + .5, left, 2.5, np.tan(np.deg2rad(4)))
+    r, _, _ = consensus_line(ys + .5, right, 2.5, np.tan(np.deg2rad(4)))
+    taper = float(abs(l[0] - r[0]) * len(ys))
+    if taper > max_taper_px:
+        raise ValueError('Plate sides taper exceeds studio capture bound')
+    slope = float((l[0] + r[0]) / 2)
+    cols = np.arange(max(0, int(min(left.min(), np.polyval(l, wide_rows[0])) - 15)),
+                     min(w, int(max(right.max(), np.polyval(r, wide_rows[-1])) + 16)))
+    cols = cols[mask[:, cols].any(axis=0)]
+    top_y = np.argmax(mask[:, cols], axis=0).astype(float)
+    xl0 = float(np.polyval(l, wide_rows[0]))
+    xr0 = float(np.polyval(r, wide_rows[0]))
+    top_w = xr0 - xl0
+    core = (cols > xl0 + .25 * top_w) & (cols < xr0 - .25 * top_w)
+    top_line, _, top_res = fixed_slope_consensus(cols[core] + .5, top_y[core], -slope)
+    if top_res > 3:
+        raise ValueError('Top plate rail lacks straight consensus')
+    l_top = np.polyval(l, top_y + .5)
+    r_top = np.polyval(r, top_y + .5)
+    w_top = np.maximum(1.0, r_top - l_top)
+    d_top_l = (cols + .5 - l_top) / w_top
+    d_top_r = (r_top - (cols + .5)) / w_top
+    sag_top = top_y - np.polyval(top_line, cols + .5)
+    grid = np.linspace(0.0, 0.26, 261)
+
+    def side_sag(d_vals):
+        valid = (d_vals >= 0.0) & (d_vals <= 0.26) & (sag_top >= -2) & (sag_top < .28 * top_w)
+        if valid.sum() < 20:
+            raise ValueError('Top corner lacks sufficient silhouette samples')
+        order = np.argsort(d_vals[valid])
+        return np.interp(grid, d_vals[valid][order], np.maximum(0.0, sag_top[valid][order]))
+
+    return dict(
+        l=l, r=r, slope=slope, taper=taper, top_line=top_line, top_w=top_w,
+        cols=cols, grid=grid, sag_l=side_sag(d_top_l), sag_r=side_sag(d_top_r),
+    )
+
+
+def _eval_taper_corner_curve(width, base, l, r, grid, sag_l, sag_r):
+    xx = np.arange(width, dtype=float) + .5
+    curve = base.copy()
+    for _ in range(3):
+        lx = np.polyval(l, curve)
+        rx = np.polyval(r, curve)
+        wb = np.maximum(1.0, rx - lx)
+        dl = (xx - lx) / wb
+        dr = (rx - xx) / wb
+        sag = np.where(dl < .25, np.interp(np.clip(dl, 0.0, .26), grid, sag_l),
+              np.where(dr < .25, np.interp(np.clip(dr, 0.0, .26), grid, sag_r), 0.0))
+        curve = base - sag
+    return curve
+
+
 def plate_plane_from_own_corners(rgba,raw_rgb,wide_rows):
     """Infer the hidden bottom plane from this phone's visible corner curves.
 
@@ -200,37 +260,108 @@ def plate_plane_from_own_corners(rgba,raw_rgb,wide_rows):
     left=np.argmax(mask[ys],axis=1);right=w-1-np.argmax(mask[ys,::-1],axis=1)
     l,_,_=consensus_line(ys+.5,left.astype(float),2.5,np.tan(np.deg2rad(4)))
     r,_,_=consensus_line(ys+.5,right.astype(float),2.5,np.tan(np.deg2rad(4)))
-    if abs(l[0]-r[0])*len(ys)>4:raise ValueError('Plate sides are not a parallel studio capture')
-    slope=float((l[0]+r[0])/2);normal=np.sqrt(1+slope*slope)
-    uleft=float(np.percentile((left-slope*ys)/normal,75));uright=float(np.percentile((right-slope*ys)/normal,25));width=uright-uleft
-    cols=np.arange(max(0,int(left.min())-12),min(w,int(right.max())+13))
-    cols=cols[mask[:,cols].any(axis=0)]
-    top=np.argmax(mask[:,cols],axis=0);tu=(cols-slope*top)/normal;tv=(slope*cols+top)/normal
-    core=(tu>uleft+.25*width)&(tu<uright-.25*width)
-    vtop=float(np.median(tv[core]));valid=(tu>=uleft)&(tu<=uright)&(tv<vtop+.28*width)
-    order=np.argsort(tu[valid]);curve_u=tu[valid][order];curve_v=tv[valid][order]-vtop
-    bottom=h-1-np.argmax(mask[::-1,cols],axis=0);bu=(cols-slope*bottom)/normal;bv=(slope*cols+bottom)/normal
-    lc=(bu>uleft+.025*width)&(bu<uleft+.22*width);rc=(bu>uright-.22*width)&(bu<uright-.025*width)
-    usable=(lc|rc)&(bottom<h-8)
-    estimate=bv+np.interp(bu,curve_u,curve_v)
-    usable &= (estimate-vtop>1.7*width)&(estimate-vtop<2.4*width)
-    if min(np.count_nonzero(usable&lc),np.count_nonzero(usable&rc))<20:raise ValueError('Both lower corners must be exposed')
-    histogram=ndimage.gaussian_filter1d(np.bincount(np.maximum(0,np.rint(estimate[usable]).astype(int))),1.)
-    center=float(histogram.argmax());keep=usable&(np.abs(estimate-center)<=3)
-    fractions=[float(np.count_nonzero(keep&side)/np.count_nonzero(usable&side)) for side in (lc,rc)]
-    if min(fractions)<.6:raise ValueError('Upper/lower corner curves disagree')
-    plane=float(np.median(estimate[keep]));residual=float(np.percentile(np.abs(estimate[keep]-plane),95))
-    if residual>3:raise ValueError('Corner-derived plate plane exceeds residual limit')
-    gradient=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(np.float32),.8,axis=0),axis=0),axis=2)
-    xx=cols[keep];yy=bottom[keep]
-    edge=np.max(gradient[np.clip(yy[:,None]+np.arange(-2,3),0,h-1),xx[:,None]],axis=1)
-    if np.mean(edge>3)<.6:raise ValueError('Corner contour lacks independent raw RGB support')
-    line=np.array([-slope,normal*plane])
-    return line,dict(method='own_top_bottom_corner_curve_consensus_v1',
-        own_corner_support_fractions=fractions,corner_residual_p95_px=residual,
-        raw_rgb_supported_fraction=float(np.mean(edge>3)),body_u=[uleft,uright],top_v=vtop,bottom_v=plane,
-        symmetric_body_assumption=True,samples=int(keep.sum()),axis_slope=slope,
-        upper_curve_u=curve_u.tolist(),upper_curve_v=curve_v.tolist())
+    if abs(l[0]-r[0])*len(ys)<=4:
+        slope=float((l[0]+r[0])/2);normal=np.sqrt(1+slope*slope)
+        uleft=float(np.percentile((left-slope*ys)/normal,75));uright=float(np.percentile((right-slope*ys)/normal,25));width=uright-uleft
+        cols=np.arange(max(0,int(left.min())-12),min(w,int(right.max())+13))
+        cols=cols[mask[:,cols].any(axis=0)]
+        top=np.argmax(mask[:,cols],axis=0);tu=(cols-slope*top)/normal;tv=(slope*cols+top)/normal
+        core=(tu>uleft+.25*width)&(tu<uright-.25*width)
+        vtop=float(np.median(tv[core]));valid=(tu>=uleft)&(tu<=uright)&(tv<vtop+.28*width)
+        order=np.argsort(tu[valid]);curve_u=tu[valid][order];curve_v=tv[valid][order]-vtop
+        bottom=h-1-np.argmax(mask[::-1,cols],axis=0);bu=(cols-slope*bottom)/normal;bv=(slope*cols+bottom)/normal
+        lc=(bu>uleft+.025*width)&(bu<uleft+.22*width);rc=(bu>uright-.22*width)&(bu<uright-.025*width)
+        usable=(lc|rc)&(bottom<h-8)
+        estimate=bv+np.interp(bu,curve_u,curve_v)
+        usable &= (estimate-vtop>1.7*width)&(estimate-vtop<2.4*width)
+        if min(np.count_nonzero(usable&lc),np.count_nonzero(usable&rc))<20:raise ValueError('Both lower corners must be exposed')
+        histogram=ndimage.gaussian_filter1d(np.bincount(np.maximum(0,np.rint(estimate[usable]).astype(int))),1.)
+        center=float(histogram.argmax());keep=usable&(np.abs(estimate-center)<=3)
+        fractions=[float(np.count_nonzero(keep&side)/np.count_nonzero(usable&side)) for side in (lc,rc)]
+        if min(fractions)<.6:raise ValueError('Upper/lower corner curves disagree')
+        plane=float(np.median(estimate[keep]));residual=float(np.percentile(np.abs(estimate[keep]-plane),95))
+        if residual>3:raise ValueError('Corner-derived plate plane exceeds residual limit')
+        gradient=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(np.float32),.8,axis=0),axis=0),axis=2)
+        xx=cols[keep];yy=bottom[keep]
+        edge=np.max(gradient[np.clip(yy[:,None]+np.arange(-2,3),0,h-1),xx[:,None]],axis=1)
+        if np.mean(edge>3)<.6:raise ValueError('Corner contour lacks independent raw RGB support')
+        line=np.array([-slope,normal*plane])
+        return line,dict(method='own_top_bottom_corner_curve_consensus_v1',
+            own_corner_support_fractions=fractions,corner_residual_p95_px=residual,
+            raw_rgb_supported_fraction=float(np.mean(edge>3)),body_u=[uleft,uright],top_v=vtop,bottom_v=plane,
+            symmetric_body_assumption=True,samples=int(keep.sum()),axis_slope=slope,
+            upper_curve_u=curve_u.tolist(),upper_curve_v=curve_v.tolist())
+
+    # Mild trapezoid perspective taper (4..24 px across the shaft): mirror the
+    # phone's own top-left/top-right curves along its actual fitted side rails.
+    model = _top_corner_sag_model(mask, wide_rows, max_taper_px=24.0)
+    cols = model['cols']; slope = model['slope']
+    bottom = h - 1 - np.argmax(mask[::-1, cols], axis=0)
+    l_bot = np.polyval(model['l'], bottom + .5)
+    r_bot = np.polyval(model['r'], bottom + .5)
+    w_bot = np.maximum(1.0, r_bot - l_bot)
+    d_bot_l = (cols + .5 - l_bot) / w_bot
+    d_bot_r = (r_bot - (cols + .5)) / w_bot
+    lc = (d_bot_l > .025) & (d_bot_l < .20)
+    rc = (d_bot_r > .025) & (d_bot_r < .20)
+    usable = (lc | rc) & (bottom < h - 8)
+    sag = np.where(lc, np.interp(np.clip(d_bot_l, 0.0, .26), model['grid'], model['sag_l']),
+                   np.interp(np.clip(d_bot_r, 0.0, .26), model['grid'], model['sag_r']))
+    estimate = bottom.astype(float) + sag + slope * (cols + .5)
+    top_mid = float(np.polyval(model['top_line'], w / 2))
+    mid_height = estimate - slope * (w / 2) - top_mid
+    usable &= (mid_height > 1.7 * model['top_w']) & (mid_height < 2.4 * model['top_w'])
+    if min(np.count_nonzero(usable & lc), np.count_nonzero(usable & rc)) < 20:
+        raise ValueError('Both lower corners must be exposed')
+    histogram = ndimage.gaussian_filter1d(np.bincount(np.maximum(0, np.rint(estimate[usable]).astype(int))), 1.)
+    center = float(histogram.argmax())
+    keep = usable & (np.abs(estimate - center) <= 3.5)
+    fractions = [float(np.count_nonzero(keep & side) / np.count_nonzero(usable & side)) for side in (lc, rc)]
+    if min(fractions) < .6:
+        raise ValueError('Upper/lower corner curves disagree')
+    plane = float(np.median(estimate[keep]))
+    residual = float(np.percentile(np.abs(estimate[keep] - plane), 95))
+    if residual > 3.2:
+        raise ValueError('Corner-derived plate plane exceeds residual limit')
+    gradient = np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(np.float32), .8, axis=0), axis=0), axis=2)
+    xx = cols[keep]; yy = bottom[keep]
+    edge = np.max(gradient[np.clip(yy[:, None] + np.arange(-2, 3), 0, h - 1), xx[:, None]], axis=1)
+    if np.mean(edge > 3) < .6:
+        raise ValueError('Corner contour lacks independent raw RGB support')
+    line = np.array([-slope, plane])
+    # If the phone's own exposed flat bottom columns consistently sit within a
+    # few pixels of the mirrored top-corner plane (mild camera pitch), anchor
+    # the intercept to their directly observed raw RGB outer boundary so we
+    # neither step inward above real body nor leave soft stand alpha below it.
+    xl_b = float(np.polyval(model['l'], wide_rows[-1]))
+    xr_b = float(np.polyval(model['r'], wide_rows[-1]))
+    wb_b = xr_b - xl_b
+    fx = np.arange(max(0, int(xl_b + .18 * wb_b)), min(w, int(xr_b - .18 * wb_b)))
+    if len(fx) >= 20:
+        fb = h - 1 - np.argmax(mask[::-1, fx], axis=0)
+        exp_flat = fb < h - 8
+        if exp_flat.sum() >= 20:
+            fx_e = fx[exp_flat]; fb_e = fb[exp_flat]
+            deltas = fb_e.astype(float) - np.polyval(line, fx_e + .5)
+            near_flat = np.abs(deltas) <= 5.0
+            if near_flat.sum() >= 20 and np.percentile(np.abs(deltas[near_flat] - np.median(deltas[near_flat])), 90) <= 1.5:
+                fx_n = fx_e[near_flat]; fb_n = fb_e[near_flat]
+                sy = np.clip(fb_n[:, None] + np.arange(-4, 5), 0, h - 1)
+                g_win = gradient[sy, fx_n[:, None]]
+                rgb_y = sy[np.arange(len(fx_n)), np.argmax(g_win, axis=1)] + .5
+                valid_g = (g_win.max(axis=1) > 3.0) & (np.abs(rgb_y - (fb_n + .5)) <= 3.0)
+                if valid_g.sum() >= 20:
+                    rgb_deltas = rgb_y[valid_g] - np.polyval(line, fx_n[valid_g] + .5)
+                    if np.percentile(np.abs(rgb_deltas - np.median(rgb_deltas)), 90) <= 2.0:
+                        shift = float(np.median(rgb_deltas))
+                        if -3.0 <= shift <= 4.0:
+                            line[1] += shift
+    return line, dict(method='own_top_bottom_corner_curve_consensus_taper_v1',
+        own_corner_support_fractions=fractions, corner_residual_p95_px=residual,
+        raw_rgb_supported_fraction=float(np.mean(edge > 3)),
+        taper_px=model['taper'], left_line=model['l'].tolist(), right_line=model['r'].tolist(),
+        sag_grid=model['grid'].tolist(), sag_left=model['sag_l'].tolist(), sag_right=model['sag_r'].tolist(),
+        symmetric_body_assumption=True, samples=int(keep.sum()), axis_slope=slope)
 
 
 def plate_corner_contact_limit(rgba, raw_rgb, line, corner, support_columns, paper=None):
@@ -241,18 +372,32 @@ def plate_corner_contact_limit(rgba, raw_rgb, line, corner, support_columns, pap
     silhouette can change. Exposed corners, body reflections and paper stay
     unchanged. A poor correspondence is a failure, never a smaller body.
     """
-    a=np.asarray(rgba);h,w=a.shape[:2];mask=principal(a[...,3]);x=np.arange(w,dtype=float)
-    base=np.polyval(line,x+.5);curve=base.copy()
-    slope=float(corner['axis_slope']);normal=np.sqrt(1+slope*slope)
-    u0,u1=corner['body_u'];width=u1-u0
-    for _ in range(4):
-        u=(x-slope*curve)/normal
-        curve=normal*(corner['bottom_v']-np.interp(u,corner['upper_curve_u'],corner['upper_curve_v']))-slope*x
+    a=np.asarray(rgba);h,w=a.shape[:2];x=np.arange(w,dtype=float)
+    base=np.polyval(line,x+.5)
+    if 'left_line' in corner:
+        l_line = np.asarray(corner['left_line'], float)
+        r_line = np.asarray(corner['right_line'], float)
+        grid = np.asarray(corner['sag_grid'], float)
+        sag_l = np.asarray(corner['sag_left'], float)
+        sag_r = np.asarray(corner['sag_right'], float)
+        curve = _eval_taper_corner_curve(w, base, l_line, r_line, grid, sag_l, sag_r)
+        lx = np.polyval(l_line, base); rx = np.polyval(r_line, base); wb = np.maximum(1.0, rx - lx)
+        xx = x + .5
+        corner_columns = ((xx > lx + .025 * wb) & (xx < lx + .24 * wb)) | ((xx > rx - .24 * wb) & (xx < rx - .025 * wb))
+        left_side = xx < (lx + rx) / 2
+    else:
+        curve=base.copy()
+        slope=float(corner['axis_slope']);normal=np.sqrt(1+slope*slope)
+        u0,u1=corner['body_u'];width=u1-u0
+        for _ in range(4):
+            u=(x-slope*curve)/normal
+            curve=normal*(corner['bottom_v']-np.interp(u,corner['upper_curve_u'],corner['upper_curve_v']))-slope*x
+        corner_columns=((u>u0+.025*width)&(u<u0+.23*width))|((u>u1-.23*width)&(u<u1-.025*width))
+        left_side = u < (u0 + u1) / 2
     present=a[...,3]>0
     bottom=h-1-np.argmax(present[::-1],axis=0)
     # A real exposed corner follows the fitted curve. Only a clearly attached
     # projection extends farther, so do not recut every already good corner.
-    corner_columns=((u>u0+.025*width)&(u<u0+.23*width))|((u>u1-.23*width)&(u<u1-.025*width))
     support_columns=np.asarray(support_columns,dtype=bool).reshape(-1)
     if support_columns.shape!=(w,):raise ValueError('Stand projection columns differ from source width')
     affected=corner_columns&(bottom>curve+4)&(base>curve+4)&support_columns&present.any(axis=0)
@@ -261,7 +406,7 @@ def plate_corner_contact_limit(rgba, raw_rgb, line, corner, support_columns, pap
     limit=base.copy();details=[]
     if not affected.any():return limit,dict(method='raw_supported_local_corner_contact',changed_columns=[],corners=[])
     gradient=np.linalg.norm(np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(np.float32),.8,axis=0),axis=0),axis=2)
-    for name,side in [('left',u<(u0+u1)/2),('right',u>=(u0+u1)/2)]:
+    for name,side in [('left',left_side),('right',~left_side)]:
         cols=np.flatnonzero(affected&side)
         if not len(cols):continue
         # Validate a full local neighbourhood, including exposed witnesses on
@@ -286,6 +431,79 @@ def plate_corner_contact_limit(rgba, raw_rgb, line, corner, support_columns, pap
             rgb_support_fraction=float(supported.mean()),rgb_offset_px=offset,
             rgb_residual_p95_px=residual,source_samples=int(supported.sum())))
     return limit,dict(method='raw_supported_local_corner_contact',changed_columns=np.flatnonzero(limit<base).tolist(),corners=details)
+
+
+def plate_corner_wedge_limit(rgba, raw_rgb, wide_rows, line, support_columns, paper=None):
+    """Trim stand wedges tucked under rounded bottom corners using the phone's
+    own top-corner curve and isotropic raw RGB edge verification.
+
+    Applies strictly to stand-adjacent bottom-corner columns and retains a
+    conservative outer envelope (never cuts inward above the verified bezel).
+    """
+    a = np.asarray(rgba); h, w = a.shape[:2]
+    mask = principal(a[..., 3])
+    xx = np.arange(w, dtype=float) + .5
+    base = np.polyval(line, xx)
+    try:
+        model = _top_corner_sag_model(mask, wide_rows, max_taper_px=24.0)
+    except ValueError:
+        return base, None
+    curve = _eval_taper_corner_curve(w, base, model['l'], model['r'],
+                                     model['grid'], model['sag_l'], model['sag_r'])
+    support_columns = np.asarray(support_columns, dtype=bool).reshape(-1)
+    if support_columns.shape != (w,):
+        return base, None
+    present = a[..., 3] > 0
+    bottom = h - 1 - np.argmax(present[::-1], axis=0)
+    lx = np.polyval(model['l'], base); rx = np.polyval(model['r'], base); wb = np.maximum(1.0, rx - lx)
+    corner_columns = ((xx > lx + .025 * wb) & (xx < lx + .24 * wb)) | ((xx > rx - .24 * wb) & (xx < rx - .025 * wb))
+    affected = corner_columns & (bottom > curve + 2.5) & (base > curve + 2.0) & support_columns & present.any(axis=0)
+    if paper is not None and paper.any():
+        affected &= ~np.any(np.asarray(paper, dtype=bool) & (np.arange(h)[:, None] >= curve[None, :] - 3), axis=0)
+    if not affected.any():
+        return base, dict(method='isotropic_corner_wedge_trim_v1', changed_columns=[], corners=[])
+    sm = ndimage.gaussian_filter(raw_rgb.astype(np.float32), (.8, .8, 0))
+    grad = np.hypot(np.linalg.norm(np.gradient(sm, axis=1), axis=2),
+                    np.linalg.norm(np.gradient(sm, axis=0), axis=2))
+    limit = base.copy(); details = []
+    left_side = xx < (lx + rx) / 2
+    offs = np.arange(-5, 9)
+    for name, side in (('left', left_side), ('right', ~left_side)):
+        cols = np.flatnonzero(affected & side)
+        if not len(cols):
+            continue
+        check = np.arange(max(0, cols.min() - 8), min(w, cols.max() + 9))
+        ys = np.rint(curve[check, None] + offs).astype(int)
+        vals = grad[np.clip(ys, 0, h - 1), check[:, None]]
+        lmax = (vals >= np.roll(vals, 1, axis=1)) & (vals >= np.roll(vals, -1, axis=1))
+        lmax[:, [0, -1]] = False
+        lmax &= (vals > 4.0) & (vals >= .30 * vals.max(axis=1, keepdims=True))
+        dist = np.abs(ys - curve[check, None])
+        pk = np.argmin(np.where(lmax, dist, 999.0), axis=1)
+        supported = lmax.any(axis=1)
+        if supported.mean() < .70 or supported.sum() < 10:
+            continue
+        disp = ys[np.arange(len(check)), pk][supported] - curve[check[supported]]
+        offset = float(np.median(disp))
+        if abs(offset) > 3.2:
+            continue
+        local = curve + max(0.0, offset) + .5
+        # Continue smoothly from the outer affected wedge to where local meets base
+        # so the curved corner blends continuously into the flat rail without a step.
+        if name == 'left':
+            arc = np.flatnonzero(side & (xx >= cols.min()) & (local < base) & present.any(axis=0))
+        else:
+            arc = np.flatnonzero(side & (xx <= cols.max()) & (local < base) & present.any(axis=0))
+        if paper is not None and paper.any():
+            paper_cols = np.any(np.asarray(paper, dtype=bool) & (np.arange(h)[:, None] >= curve[None, :] - 3), axis=0)
+            arc = arc[~paper_cols[arc]]
+        target_cols = np.union1d(cols, arc)
+        limit[target_cols] = np.minimum(base[target_cols], local[target_cols])
+        details.append(dict(side=name, columns=[int(target_cols.min()), int(target_cols.max())],
+                            rgb_support_fraction=float(supported.mean()),
+                            rgb_offset_px=offset, source_samples=int(supported.sum())))
+    return limit, dict(method='isotropic_corner_wedge_trim_v1',
+                       changed_columns=np.flatnonzero(limit < base).tolist(), corners=details)
 
 
 def line_samples(alpha, lo, hi):
@@ -438,8 +656,12 @@ def _bottom_upper_body_rail(rgba, raw, top, bottom, extent):
 def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_support_edge=True, *, model=None):
     a=np.array(matte.convert('RGBA')); original=a.copy()
     raw=np.array(source_image.convert('RGB')) if source_image else None
+    side_button_trim=None
     if face == 'top':
-        from .top_frame import TopCalibrationError, calibrate_top, verify_top_mask
+        from .top_frame import TopCalibrationError, calibrate_top, trim_top_side_button, verify_top_mask
+        a, side_button_trim = trim_top_side_button(a, raw)
+        original = a.copy()
+        matte_top = Image.fromarray(a) if side_button_trim is not None else matte
         try:
             top,bottom,proof=calibrate_top(a,raw)
         except TopCalibrationError as failure:
@@ -447,19 +669,26 @@ def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_suppo
                 raise
             from .frame_contact import recover_frame
             try:
-                recovered, proof = recover_frame(matte, source_image, face, stage_sink)
+                recovered, proof = recover_frame(matte_top, source_image, face, stage_sink)
                 proof['original_failure'] = str(failure)
+                if side_button_trim is not None:
+                    proof['side_button_trim'] = side_button_trim
                 return recovered, proof
             except ValueError as unsupported:
                 if model is not None:
                     from .top_body_template import normalize_top
                     try:
-                        return normalize_top(matte,source_image,model,stage_sink,
+                        recovered, proof = normalize_top(matte_top,source_image,model,stage_sink,
                                              previous_error=f'{failure} (source contact check: {unsupported})')
+                        if side_button_trim is not None:
+                            proof['side_button_trim'] = side_button_trim
+                        return recovered, proof
                     except ValueError as template_error:
                         raise TopCalibrationError(f'{failure} (source contact check: {unsupported}; '
                                                   f'thickness template: {template_error})') from template_error
                 raise TopCalibrationError(f'{failure} (source contact check: {unsupported})') from unsupported
+        if side_button_trim is not None:
+            proof['side_button_trim'] = side_button_trim
     else:
         try:
             top,bottom,proof=frame_rails(a,raw)
@@ -521,13 +750,14 @@ def frame_geometry(matte, face, stage_sink=None,source_image=None,separate_suppo
         review_reasons=['extrapolated_frame_edges','complete_outline_requires_review'])
 
 
-def exposed_lower_plane(mask, raw_gradient, x0, x1, last_body_row, paper=None):
+def exposed_lower_plane(mask, raw_gradient, x0, x1, last_body_row, paper=None, body_slope=None):
     """Fit the photographed cross-edge independently of the long-side axis.
 
     Mild perspective makes those axes non-perpendicular. Require both exposed
     halves and independent RGB support; never fit the central stand or paper.
     """
     h,w=mask.shape;bw=x1-x0;options=[]
+    max_slope_delta = max(4.0, .0045 * bw) / max(1.0, bw)
     for lo,hi in ((.12,.28),(.14,.30),(.16,.30)):
         x=np.r_[np.arange(int(x0+lo*bw),int(x0+hi*bw)),
                 np.arange(int(x1-hi*bw),int(x1-lo*bw))]
@@ -544,6 +774,9 @@ def exposed_lower_plane(mask, raw_gradient, x0, x1, last_body_row, paper=None):
             rgb_y=yy[np.arange(len(x)),np.argmax(strength,axis=1)]+.5
             rgb,rk,re=consensus_line(x+.5,rgb_y,3,np.tan(np.deg2rad(4)))
         except ValueError:continue
+        if body_slope is not None and (abs(rgb[0] - body_slope) > max_slope_delta or
+                                       abs(alpha[0] - body_slope) > max_slope_delta):
+            continue
         fractions=[float((ak&rk&(strength.max(axis=1)>3))[s].mean()) for s in halves]
         if min(fractions)<.6:continue
         disagreement=float(np.max(np.abs(np.polyval(rgb,[x0,x1])-np.polyval(alpha,[x0,x1]))))
@@ -614,12 +847,17 @@ def front_lower_closure(mask,raw_rgb,x0,x1,last_body_row,source_alpha=None):
     return 2*residual,line,line,len(x),[.30,.45],proof
 
 
-def paper_without_stand(paper, limit):
+def paper_without_stand(paper, limit, *, allow_tail=True):
     """A sticker tail ends just past the body; white paper-like pixels beyond
     the lower body edge that run on to the photograph's bottom border are the
-    stand (paper detection can flood into it) and get no paper protection."""
+    stand (paper detection can flood into it) and get no paper protection.
+    When allow_tail=False (profiles whose sticker wraps flush onto the bottom
+    frame without hanging below the phone), pixels past limit receive no paper
+    protection so gray stand lips below the sticker are cut cleanly."""
     if paper is None or not paper.any():return paper
     h=paper.shape[0];yy=np.arange(h)[:,None]
+    if not allow_tail:
+        return paper & (yy <= np.broadcast_to(limit, paper.shape) + .5)
     beyond=paper&(yy>np.broadcast_to(limit,paper.shape)+1)
     labels,n=ndimage.label(beyond)
     stand=np.isin(labels,np.unique(labels[-1][labels[-1]>0]))
@@ -679,7 +917,7 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
         try:
             if _front_closure_evidence:
                 score,al,rl,n,bands,lower_plane_proof=front_lower_closure(mask,raw_rgb,x0,x1,rows[-1],a[...,3])
-            else:score,al,rl,n,bands,lower_plane_proof=exposed_lower_plane(mask,raw_gradient,x0,x1,rows[-1],paper)
+            else:score,al,rl,n,bands,lower_plane_proof=exposed_lower_plane(mask,raw_gradient,x0,x1,rows[-1],paper,body_slope=body_slope)
             clear_options.append((score,al,rl,n,bands))
         except ValueError:pass
     if clear_options:
@@ -688,11 +926,14 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
         # alpha retained at both exposed, already segmented round corners.
         line=rgb_line;residual=corner_proof['corner_residual_p95_px'] if bands is None else score/2;inlier_fraction=1.
         yy=np.arange(h)[:,None];xx=np.arange(w)[None,:]+.5;limit=np.polyval(line,xx)
+        base_limit=limit.copy()
         paper_tail_proof=None
         if reconstruct_paper_tail and face=='back' and paper is not None and paper.any():
             from .auto_material import source_paper_tail
             paper,tail_info=source_paper_tail(np.dstack([raw_rgb,a[...,3]]),paper,{},physical_end=limit[0])
             paper_tail_proof=tail_info.get('source_paper_tail')
+        paper_cut = paper_without_stand(paper, limit, allow_tail=reconstruct_paper_tail)
+        remote=(yy>limit+12)&(a[...,3]>0)
         far_start=min(h-1,max(0,int(np.min(limit))+12))
         support_columns=ndimage.binary_dilation((a[far_start:,:,3]>0).any(axis=0),iterations=8)[None,:]
         contact_curve_proof=None
@@ -700,15 +941,42 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
             # With a tilted body, a single global far-start row can still
             # intersect the phone at the opposite end. This new corner-only
             # projection must be genuinely beyond each column's body plane.
-            remote=(yy>limit+12)&(a[...,3]>0)
             corner_support=ndimage.binary_dilation(remote.any(axis=0),iterations=8)
-            local_limit,contact_curve_proof=plate_corner_contact_limit(a,raw_rgb,line,corner_proof,corner_support,paper)
-            limit=local_limit[None,:]
+            try:
+                local_limit,contact_curve_proof=plate_corner_contact_limit(a,raw_rgb,line,corner_proof,corner_support,paper_cut)
+                limit=local_limit[None,:]
+            except ValueError:
+                if face == 'back':
+                    pass
+                elif corner_proof and corner_proof.get('method') == 'own_top_bottom_corner_curve_consensus_taper_v1':
+                    # On mildly tapered front captures, fall back cleanly to an
+                    # exposed clear-band/closure line rather than failing a
+                    # capture whose flat lower rail is already directly observed.
+                    others = [v for v in clear_options if v[4] is not None]
+                    if others:
+                        score,alpha_line,rgb_line,n_clear,bands=min(others,key=lambda v:v[0])
+                        line=rgb_line;residual=score/2
+                        limit=np.polyval(line,xx);base_limit=limit.copy()
+                        remote=(yy>limit+12)&(a[...,3]>0)
+                        far_start=min(h-1,max(0,int(np.min(limit))+12))
+                        support_columns=ndimage.binary_dilation((a[far_start:,:,3]>0).any(axis=0),iterations=8)[None,:]
+                else:
+                    raise
+        if face == 'back':
+            wedge_support = ndimage.binary_dilation(remote.any(axis=0), iterations=24)
+            wedge_limit, wedge_proof = plate_corner_wedge_limit(a, raw_rgb, rows, line, wedge_support, paper_cut)
+            if wedge_proof and wedge_proof.get('changed_columns'):
+                limit = np.minimum(limit, wedge_limit[None, :])
+                support_columns = support_columns | (limit < base_limit)
+                if contact_curve_proof is None or not contact_curve_proof.get('changed_columns'):
+                    contact_curve_proof = wedge_proof
+                else:
+                    contact_curve_proof['wedge_refinement'] = wedge_proof
         if lower_plane_proof and lower_plane_proof.get('method')=='front_alpha_plateau_with_independent_dark_glass_closure':
             a[...,3]=front_support_coverage(a[...,3],limit,support_columns)
             lower_plane_proof['source_cut']='fractional_coverage_at_exclusive_alpha_rail_no_extra_stand_pixel'
         else:
-            paper=paper_without_stand(paper,limit)
+            paper=paper_without_stand(paper,limit,allow_tail=reconstruct_paper_tail)
             outside=(yy>limit+1)&support_columns
             if paper is not None:outside &= ~paper
             a[...,3][outside]=0
@@ -788,10 +1056,24 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
         paper_tail_proof=tail_info.get('source_paper_tail')
     far=mask[int(np.polyval(line,(x0+x1)/2)+12):]
     support_columns=ndimage.binary_dilation(far.any(axis=0),iterations=8)
+    paper=paper_without_stand(paper,limit,allow_tail=reconstruct_paper_tail)
+    corner_wedge_proof=None
+    if face == 'back':
+        remote=(yy>np.polyval(line,xx)+12)&(a[...,3]>0)
+        wedge_support=ndimage.binary_dilation(remote.any(axis=0),iterations=24)
+        wedge_limit,corner_wedge_proof=plate_corner_wedge_limit(a,raw_rgb,rows,line,wedge_support,paper)
+        if corner_wedge_proof and corner_wedge_proof.get('changed_columns'):
+            limit=np.minimum(limit,wedge_limit[None,:]+1.)
+            support_columns=support_columns|(wedge_limit<np.polyval(line,xx[0]))
     support=ndimage.binary_fill_holes(np.broadcast_to(support_columns,(h,w))) & (yy>=limit)
-    paper=paper_without_stand(paper,limit)
     if paper is not None:support &= ~paper
     a[...,3][support]=0
+    if corner_wedge_proof and corner_wedge_proof.get('changed_columns'):
+        wedge_cols=np.zeros(w,bool);wedge_cols[corner_wedge_proof['changed_columns']]=True
+        contact=(yy>=limit-3)&(yy<limit)&mask&wedge_cols[None,:]
+        if paper is not None:contact &= ~paper
+        coverage=np.clip((limit-yy)/3.,0,1)
+        a[...,3][contact]=np.minimum(a[...,3][contact],np.rint(255*coverage[contact]).astype(np.uint8))
     if stage_sink:stage_sink('source_matte',matte);stage_sink('after_support',Image.fromarray(a))
     slope=float(np.polyval(np.polyder(line),(x0+x1)/2))
     angle=axis_proof['rotation_ccw_degrees'];rotated=Image.fromarray(rotate_alpha_safe(a,angle))
@@ -802,7 +1084,7 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
     return result,dict(method='local_stand_removal_from_exposed_plate_edges_v1',
         source_size=list(matte.size),output_size=list(result.size),body_x=[x0,x1],
         bottom_rail=line.tolist(),lower_edge_residual_p95_px=residual,exposed_samples=int(valid.sum()),
-        source_paper_tail=paper_tail_proof,
+        source_paper_tail=paper_tail_proof,corner_contact_evidence=corner_wedge_proof,
         rotation_ccw_degrees=angle,canvas_trim_xyxy=list(box),removed_support_pixels=int(support.sum()),
         rgb_painted=False,axis_evidence=axis_proof,review_reasons=['heuristic_support_cut','complete_outline_requires_review'])
 

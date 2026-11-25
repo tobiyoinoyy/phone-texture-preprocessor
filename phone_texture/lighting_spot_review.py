@@ -79,6 +79,7 @@ def side_rail(source, current, safe, alpha, metal):
         x = np.arange(length)[None,:]
         y = np.minimum(np.argmax(opacity >= 240, axis=0) + np.arange(depth)[:,None], height-1)
         valid = (opacity[y,x] >= 128) & mask[y,x]
+        orig_full = out[..., 0].copy()
         original = out[y,x,0].copy()
         ceiling = limit[y,x,0]
         # Compare the rendered contrast to the source on both edges, even
@@ -93,6 +94,24 @@ def side_rail(source, current, safe, alpha, metal):
 
         check = _review_grid(raw[y,x,:1], original[...,None], valid, max(4, round(height*.40)),
                              'nearest', propose, read, commit)
+        # Ensure released lift never re-opens a steep tangent added-L cliff in
+        # actual image coordinates next to a gamut-pinned highlight or spot
+        # boundary. Only pull back pixels lifted above `orig_full`; unedited
+        # pixels remain bitwise identical.
+        m_full = (opacity >= 128) & mask
+        lifted = m_full & (out[..., 0] > orig_full + 1e-6)
+        if lifted.any() and length > 1:
+            shift = out[..., 0] - raw[..., 0]
+            cap = np.where(m_full, shift, np.inf)
+            step_lim = .90
+            for col in range(1, length):
+                cap[:, col] = np.where(m_full[:, col], np.minimum(cap[:, col], cap[:, col - 1] + step_lim), np.inf)
+            for col in range(length - 2, -1, -1):
+                cap[:, col] = np.where(m_full[:, col], np.minimum(cap[:, col], cap[:, col + 1] + step_lim), np.inf)
+            clamped = np.maximum(orig_full, np.minimum(out[..., 0], raw[..., 0] + cap))
+            fix = lifted & (clamped < out[..., 0] - 1e-6)
+            if fix.any():
+                out[fix, 0] = clamped[fix]
         proof.append(check)
     return proof
 

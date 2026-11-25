@@ -117,7 +117,7 @@ def seeded_paper(a,face,resolve_end=True):
     # Print seeds are certainly paper; white margins within the print block
     # also train the foreground model so the result is not ink-only.
     labels[max(0,sy0):min(rh,sy1),max(margin,sx0):min(rw-margin,sx1)]=cv2.GC_FGD
-    labels[np.array(a[y0:y1,x0:x1,3])==0]=cv2.GC_BGD
+    labels[np.array(a[y0:y1,x0:x1,3])<(240 if face=='back' else 1)]=cv2.GC_BGD
     cv2.setRNGSeed(0)
     cv2.grabCut(features,labels,None,np.zeros((1,65)),np.zeros((1,65)),5,cv2.GC_INIT_WITH_MASK)
     fg=(labels==cv2.GC_FGD)|(labels==cv2.GC_PR_FGD)
@@ -369,7 +369,7 @@ def paper_mask(image,face,resolve_end=True,source_tail=True):
     mask=np.zeros((h,w),bool)
     if face not in ('back','bottom'):return mask,dict(method='profile_no_label_face',components=[])
     hsv=cv2.cvtColor(rgb,cv2.COLOR_RGB2HSV)
-    white=(hsv[...,1]<65)&(hsv[...,2]>155)&(rgb.min(axis=2)>120)&(a[...,3]>128)
+    white=(hsv[...,1]<65)&(hsv[...,2]>155)&(rgb.min(axis=2)>120)&(a[...,3]>=(240 if face=='back' else 128))
     if face=='back':white[:int(h*.55)]=False
     if face=='bottom':
         # A white paper strip can touch a specular outer rail. Discover its
@@ -541,21 +541,41 @@ def rear_panel(image):
     if min(ls,rs,ts,bs)<2 or not .7*w<right-left<.95*w:
         raise ValueError('Rear panel has insufficient independent seam evidence')
     angles=np.linspace(.08,np.pi/2-.08,100)
-    corners=[]
-    for x,y,sx,sy in [(left,top,1,1),(right,top,-1,1),(left,bottom,1,-1),(right,bottom,-1,-1)]:
-        radii=np.arange(int(w*.035),int(w*.2))
-        scores=[]
-        for r in radii:
-            xx=x+sx*r*(1-np.cos(angles));yy=y+sy*r*(1-np.sin(angles))
-            scores.append(float(ndimage.map_coordinates(ridge,[yy,xx],order=1).mean()))
-        radius=int(radii[np.argmax(scores)])
-        supported=not (max(scores)<2 or radius in (radii[0],radii[-1]))
-        corners.append(dict(radius=radius,mean_seam_evidence=max(scores),supported=supported))
+    def measure_corners(top_y):
+        found=[]
+        for x,y,sx,sy in [(left,top_y,1,1),(right,top_y,-1,1),(left,bottom,1,-1),(right,bottom,-1,-1)]:
+            radii=np.arange(int(w*.035),int(w*.2))
+            scores=[]
+            for r in radii:
+                xx=x+sx*r*(1-np.cos(angles));yy=y+sy*r*(1-np.sin(angles))
+                scores.append(float(ndimage.map_coordinates(ridge,[yy,xx],order=1).mean()))
+            radius=int(radii[np.argmax(scores)])
+            supported=not (max(scores)<2 or radius in (radii[0],radii[-1]))
+            found.append(dict(radius=radius,mean_seam_evidence=max(scores),supported=supported))
+        return found
+    corners=measure_corners(top)
+    weak=[i for i,c in enumerate(corners) if not c['supported']]
+    if len(weak)>1:
+        # A strong camera-plateau lower bevel near 0.28*h can raise the 0.25*max
+        # peak threshold above the actual inset-panel top seam (~0.32*h). Check
+        # lower ridge peaks (>= 2.0) in the same band against the same strict
+        # corner-support gate before rejecting.
+        lo_t,hi_t=int(len(horizontal)*.27),int(len(horizontal)*.39)
+        alt_peaks,_=find_peaks(horizontal[lo_t:hi_t],height=2.,distance=5)
+        for p in reversed(alt_peaks):
+            cand_top=int(p)+lo_t
+            if cand_top<=top:
+                continue
+            cand_corners=measure_corners(cand_top)
+            cand_weak=[i for i,c in enumerate(cand_corners) if not c['supported']]
+            if len(cand_weak)<=1:
+                top,ts=cand_top,float(horizontal[cand_top])
+                corners,weak=cand_corners,cand_weak
+                break
     # Lighting direction can make one seam corner read bright instead of dark.
     # With all four edges and three corners measured, borrow the radius of the
     # mirrored corner on the same row (same y, so perspective keystone matches).
     # Two or more weak corners still reject: the panel is then not measured.
-    weak=[i for i,c in enumerate(corners) if not c['supported']]
     if len(weak)>1 or (weak and min(ls,rs,ts,bs)<2):
         raise ValueError('Rear panel corner lacks source seam support')
     for i in weak:
@@ -628,7 +648,9 @@ def rear_camera_glass(a, remaining):
     h,w=a.shape[:2]
     gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY)
     upper=np.zeros((h,w),bool);upper[:int(h*.30)]=True
-    dark=(gray<max(35,float(np.percentile(gray[remaining&upper],15))))&remaining&upper
+    upper_samples=gray[remaining&upper]
+    p15=float(np.percentile(upper_samples,15)) if upper_samples.size else 35.
+    dark=(gray<max(35.,p15))&remaining&upper
     n,labels,stats,_=cv2.connectedComponentsWithStats(dark.astype(np.uint8),8)
     glass=np.zeros((h,w),bool)
     interior=ndimage.binary_erosion(a[...,3]>=240,border_value=0)
@@ -651,9 +673,75 @@ def rear_camera_glass(a, remaining):
                 shadow_arcs.append(dict(evidence,source_box_occupancy=occupancy))
                 continue
             glass|=component;accepted.append(evidence)
+    # On bright metallic backs (e.g. silver where plateau metal ~220+), the 3
+    # large lenses alone occupy ~15% of the upper frame so p15 can bisect a
+    # mid-dark LiDAR disk (~50-60 gray). Recover disjoint compact circular
+    # hardware surrounded by much brighter metal without absorbing shadow arcs.
+    mid_contrast_accepted=[]
+    if upper_samples.size:
+        p60=float(np.percentile(upper_samples,60))
+        mid_thr=min(110.,max(35.,p15,p60*.45))
+        if p60>120. and mid_thr>max(35.,p15)+5.:
+            dark2=(gray<mid_thr)&remaining&upper
+            n2,labels2,stats2,_=cv2.connectedComponentsWithStats(dark2.astype(np.uint8),8)
+            for i in range(1,n2):
+                x,y,bw,bh,area=map(int,stats2[i])
+                if not (.04*w<bw<.16*w and .04*w<bh<.16*w and .75<=bw/max(1,bh)<=1.33 and area>200):
+                    continue
+                occupancy=area/max(1,bw*bh)
+                if occupancy<.60:
+                    continue
+                component=ndimage.binary_fill_holes(labels2==i)
+                if np.any(component&~interior) or np.any(component&glass):
+                    continue
+                ring=ndimage.binary_dilation(component,iterations=12)&~ndimage.binary_dilation(component,iterations=4)&remaining
+                if ring.sum()<50:
+                    continue
+                contrast=float(np.median(gray[ring])-np.median(gray[component]))
+                if contrast<50.:
+                    continue
+                evidence=dict(box=[x,y,bw,bh],source_component_pixels=area,
+                              filled_pixels=int(component.sum()),outer_neighbourhood_pixels=0,
+                              source_box_occupancy=float(occupancy),ring_contrast_gray=contrast,
+                              detection='mid_contrast_dark_hardware')
+                glass|=component;accepted.append(evidence);mid_contrast_accepted.append(evidence)
+    # Bright glare inside a dark lens disk can exceed the fixed gray threshold
+    # and leak outer glass into camera_surround. When camera_metal measures a
+    # verified glass-to-metal inner edge overlapping an accepted glass disk,
+    # exclude the complete measured glass disk interior (leaving the metal rim).
+    lens_inner_completed=[]
+    if glass.any() and min(h,w)>=300:
+        from . import camera_metal
+        try:
+            plan=camera_metal.measure(a,'triple')
+        except ValueError:
+            plan=None
+        if plan is not None:
+            yy,xx=np.ogrid[:h,:w]
+            angles=np.arange(360)
+            for idx,lens in enumerate(plan.get('lenses',[])):
+                if sum(lens.get('supported',[]))<210:
+                    continue
+                cx,cy,r=lens['centre']
+                inner_arr=np.asarray(lens['inner'],float)
+                ang=np.rad2deg(np.arctan2(yy-cy,xx-cx))%360
+                rad=np.hypot(xx-cx,yy-cy)
+                inner_r=np.interp(ang,angles,inner_arr,period=360)
+                disk=(rad<=inner_r)&interior&remaining
+                if not disk.any():
+                    continue
+                overlap=float(np.count_nonzero(disk&glass)/disk.sum())
+                if overlap>=.40:
+                    added=int(np.count_nonzero(disk&~glass))
+                    if added>0:
+                        glass|=disk
+                        lens_inner_completed.append(dict(lens_index=idx,added_pixels=added,
+                            overlap_fraction=overlap,centre=[float(cx),float(cy),float(r)]))
     return glass,dict(method='source_interior_camera_components_v3',
                       accepted=accepted,rejected_outer_fragments=outer_fragments,
-                      rejected_shadow_arcs=shadow_arcs)
+                      rejected_shadow_arcs=shadow_arcs,
+                      mid_contrast_accepted=mid_contrast_accepted,
+                      lens_inner_completed=lens_inner_completed)
 
 
 def _independent_rear_material_reference(image,side,edge,source):
@@ -827,7 +915,6 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
             if complete_landmarks:
                 rear_proof[side]['side_geometry_sha256']=digest(companions[side])
         proof['rear_plastic_materials']=rear_proof
-        if rim.sum()>=30:materials.append(('rear_perimeter',rim,[max(6,h*.012),max(2,w*.004)]));remaining &= ~rim
         try:
             panel,panel_proof=rear_panel(image)
         except ValueError as error:
@@ -839,6 +926,12 @@ def propose_job(source,face,folder,companions=None,landmarks=None,protection_pol
                 if np.count_nonzero(verified_rim & (a[...,3]>=240))>=100:
                     save_mask(folder/'rear_perimeter-provisional.png',verified_rim)
             raise
+        # Any thin aluminum gap below the inset rear glass panel belongs to the
+        # bottom rear_perimeter frame, not to the upper camera_surround plateau.
+        bottom_gap=remaining&~rim&~panel&(yy>panel_proof['bounds'][3])
+        if bottom_gap.any():
+            rim=rim|bottom_gap
+        if rim.sum()>=30:materials.append(('rear_perimeter',rim,[max(6,h*.012),max(2,w*.004)]));remaining &= ~rim
         proof['rear_panel']=panel_proof
         from .rear_lighting_features import dark_rear_mark
         mark,mark_proof=dark_rear_mark(a,panel&~label_fit)

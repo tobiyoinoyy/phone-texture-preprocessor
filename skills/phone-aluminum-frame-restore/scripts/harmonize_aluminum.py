@@ -1010,6 +1010,12 @@ def process_view(item, target, defaults):
         from phone_texture.rear_rim_spots import correct as share_rim_light
         metal = domain_masks['rear_perimeter']
         plateau = (item.get('rear_shadow_correction') or {}).get('flat_core_bounds')
+        if plateau is None and item.get('camera_metal_layout') == 'triple' and 'camera_surround' in domain_masks:
+            from phone_texture.rear_shadow import _plateau_core, InsufficientRearShadowEvidence
+            try:
+                plateau, _ = _plateau_core(lab[..., 0])
+            except InsufficientRearShadowEvidence:
+                plateau = None
         # On three-camera photos the same metal above the step can straddle
         # both domain masks. The measured step excludes the bevel below it.
         if plateau and 'camera_surround' in domain_masks:

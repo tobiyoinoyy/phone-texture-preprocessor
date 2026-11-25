@@ -168,12 +168,14 @@ def run(job_path):
         for chain in paired:
             arc=chain['arc'];ss=np.linspace(0,arc[-1],192);samples=[];derivatives=[]
             metric_valid=np.ones(len(ss),bool)
+            visible_joint=np.ones(len(ss),bool)
             for side in chain['sides']:
                 p,n=resample_side(side,arc,ss);step=job.get('derivative_step_units',.015)*side['px_per_unit']
                 values=sample(low[side['name']],p)
                 derivative=(sample(low[side['name']],p+n*step)-values)/job.get('derivative_step_units',.015)
                 samples.append(values);derivatives.append(derivative)
                 metric_valid &= sample(weights[side['name']][...,None],p)[:,0]>.98
+                visible_joint &= sample((originals[side['name']][...,3]>0).astype(float)[...,None],p)[:,0]>.98
             target=(samples[0]+samples[1])/2
             desired=[(derivatives[0]-derivatives[1])/2,(derivatives[1]-derivatives[0])/2]
             for k,side in enumerate(chain['sides']):
@@ -189,8 +191,22 @@ def run(job_path):
                 fields[side['name']]+=field;bands[side['name']]|=mask
             before=np.linalg.norm(samples[0]-samples[1],axis=-1)[metric_valid]
             if not len(before):raise ValueError('Seam contains no jointly editable samples')
-            if metric_valid.mean() < job.get('minimum_joint_coverage',0):
-                raise ValueError('UV seam lacks required jointly editable material coverage')
+            min_cov=job.get('minimum_joint_coverage',0)
+            coverage=float(metric_valid.mean())
+            if coverage < min_cov:
+                # A photographed rounded-bevel corner can curve 1-3 px inside the
+                # model UV seam's outermost terminal tip (alpha=0), leaving all
+                # visible pixels 100% editable. Allow only a short contiguous
+                # terminal transparent tip (<=8% of the seam); any non-editable
+                # visible pixel or interior transparent gap still fails closed.
+                nonvis=np.flatnonzero(~visible_joint)
+                terminal_only=bool(len(nonvis)) and all(
+                    (i < len(ss)//2 and np.all(~visible_joint[:i+1])) or
+                    (i >= len(ss)//2 and np.all(~visible_joint[i:]))
+                    for i in nonvis)
+                vis_cov=float(metric_valid[visible_joint].mean()) if visible_joint.any() else 0.
+                if not (terminal_only and float(visible_joint.mean()) >= .92 and vis_cov >= min_cov):
+                    raise ValueError('UV seam lacks required jointly editable material coverage')
             info.append({'pair':chain['names'],'edge_ids':chain['edges'],'before_mean_deltaE76':float(before.mean()),'before_p95_deltaE76':float(np.quantile(before,.95)),
                          'metric_samples':int(metric_valid.sum()),'total_samples':len(ss),
                          'joint_coverage':float(metric_valid.mean()),'width_pixels':{s['name']:job.get('width_units',.20)*s['px_per_unit']for s in chain['sides']}})

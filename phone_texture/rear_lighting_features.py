@@ -18,32 +18,51 @@ def dark_rear_mark(a, panel):
                usage='illumination_fit_exclusion_only',pixel_protection=False)
     if search.sum()<100:return empty,dict(proof,reason='insufficient_panel')
     gray=cv2.cvtColor(a[...,:3],cv2.COLOR_RGB2GRAY).astype(float)
-    background=float(np.percentile(gray[search],70));readings=[]
-    for deficit in (15,25,35):
-        dark=(gray<background-deficit)&search
-        n,labels,stats,centres=cv2.connectedComponentsWithStats(dark.astype('uint8'),8)
-        bodies=[]
-        for i in range(1,n):
-            x,y,bw,bh,area=map(int,stats[i]);cx,cy=centres[i]
-            if (.12*w<bw<.28*w and .065*h<bh<.13*h and
-                    .45<area/(bw*bh)<.9 and .38*w<cx<.62*w):
-                bodies.append(i)
-        if len(bodies)!=1:return empty,dict(proof,reason='no_unique_high_contrast_body')
-        i=bodies[0];x,y,bw,bh,_=map(int,stats[i]);leaves=[]
-        for k in range(1,n):
-            lx,ly,lw,lh,area=map(int,stats[k]);cx,cy=centres[k]
-            if (k!=i and x+bw*.25<cx<x+bw*.85 and y-bh*.55<cy<y and
-                    .10*bw<lw<.4*bw and .10*bh<lh<.4*bh and area>20):
-                leaves.append(k)
-        if len(leaves)!=1:return empty,dict(proof,reason='no_unique_leaf')
-        readings.append((labels==i)|(labels==leaves[0]))
-    intersection=np.logical_and.reduce(readings);union=np.logical_or.reduce(readings)
-    agreement=float(intersection.sum()/max(1,union.sum()))
-    if agreement<.94:return empty,dict(proof,reason='unstable_material_boundary',agreement=agreement)
-    # Include the observed sensor transition, without freezing the emblem.
-    margin=max(2,int(round(w*.002)))
-    mark=ndimage.binary_dilation(union,iterations=margin)&panel
-    ys,xs=np.nonzero(mark)
-    return mark,dict(proof,detected=True,agreement=agreement,pixels=int(mark.sum()),
-                     bounds=[int(xs.min()),int(ys.min()),int(xs.max()+1),int(ys.max()+1)],
-                     source_background_gray=background,threshold_deficits=[15,25,35])
+    background=float(np.percentile(gray[search],70))
+    last_reason='no_unique_high_contrast_body'
+    last_agreement=None
+    # Try the high-contrast trio first; on darker anodized backs (e.g. deep
+    # blue where background ~70-86 and emblem ~37-44), bg-35 falls at or below
+    # the emblem floor. Narrower deficit trios still require >=24 gray contrast,
+    # unique body + leaf across all three thresholds, and >=0.94 IoU agreement.
+    for deficits,min_contrast in (((15,25,35),0.0),((15,20,25),24.0),((10,15,20),24.0)):
+        readings=[];failed=None
+        for deficit in deficits:
+            dark=(gray<background-deficit)&search
+            n,labels,stats,centres=cv2.connectedComponentsWithStats(dark.astype('uint8'),8)
+            bodies=[]
+            for i in range(1,n):
+                x,y,bw,bh,area=map(int,stats[i]);cx,cy=centres[i]
+                if (.12*w<bw<.28*w and .065*h<bh<.13*h and
+                        .45<area/(bw*bh)<.9 and .38*w<cx<.62*w):
+                    bodies.append(i)
+            if len(bodies)!=1:failed='no_unique_high_contrast_body';break
+            i=bodies[0];x,y,bw,bh,_=map(int,stats[i]);leaves=[]
+            for k in range(1,n):
+                lx,ly,lw,lh,area=map(int,stats[k]);cx,cy=centres[k]
+                if (k!=i and x+bw*.25<cx<x+bw*.85 and y-bh*.55<cy<y and
+                        .10*bw<lw<.4*bw and .10*bh<lh<.4*bh and area>20):
+                    leaves.append(k)
+            if len(leaves)!=1:failed='no_unique_leaf';break
+            readings.append((labels==i)|(labels==leaves[0]))
+        if failed is not None:
+            if deficits==(15,25,35):last_reason=failed
+            continue
+        intersection=np.logical_and.reduce(readings);union=np.logical_or.reduce(readings)
+        agreement=float(intersection.sum()/max(1,union.sum()))
+        if agreement<.94:
+            if deficits==(15,25,35):last_reason='unstable_material_boundary';last_agreement=agreement
+            continue
+        contrast=background-float(np.median(gray[intersection]))
+        if contrast<min_contrast:
+            continue
+        # Include the observed sensor transition, without freezing the emblem.
+        margin=max(2,int(round(w*.002)))
+        mark=ndimage.binary_dilation(union,iterations=margin)&panel
+        ys,xs=np.nonzero(mark)
+        return mark,dict(proof,detected=True,agreement=agreement,pixels=int(mark.sum()),
+                         bounds=[int(xs.min()),int(ys.min()),int(xs.max()+1),int(ys.max()+1)],
+                         source_background_gray=background,threshold_deficits=list(deficits),
+                         emblem_contrast_gray=float(contrast))
+    extra=dict(agreement=last_agreement) if last_agreement is not None else {}
+    return empty,dict(proof,reason=last_reason,**extra)

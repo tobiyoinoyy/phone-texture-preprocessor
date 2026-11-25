@@ -73,27 +73,31 @@ def antenna_rows(image,x_range,expected_width=None,require_full_span=False):
                     continue
                 break
             else:
-                if weak is None:
-                    for score,lo,hi in pairs:
-                        candidate=result.copy()
-                        candidate[2*band:2*band+2]=[lo,hi]
-                        try:
-                            _,gate_proof=trace_boundaries(image,candidate,bands=(band,),recover_center=True)
-                        except ValueError:
-                            continue
-                        # Recover the measured central strip, not a wider
-                        # reflection sharing only one of its two boundaries.
-                        dominant=pairs[0][1:3]
-                        if max(abs(lo-dominant[0]),abs(hi-dominant[1]))>2.5:
-                            continue
-                        recovered_center=True
-                        if gate_proof['endpoint_shape_review_required']:
-                            weak=(score,lo,hi,candidate)
+                chosen_recovered=None
+                for score,lo,hi in pairs:
+                    # Recover the measured central strip, not a wider
+                    # reflection sharing only one of its two boundaries.
+                    dominant=pairs[0][1:3]
+                    if max(abs(lo-dominant[0]),abs(hi-dominant[1]))>2.5:
+                        continue
+                    candidate=result.copy()
+                    candidate[2*band:2*band+2]=[lo,hi]
+                    try:
+                        _,gate_proof=trace_boundaries(image,candidate,bands=(band,),recover_center=True)
+                    except ValueError:
+                        continue
+                    if not gate_proof['endpoint_shape_review_required'] or weak is None:
+                        chosen_recovered=(score,lo,hi,candidate,gate_proof['endpoint_shape_review_required'])
                         break
-                    else:
-                        raise first_error
-                else:
+                if chosen_recovered is not None:
+                    score,lo,hi,candidate,is_weak=chosen_recovered
+                    recovered_center=True
+                    if is_weak:
+                        weak=(score,lo,hi,candidate)
+                elif weak is not None:
                     score,lo,hi,candidate=weak
+                else:
+                    raise first_error
             result=candidate;signs[2*band:2*band+2]=[int(np.sign(g[lo])),int(np.sign(g[hi]))]
             scores[band]=float(score)
             selection.append(dict(band=band,rows=[lo,hi],rejected_candidates=rejected,

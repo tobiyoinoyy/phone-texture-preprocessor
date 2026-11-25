@@ -155,7 +155,7 @@ def _continuity_candidate(error, job, path, face, source, scope, allowed, paper,
         return re.fullmatch(
             r'Lighting (?:pixel )?correction discontinuity at '
             r'(?:antenna_[01]_(?:left|right)_metal|rear_button_(?:left|right)_[0-9]+|'
-            r'rear_upper_join_(?:left|center|right)): [0-9.]+ L',
+            r'rear_upper_join_(?:left|center|right)|side_metal_fragment_[0-9]+): [0-9.]+ L',
             str(failure))
     if profile != NAME or face not in ('left', 'right', 'back') or not local_step(error):
         raise error

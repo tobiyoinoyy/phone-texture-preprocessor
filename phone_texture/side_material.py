@@ -365,6 +365,7 @@ def _resolve_hardware_conflicts(image,face,candidates,original_error):
         error=ValueError('Ambiguous crossing side hardware contours')
         error.hardware_contour_conflict=dict(original_conflict,
             independent_disambiguation=dict(review,accepted=False,reason=reason))
+        error.resolved_hardware=list(unchanged)
         if cause is None:raise error
         raise error from cause
 
@@ -476,12 +477,63 @@ def hardware_materials(image, face):
         return certified[0]
 
 
+def _is_truncated_dark_control(a, box):
+    """Detect a false internal cap cutting through a dark sapphire control.
+
+    A specular streak across a dark camera-control surface can close a Canny
+    contour prematurely, leaving the remaining dark sapphire outside the cap
+    exposed to bright metal lighting. Reject only when the interior is clearly
+    darker than the flanking rail metal AND the pixels just past a cap remain
+    at the same dark interior luminance rather than returning to rail metal.
+    """
+    h, w = a.shape[:2]
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    cx = (x0 + x1) // 2
+    half = max(2, bw // 4)
+    cols = slice(max(0, cx - half), min(w, cx + half + 1))
+    l_cols = slice(max(0, int(w * .18)), max(1, int(w * .27)))
+    r_cols = slice(min(w - 1, int(w * .73)), min(w, int(w * .82)))
+    lum = a[..., :3].astype(float) @ np.array([.299, .587, .114])
+    mid_rows = slice(y0 + bh // 4, y1 - bh // 4)
+    if mid_rows.stop <= mid_rows.start:
+        return False
+    inside = float(np.median(lum[mid_rows, cols]))
+    flank = float(np.median(np.r_[lum[mid_rows, l_cols].ravel(), lum[mid_rows, r_cols].ravel()]))
+    contrast = flank - inside
+    if contrast < 10.:
+        return False
+    # Check 6..18 px past both top and bottom caps (skipping the 1..5 px rim/bezel).
+    for cap_slice in (slice(max(0, y0 - 18), max(0, y0 - 5)),
+                      slice(min(h, y1 + 5), min(h, y1 + 18))):
+        if cap_slice.stop - cap_slice.start < 6:
+            continue
+        if np.any(a[cap_slice, cols, 3] < 240):
+            continue
+        cap_lum = float(np.median(lum[cap_slice, cols]))
+        cap_flank = float(np.median(np.r_[lum[cap_slice, l_cols].ravel(), lum[cap_slice, r_cols].ravel()]))
+        if cap_flank - cap_lum >= max(10., contrast * .65) and abs(cap_lum - inside) <= max(6., contrast * .35):
+            return True
+    return False
+
+
 def lighting_hardware(image, face):
     """A lighting domain does not require certifying every button boundary."""
     try:
         return hardware_materials(image,face), None
     except ValueError as error:
-        return _hardware_materials(image,face,lighting_only=True), str(error)
+        controls = _hardware_materials(image,face,lighting_only=True)
+        if face == 'right' and len(controls) < 2:
+            from .side_control_material import filled_control
+            min_y = (controls[0][1]['box'][3] + 1) if len(controls) == 1 else int(image.height * .45)
+            filled = filled_control(image, min_y, channel_witnesses=True, lighting_only=True)
+            for mask, proof in filled:
+                if not any(np.any(mask & existing) for existing, _ in controls):
+                    controls.append((mask, proof))
+                    if len(controls) >= 2:
+                        break
+            controls.sort(key=lambda item: item[1]['box'][1])
+        return controls, str(error)
 
 
 def _hardware_materials(image, face, gray=None, *, lighting_only=False):
@@ -547,6 +599,8 @@ def _hardware_materials(image, face, gray=None, *, lighting_only=False):
                 # failure. Refine only the localization of a complete capsule.
                 if min(support)<.75:continue
                 (blemished if blemish_corner else refinements).append((mask,entry));continue
+            if face == 'right' and entry['box'][1] > h * .48 and _is_truncated_dark_control(a, entry['box']):
+                continue
             candidates.append((mask,entry))
     for mask,proof in sorted(refinements,key=lambda item:item[1]['pixels'],reverse=True):
         # An independently supported original contour takes precedence. Do
@@ -556,19 +610,21 @@ def _hardware_materials(image, face, gray=None, *, lighting_only=False):
         refined=refine_capsule_boundary(distance,a[...,3],[x,y,x1-x,y1-y],mask,max(1.5,w*.015))
         if refined is None:continue
         mask,new_proof=refined;proof=dict(proof,**new_proof);proof['pixels']=int(mask.sum())
+        if face == 'right' and proof['box'][1] > h * .48 and _is_truncated_dark_control(a, proof['box']):
+            continue
         candidates.append((mask,proof))
     if lighting_only:
-        # Pick one photographed outer contour per co-located control. When
-        # the candidates cross substantially, the rail's broad light field
-        # can pass over it without declaring a separate material or moving it.
+        # Pick one photographed outer contour per co-located control. Drop only
+        # a conflicting group rather than discarding unrelated valid buttons.
         controls=[]
         for group in _hardware_candidate_groups(candidates):
             outer,proof=max((candidates[i] for i in group),key=lambda item:item[1]['pixels'])
             if all(np.count_nonzero(candidates[i][0]&outer)>=.90*candidates[i][0].sum()
                    for i in group):
                 controls.append((outer,dict(proof,lighting_only_candidates=len(group))))
-        return sorted(controls,key=lambda item:item[1]['box'][1]) if not any(
-            (a[0]&b[0]).any() for i,a in enumerate(controls) for b in controls[i+1:]) else []
+        non_overlapping=[entry for i,entry in enumerate(controls)
+                         if not any((entry[0]&other[0]).any() for j,other in enumerate(controls) if j!=i)]
+        return sorted(non_overlapping,key=lambda item:item[1]['box'][1])
     # Keep complete outer contours ahead of nested grooves. Resolve an old
     # conflict only with a unique, independently certified source material.
     try:

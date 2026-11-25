@@ -143,16 +143,131 @@ def _calibrate_top(rgba, raw_rgb, exposed_lower=False, *, allow_taper=False):
         camera_policy='exclude_entire_camera_island_and_lenses', agent_required=False)
 
 
-def _exposed_lower_rail(alpha, raw_rgb, x0, x1, gradients):
-    """Measure the visible lower plateau instead of extrapolating its corner.
+def trim_top_side_button(rgba, raw_rgb):
+    """Trim a narrow mid-height side-button protrusion at an extreme top-rail end.
 
-    Rounded ends keep their original alpha. Both end bands must independently
-    support a straight edge in held-out alpha samples and original RGB; the
-    central stand is never sampled. No outliers or missing bands are filled.
+    A mildly yawed top capture can expose a side button protruding 5..25 px past
+    the rounded endcap. Only a thin extreme-end tab strictly nested inside the
+    adjacent rail's vertical span with a sharp step into the rounded body and
+    raw RGB edge support at the shoulder is removed.
     """
+    if raw_rgb is None or raw_rgb.shape != rgba[..., :3].shape:
+        return rgba, None
+    alpha = rgba[..., 3]
+    labels, count = ndimage.label(alpha >= 128)
+    if not count:
+        return rgba, None
+    sizes = np.bincount(labels.ravel()); sizes[0] = 0
+    mask = labels == sizes.argmax()
+    _, xs = np.nonzero(mask)
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
     width = x1 - x0
-    groups = [np.arange(int(x0 + lo*width), int(x0 + hi*width))
-              for lo, hi in ((.05, .12), (.88, .95))]
+    if width < 350:
+        return rgba, None
+    col_h = mask[:, x0:x1].sum(axis=0)
+    col_top = np.argmax(mask[:, x0:x1], axis=0)
+    col_bot = len(mask) - np.argmax(mask[::-1, x0:x1], axis=0)
+    max_tab = max(8, int(.025 * width))
+    gx = np.linalg.norm(
+        np.gradient(ndimage.gaussian_filter1d(raw_rgb.astype(np.float32), .8, axis=1), axis=1),
+        axis=2,
+    )
+    out = None
+    trimmed = []
+    for side, is_left in (('left', True), ('right', False)):
+        if is_left:
+            ref_sl = slice(int(.04 * width), int(.08 * width))
+            bt = float(np.median(col_h[ref_sl]))
+            if bt < 30:
+                continue
+            raw_tab = int(np.argmax(col_h >= .58 * bt))
+            if not (4 <= raw_tab <= max_tab):
+                continue
+            tab_med = float(np.median(col_h[:raw_tab]))
+            # Stop right where the height jumps sharply into the rounded endcap.
+            jump = int(np.argmax(col_h[:min(width, raw_tab + 4)] >= max(tab_med + 12.0, .50 * bt)))
+            tab = jump if jump >= 4 else raw_tab
+            # Step 1px past a single dark shadow-crease column if top/bot barely widened.
+            if tab + 1 < width and col_h[tab] < .58 * bt and (col_h[tab] - tab_med) < 20.0:
+                tab += 1
+            tab_cols = np.arange(0, tab)
+            body_cols = np.arange(tab + 2, min(width, tab + max(12, int(.03 * width))))
+            cut_x = x0 + tab
+        else:
+            ref_sl = slice(int(.92 * width), int(.96 * width))
+            bt = float(np.median(col_h[ref_sl]))
+            if bt < 30:
+                continue
+            rev_h = col_h[::-1]
+            raw_tab = int(np.argmax(rev_h >= .58 * bt))
+            if not (4 <= raw_tab <= max_tab):
+                continue
+            tab_med = float(np.median(rev_h[:raw_tab]))
+            jump = int(np.argmax(rev_h[:min(width, raw_tab + 4)] >= max(tab_med + 12.0, .50 * bt)))
+            tab = jump if jump >= 4 else raw_tab
+            if tab + 1 < width and rev_h[tab] < .58 * bt and (rev_h[tab] - tab_med) < 20.0:
+                tab += 1
+            tab_cols = np.arange(width - tab, width)
+            body_cols = np.arange(max(0, width - tab - max(12, int(.03 * width))), width - tab - 2)
+            cut_x = x1 - tab
+        if len(body_cols) < 6:
+            continue
+        body_top = float(np.median(col_top[body_cols]))
+        body_bot = float(np.median(col_bot[body_cols]))
+        body_span = body_bot - body_top
+        if body_span < 30:
+            continue
+        # The side button sits mid-height, strictly nested inside the rounded body rail.
+        if (np.median(col_top[tab_cols]) < body_top + .10 * body_span or
+                np.median(col_bot[tab_cols]) > body_bot - .10 * body_span):
+            continue
+        # Verify an abrupt vertical jump into the rounded endcap and raw RGB edge support.
+        shoulder = col_h[tab:min(width, tab + 5)] if is_left else col_h[max(0, width - tab - 5):width - tab]
+        if float(np.max(shoulder) - np.median(col_h[tab_cols])) < 15:
+            continue
+        ys_mid = np.arange(int(np.min(col_top[tab_cols])), int(np.max(col_bot[tab_cols])))
+        if not len(ys_mid):
+            continue
+        # If BiRefNet bridged a bright studio background slit between the button
+        # and the darker curved endcap, step just past that bright slit peak.
+        inner_body = np.arange(min(width - 1, tab + 8), min(width, tab + 16)) if is_left else np.arange(max(0, width - tab - 16), max(1, width - tab - 8))
+        if len(inner_body):
+            body_x = x0 + inner_body
+            body_end_gray = float(raw_rgb[ys_mid[:, None], body_x[None, :]].mean())
+            slit_span = np.arange(cut_x, min(x1 - 1, cut_x + 6)) if is_left else np.arange(max(x0 + 1, cut_x - 6), cut_x)
+            if len(slit_span):
+                slit_gray = raw_rgb[ys_mid[:, None], slit_span[None, :]].mean(axis=(0, 2))
+                bright = np.flatnonzero((slit_gray > 165.0) & (slit_gray > body_end_gray + 30.0))
+                if len(bright):
+                    if is_left:
+                        cut_x = int(slit_span[bright[-1]]) + 1
+                        tab = cut_x - x0
+                    else:
+                        cut_x = int(slit_span[bright[0]])
+                        tab = x1 - cut_x
+                    if tab > max_tab + 6:
+                        continue
+        xs_win = np.clip(cut_x + np.arange(-3, 4), 0, rgba.shape[1] - 1)
+        rgb_support = float((gx[ys_mid[:, None], xs_win[None, :]].max(axis=1) > 3).mean())
+        if rgb_support < .6:
+            continue
+        if out is None:
+            out = rgba.copy()
+        if is_left:
+            out[:, :cut_x, 3] = 0
+        else:
+            out[:, cut_x:, 3] = 0
+        trimmed.append(dict(side=side, trimmed_width_px=int(tab), cut_x=int(cut_x),
+                            tab_median_height_px=float(np.median(col_h[tab_cols])),
+                            body_thickness_px=float(bt), shoulder_rgb_support=rgb_support))
+    if not trimmed:
+        return rgba, None
+    return out, dict(method='top_extreme_end_side_button_trim_v1', trimmed_ends=trimmed)
+
+
+def _fit_exposed_lower_bands(alpha, x0, x1, gradients, band_pair):
+    width = x1 - x0
+    groups = [np.arange(int(x0 + lo * width), int(x0 + hi * width)) for lo, hi in band_pair]
     xx = np.concatenate(groups)
     training = np.concatenate([np.arange(len(g)) % 3 != 0 for g in groups])
     endpoints = np.array([x0 + .5, x1 - .5])
@@ -166,39 +281,78 @@ def _exposed_lower_rail(alpha, raw_rgb, x0, x1, gradients):
         if not mask[:, xx].any(axis=0).all():
             raise TopCalibrationError('TOP_LOWER_PLATEAU_NOT_VISIBLE')
         yy = len(mask) - np.argmax(mask[::-1, xx], axis=0)
-        line = np.polyfit(xx[training]+.5, yy[training], 1)
-        error = abs(np.polyval(line, xx+.5) - yy)
+        line = np.polyfit(xx[training] + .5, yy[training], 1)
+        error = abs(np.polyval(line, xx + .5) - yy)
         proofs = []
-        for indices in (np.arange(len(groups[0])), np.arange(len(groups[0]),len(xx))):
+        for indices in (np.arange(len(groups[0])), np.arange(len(groups[0]), len(xx))):
             train_error = float(np.percentile(error[indices[training[indices]]], 95))
             held_error = float(np.percentile(error[indices[~training[indices]]], 95))
             if train_error > 1.5 or held_error > 2:
                 raise TopCalibrationError('TOP_LOWER_PLATEAU_UNSTABLE')
             proofs.append(dict(training_error_p95_px=train_error, held_out_error_p95_px=held_error))
-        estimates.append((line, yy, proofs))
-    line, yy, proofs = estimates[0]
-    spread = max(float(np.max(abs(np.polyval(other[0], endpoints)-np.polyval(line,endpoints))))
+        estimates.append((line, yy, proofs, mask))
+    line, yy, proofs, mask128 = estimates[0]
+    spread = max(float(np.max(abs(np.polyval(other[0], endpoints) - np.polyval(line, endpoints))))
                  for other in estimates[1:])
     if spread > 1.5:
         raise TopCalibrationError('TOP_LOWER_PLATEAU_ALPHA_UNSTABLE')
-    rows = np.clip(yy[:,None]+np.arange(-3,4), 0, alpha.shape[0]-1)
-    strength = gradients[rows,xx[:,None]]
-    peak = np.argmax(strength,axis=1)
-    valid = (strength.max(axis=1)>3)&(peak>0)&(peak<6)
-    for indices in (np.arange(len(groups[0])), np.arange(len(groups[0]),len(xx))):
+    rows = np.clip(yy[:, None] + np.arange(-3, 4), 0, alpha.shape[0] - 1)
+    strength = gradients[rows, xx[:, None]]
+    peak = np.argmax(strength, axis=1)
+    valid = (strength.max(axis=1) > 3) & (peak > 0) & (peak < 6)
+    for indices in (np.arange(len(groups[0])), np.arange(len(groups[0]), len(xx))):
         if valid[indices].mean() < .8:
             raise TopCalibrationError('TOP_LOWER_PLATEAU_RGB_UNSUPPORTED')
-    rgb_y = rows[np.arange(len(xx)),peak] + .5
-    rgb_line = np.polyfit(xx[valid]+.5, rgb_y[valid], 1)
-    rgb_error = float(np.percentile(abs(np.polyval(rgb_line,xx[valid]+.5)-rgb_y[valid]),95))
-    discrepancy = float(np.max(abs(np.polyval(rgb_line,endpoints)-np.polyval(line,endpoints))))
+    rgb_y = rows[np.arange(len(xx)), peak] + .5
+    rgb_line = np.polyfit(xx[valid] + .5, rgb_y[valid], 1)
+    rgb_error = float(np.percentile(abs(np.polyval(rgb_line, xx[valid] + .5) - rgb_y[valid]), 95))
+    discrepancy = float(np.max(abs(np.polyval(rgb_line, endpoints) - np.polyval(line, endpoints))))
     if rgb_error > 2 or discrepancy > 2:
         raise TopCalibrationError('TOP_LOWER_PLATEAU_RGB_DISAGREES')
-    return line, dict(method='two_exposed_lower_plateaus_with_heldout_alpha_and_RGB',
-        bands_xy=[[int(g[0]),int(g[-1])+1] for g in groups], end_checks=proofs,
+    return line, mask128, dict(method='two_exposed_lower_plateaus_with_heldout_alpha_and_RGB',
+        bands_xy=[[int(g[0]), int(g[-1]) + 1] for g in groups], end_checks=proofs,
         alpha_threshold_spread_px=spread, raw_rgb_support_fraction=float(valid.mean()),
         raw_rgb_residual_p95_px=rgb_error, raw_rgb_alpha_discrepancy_px=discrepancy,
         lower_rail=line.tolist(), corner_alpha_reconstructed=False)
+
+
+def _exposed_lower_rail(alpha, raw_rgb, x0, x1, gradients):
+    """Measure the visible lower plateau instead of extrapolating its corner.
+
+    Rounded ends keep their original alpha. Both end bands must independently
+    support a straight edge in held-out alpha samples and original RGB; the
+    central stand is never sampled. No outliers or missing bands are filled.
+    """
+    default_pair = ((.05, .12), (.88, .95))
+    try:
+        line, _, evidence = _fit_exposed_lower_bands(alpha, x0, x1, gradients, default_pair)
+        return line, evidence
+    except TopCalibrationError as original:
+        if str(original) != 'TOP_LOWER_PLATEAU_UNSTABLE':
+            raise
+    width = x1 - x0
+    # When a small localized dent sits inside one default end band, test an
+    # adjacent stand-free inward band while verifying the skipped outer band
+    # stays within a small dent bound (<= 4 px, rejecting stand projections).
+    for alt_pair, skipped in (
+        (((.05, .12), (.82, .89)), (.88, .95)),
+        (((.11, .18), (.88, .95)), (.05, .12)),
+    ):
+        try:
+            line, mask128, evidence = _fit_exposed_lower_bands(alpha, x0, x1, gradients, alt_pair)
+        except TopCalibrationError:
+            continue
+        sx = np.arange(int(x0 + skipped[0] * width), int(x0 + skipped[1] * width))
+        if not len(sx) or not mask128[:, sx].any(axis=0).all():
+            continue
+        sy = len(mask128) - np.argmax(mask128[::-1, sx], axis=0)
+        excursion = float(np.percentile(np.abs(sy - np.polyval(line, sx + .5)), 95))
+        if excursion > 4.0:
+            continue
+        evidence['fallback_avoided_outer_band'] = [int(sx[0]), int(sx[-1]) + 1]
+        evidence['skipped_outer_band_excursion_p95_px'] = excursion
+        return line, evidence
+    raise TopCalibrationError('TOP_LOWER_PLATEAU_UNSTABLE')
 
 
 def calibrate_top(rgba, raw_rgb):

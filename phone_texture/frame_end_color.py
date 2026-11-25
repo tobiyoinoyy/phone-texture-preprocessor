@@ -60,10 +60,17 @@ def correct(rgba, metal):
         end = np.median(colors[near], axis=0)
         loss = reference[0] - end[0]
         tint = np.linalg.norm(reference[1:] - end[1:])
+        ref_chroma = float(np.linalg.norm(reference[1:]))
+        end_chroma = float(np.linalg.norm(end[1:]))
+        delta_e = float(np.linalg.norm(reference - end))
+        more_saturated = end_chroma > ref_chroma + 2
+        desaturated = ref_chroma >= 8. and end_chroma < ref_chroma - 2.5 and tint >= 4.0
         info = dict(end=sign, reference=reference.tolist(), before=end.tolist(),
                     reference_windows=int(stable.sum()))
         # A bright silver end with small white-balance variations is already good.
-        if loss < 7 and (tint < 7 or np.linalg.norm(end[1:]) > np.linalg.norm(reference[1:]) + 2):
+        # Catch both combined L+chroma drops (deltaE >= 5.5) and desaturated
+        # coloured tips (e.g. deep-blue ends turning gray) before skipping.
+        if loss < 4.8 and delta_e < 5.5 and not desaturated and (tint < 5.5 or more_saturated):
             report.append(dict(info, status='within_tolerance'))
             continue
         # Require several contiguous metal observations all the way to the end.
