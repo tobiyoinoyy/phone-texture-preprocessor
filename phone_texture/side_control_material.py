@@ -135,7 +135,7 @@ def filled_control(image, minimum_y, *, channel_witnesses=False, lighting_only=F
     min_fill = .82 if lighting_only else (.85 if channel_witnesses else .98)
     max_seed_shift = 32 if lighting_only else (18 if channel_witnesses else 10)
     min_side_sup = .65 if lighting_only else .75
-    min_mean_sup = .85 if lighting_only else .95
+    min_mean_sup = .82 if lighting_only else .95
     levels = (.50,) if lighting_only else (.45,.50,.55)
     for x0,y,bw,bh in seeds:
         center=int(x0+bw/2)

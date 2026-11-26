@@ -662,6 +662,8 @@ def _hardware_materials(image, face, gray=None, *, lighting_only=False):
                 refined=refine_capsule_boundary(distance,a[...,3],[x,y,x1-x,y1-y],mask,max(1.5,w*.015))
                 if refined is None:continue
                 mask,new_proof=refined
+                if face == 'right' and new_proof['box'][1] > h * .48 and _is_truncated_dark_control(a, new_proof['box']):
+                    continue
                 if any(np.any(mask&m) for m,_ in selected):continue
                 selected.append((mask,dict(proof,**new_proof,pixels=int(mask.sum()),blemished_rim_fallback=True)))
             if len(selected)!=expected:

@@ -671,6 +671,34 @@ def _paired_rim_stripes(image, side):
     return measured
 
 
+def _pair_layout_consistent(rows, height):
+    if len(rows) != 4:
+        return False
+    u0, u1, l0, l1 = rows
+    widths = [u1 - u0, l1 - l0]
+    if min(widths) <= 0:
+        return False
+    end_difference = abs((u0 + u1) / 2.0 - (height - 1 - (l0 + l1) / 2.0))
+    return end_difference <= min(widths) and max(widths) <= 1.33 * min(widths)
+
+
+def _try_paired_detectors(image, side):
+    detectors = (
+        _paired_rim_stripes,
+        _joint_rim_stripes,
+        _section_breaks,
+        _matched_partner,
+        _matched_ridge_partner,
+        _ridge_height_and_area,
+    )
+    for detector in detectors:
+        try:
+            return detector(image, side)
+        except ValueError:
+            continue
+    return None
+
+
 def rear_antennas(image, *, refine_bands=('upper','lower'), sides=('left','right')):
     result = {}
     for side in sides:
@@ -684,43 +712,59 @@ def rear_antennas(image, *, refine_bands=('upper','lower'), sides=('left','right
                 try:
                     found = _rear_antennas(image,reflective_rim=True,refine_bands=refine_bands,sides=(side,))
                     found[side]['reference_track'] = 'dark_break_across_three_specular_ridge_tracks'
-                    result.update(found)
-                    continue
                 except ValueError:
-                    pass
-            entry = dict(rows=[], checks=[], rear_image_edge='right' if side=='left' else 'left')
-            for band in ('upper','lower'):
-                for reflective in ((False,True) if dark else (False,)):
-                    try:
-                        measured = _rear_antennas(image, reflective_rim=reflective,refine_bands=refine_bands,
-                                                   sides=(side,),bands=(band,))[side]
-                        pair, check = measured['rows'], measured['checks'][0]
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    try:
-                        pair,check = _rim_band_witnesses(image,side,band)
-                    except ValueError:
-                        # If the legacy reference is incomplete, independently
-                        # remeasure both bands on this same metal edge. Mixing
-                        # the new stripe with an unrelated old reflection can
-                        # yield a numerically precise but false rear target.
-                        detectors=(_paired_rim_stripes,_joint_rim_stripes,_section_breaks,_matched_partner,_matched_ridge_partner,_ridge_height_and_area)
-                        for detector in detectors:
-                            try:
-                                measured_bands=detector(image,side)
-                                break
-                            except ValueError:
-                                continue
-                        else:
-                            raise original from None
-                        entry['rows'] = [row for pair, _ in measured_bands for row in pair]
-                        entry['checks'] = [proof for _, proof in measured_bands]
-                        break
-                entry['rows'].extend(pair)
-                entry['checks'].append(check)
-            found = {side:entry}
+                    found = None
+            else:
+                found = None
+            if found is None:
+                entry = dict(rows=[], checks=[], rear_image_edge='right' if side=='left' else 'left')
+                for band in ('upper','lower'):
+                    for reflective in ((False,True) if dark else (False,)):
+                        try:
+                            measured = _rear_antennas(image, reflective_rim=reflective,refine_bands=refine_bands,
+                                                       sides=(side,),bands=(band,))[side]
+                            pair, check = measured['rows'], measured['checks'][0]
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        try:
+                            pair,check = _rim_band_witnesses(image,side,band)
+                        except ValueError:
+                            # If the legacy reference is incomplete, independently
+                            # remeasure both bands on this same metal edge. Mixing
+                            # the new stripe with an unrelated old reflection can
+                            # yield a numerically precise but false rear target.
+                            measured_bands = _try_paired_detectors(image, side)
+                            if measured_bands is None:
+                                raise original from None
+                            entry['rows'] = [row for pair, _ in measured_bands for row in pair]
+                            entry['checks'] = [proof for _, proof in measured_bands]
+                            break
+                    entry['rows'].extend(pair)
+                    entry['checks'].append(check)
+                found = {side:entry}
+        rows = found[side]['rows']
+        if not _pair_layout_consistent(rows, image.height):
+            # Single-band rim scans can lock an unrelated scuff/reflection on
+            # one end (e.g. 40-100px asymmetric or mismatched width). Prefer an
+            # independently paired symmetric measurement on the same rail when
+            # available; reject extreme unmatched asymmetry.
+            measured_bands = _try_paired_detectors(image, side)
+            if measured_bands is not None:
+                found = {
+                    side: dict(
+                        rows=[row for pair, _ in measured_bands for row in pair],
+                        checks=[proof for _, proof in measured_bands],
+                        rear_image_edge='right' if side == 'left' else 'left',
+                    )
+                }
+            else:
+                u0, u1, l0, l1 = rows
+                widths = [u1 - u0, l1 - l0]
+                end_diff = abs((u0 + u1) / 2.0 - (image.height - 1 - (l0 + l1) / 2.0))
+                if min(widths) <= 0 or max(widths) > 1.33 * min(widths) or end_diff > max(45.0, 0.025 * image.height):
+                    raise ValueError('Rear rim antenna pair is inconsistent with opposite ends of the same rail')
         result.update(found)
     return result
 

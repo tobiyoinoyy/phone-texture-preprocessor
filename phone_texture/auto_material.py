@@ -34,18 +34,52 @@ def seeded_paper(a,face,resolve_end=True):
     """
     h,w=a.shape[:2];rgb=a[...,:3];gray=cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
     if face=='back':
-        start=int(h*.55);ok,points=cv2.QRCodeDetector().detect(rgb[start:])
-        x_offset=0
-        if not ok:
-            # QR finder on a bounded central crop avoids a pale camera/body
-            # texture confusing the full-frame detector. It still measures
-            # the current printed quadrilateral, without stored label boxes.
-            x_offset=int(w*.2);start=int(h*.65)
-            ok,points=cv2.QRCodeDetector().detect(gray[start:,x_offset:int(w*.8)])
-        if not ok:return None,None
-        q=points.reshape(-1,2);q[:,1]+=start;q[:,0]+=x_offset
+        def _valid_qr_quad(quad):
+            qx0,qy0=quad.min(axis=0);qx1,qy1=quad.max(axis=0)
+            bw,bh=float(qx1-qx0),float(qy1-qy0)
+            scale=max(bw,bh)
+            if not (.02*w<scale<.25*w and min(bw,bh)>0):
+                return False
+            if not (.72<=bw/bh<=1.38):
+                return False
+            edges=[float(np.linalg.norm(quad[(i+1)%4]-quad[i])) for i in range(4)]
+            if min(edges)<=0 or max(edges)>1.45*min(edges):
+                return False
+            area=float(cv2.contourArea(quad.astype(np.float32)))
+            if area<.68*bw*bh:
+                return False
+            sub=gray[max(0,int(qy0)):min(h,int(qy1)+1),max(0,int(qx0)):min(w,int(qx1)+1)]
+            if sub.size<16 or sub.shape[1]<4:
+                return False
+            mid=sub.shape[1]//2
+            ink_thr=min(140.,float(np.percentile(sub,85))-20.)
+            if min(float((sub[:,:mid]<ink_thr).mean()),float((sub[:,mid:]<ink_thr).mean()))<.05:
+                return False
+            return True
+
+        detector=cv2.QRCodeDetector()
+        q=None
+        x_mid0,x_mid1=int(w*.2),int(w*.8)
+        y55,y65=int(h*.55),int(h*.65)
+        qr_attempts=[
+            (rgb[y55:],0,y55),
+            (gray[y65:,x_mid0:x_mid1],x_mid0,y65),
+            (cv2.adaptiveThreshold(gray[y65:,x_mid0:x_mid1],255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,10),x_mid0,y65),
+            (cv2.adaptiveThreshold(gray[y55:],255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,10),0,y55),
+        ]
+        for crop_img,x_off,y_off in qr_attempts:
+            if crop_img.size==0:
+                continue
+            ok,points=detector.detect(crop_img)
+            if not ok or points is None:
+                continue
+            cand=points.reshape(-1,2).copy()
+            cand[:,0]+=x_off;cand[:,1]+=y_off
+            if _valid_qr_quad(cand):
+                q=cand
+                break
+        if q is None:return None,None
         qx0,qy0=q.min(axis=0);qx1,qy1=q.max(axis=0);scale=max(qx1-qx0,qy1-qy0)
-        if not .02*w<scale<.25*w:return None,None
         x0=max(0,int(qx0-.8*scale));x1=min(w,int(qx1+.8*scale))
         y0=max(int(h*.55),int(qy0-1.7*scale));y1=h
         seed_box=[int(qx0),int(qy0),int(qx1)+1,int(qy1)+1]
@@ -654,9 +688,11 @@ def rear_camera_glass(a, remaining):
     n,labels,stats,_=cv2.connectedComponentsWithStats(dark.astype(np.uint8),8)
     glass=np.zeros((h,w),bool)
     interior=ndimage.binary_erosion(a[...,3]>=240,border_value=0)
-    accepted=[];outer_fragments=[];shadow_arcs=[]
+    accepted=[];outer_fragments=[];shadow_arcs=[];oversized_dark_merged=False
     for i in range(1,n):
         x,y,bw,bh,area=map(int,stats[i])
+        if (bw>=.35*w or bh>=.35*w) and area>.02*w*w:
+            oversized_dark_merged=True
         if .025*w<bw<.35*w and .025*w<bh<.35*w and .5<bw/max(1,bh)<2 and area>40:
             component=ndimage.binary_fill_holes(labels==i)
             outer=int(np.count_nonzero(component&~interior))
@@ -673,6 +709,39 @@ def rear_camera_glass(a, remaining):
                 shadow_arcs.append(dict(evidence,source_box_occupancy=occupancy))
                 continue
             glass|=component;accepted.append(evidence)
+    # On underexposed dark-anodized backs (e.g. deep blue where plateau metal
+    # sits near 30-45 gray and p15 < 35), the 35-gray floor can merge plateau
+    # metal with dark lens disks into one oversized component (>0.35*w).
+    # Re-separate remaining compact dark lens disks using strictly lower
+    # source thresholds without absorbing shadow arcs or plateau metal.
+    dark_metal_recovered=[]
+    if oversized_dark_merged and p15 < 35.:
+        for sub_thr in (14., 20., 26.):
+            if sub_thr >= max(35., p15):
+                continue
+            dark_sub=(gray<sub_thr)&remaining&upper&~glass
+            ns,labels_s,stats_s,_=cv2.connectedComponentsWithStats(dark_sub.astype(np.uint8),8)
+            for i in range(1,ns):
+                x,y,bw,bh,area=map(int,stats_s[i])
+                if not (.04*w<bw<.35*w and .04*w<bh<.35*w and .65<=bw/max(1,bh)<=1.5 and area>200):
+                    continue
+                occupancy=area/max(1,bw*bh)
+                if occupancy<.55:
+                    continue
+                component=ndimage.binary_fill_holes(labels_s==i)
+                if np.any(component&~interior) or np.any(component&glass):
+                    continue
+                ring=ndimage.binary_dilation(component,iterations=12)&~ndimage.binary_dilation(component,iterations=4)&remaining&~glass
+                if ring.sum()<50:
+                    continue
+                contrast=float(np.median(gray[ring])-np.median(gray[component]))
+                if contrast<18.:
+                    continue
+                evidence=dict(box=[x,y,bw,bh],source_component_pixels=area,
+                              filled_pixels=int(component.sum()),outer_neighbourhood_pixels=0,
+                              source_box_occupancy=float(occupancy),ring_contrast_gray=contrast,
+                              sub_threshold_gray=sub_thr,detection='dark_plateau_separated_lens')
+                glass|=component;accepted.append(evidence);dark_metal_recovered.append(evidence)
     # On bright metallic backs (e.g. silver where plateau metal ~220+), the 3
     # large lenses alone occupy ~15% of the upper frame so p15 can bisect a
     # mid-dark LiDAR disk (~50-60 gray). Recover disjoint compact circular
@@ -740,6 +809,7 @@ def rear_camera_glass(a, remaining):
     return glass,dict(method='source_interior_camera_components_v3',
                       accepted=accepted,rejected_outer_fragments=outer_fragments,
                       rejected_shadow_arcs=shadow_arcs,
+                      dark_metal_recovered=dark_metal_recovered,
                       mid_contrast_accepted=mid_contrast_accepted,
                       lens_inner_completed=lens_inner_completed)
 

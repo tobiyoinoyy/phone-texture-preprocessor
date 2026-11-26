@@ -961,8 +961,18 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
                         far_start=min(h-1,max(0,int(np.min(limit))+12))
                         support_columns=ndimage.binary_dilation((a[far_start:,:,3]>0).any(axis=0),iterations=8)[None,:]
                 else:
-                    raise
-        if face == 'back':
+                    # On tilted front captures where 1-D vertical gradient fails on
+                    # a steeply curved corner, allow isotropic 2-D corner wedge
+                    # verification if it independently certifies the contact arc.
+                    wedge_support = ndimage.binary_dilation(remote.any(axis=0), iterations=24)
+                    wedge_limit, wedge_proof = plate_corner_wedge_limit(a, raw_rgb, rows, line, wedge_support, paper_cut)
+                    if wedge_proof and wedge_proof.get('changed_columns'):
+                        limit = np.minimum(limit, wedge_limit[None, :])
+                        support_columns = support_columns | (limit < base_limit)
+                        contact_curve_proof = wedge_proof
+                    else:
+                        raise
+        if face in ('back', 'front') and (contact_curve_proof is None or contact_curve_proof.get('method') != 'isotropic_corner_wedge_trim_v1'):
             wedge_support = ndimage.binary_dilation(remote.any(axis=0), iterations=24)
             wedge_limit, wedge_proof = plate_corner_wedge_limit(a, raw_rgb, rows, line, wedge_support, paper_cut)
             if wedge_proof and wedge_proof.get('changed_columns'):
@@ -1001,44 +1011,66 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
     exposed=(bottom<h-8)&(bottom>rows[-1]-bw*.12)
     if exposed.sum()<.08*bw:raise ValueError('Insufficient exposed plate edge')
     hist=ndimage.gaussian_filter1d(np.bincount(bottom[exposed]),2.)
-    seed=int(hist.argmax())
+    from scipy.signal import find_peaks
+    primary_seed=int(hist.argmax())
+    alt_peaks,_=find_peaks(hist,distance=10,height=max(5.,float(hist.max())*.15))
+    seed_candidates=[primary_seed]+[int(p) for p in sorted(alt_peaks,key=lambda k:-hist[k]) if abs(int(p)-primary_seed)>=10]
     # Locate the photographed lower edge independently across both halves,
     # including the contact area, rather than extending a rectangle crop.
     gx=np.arange(int(x0+.20*bw),int(x1-.20*bw))
     color=ndimage.gaussian_filter1d(raw_rgb.astype(np.float32),.8,axis=0)
     gradient=np.linalg.norm(np.gradient(color,axis=0),axis=2)
-    search=np.arange(max(0,seed-8),min(h,seed+max(12,int(bw*.02))+1))
-    strength=gradient[search[:,None],gx[None,:]]
-    local_peak=(strength>=np.roll(strength,1,axis=0))&(strength>=np.roll(strength,-1,axis=0))
-    local_peak[0]=False;local_peak[-1]=False
-    local_peak &= strength>=np.max(strength,axis=0)[None,:]*.20
-    # The inner display/rim transition can be stronger than the outer body
-    # boundary. Select the last supported source peak, not the brightest one.
-    gy=np.max(np.where(local_peak,search[:,None],-1),axis=0)
-    absent=gy<0;gy[absent]=search[np.argmax(strength[:,absent],axis=0)]
-    valid=np.max(strength,axis=0)>3
-    if paper is not None:valid &= ~paper[np.clip(gy,0,h-1),gx]
-    if valid.sum()<.2*bw:raise ValueError('Weak source RGB lower boundary')
-    options=[]
-    for proposal in (gy,search[np.argmax(strength,axis=0)]):
-        try:fitted,kept,error=fixed_slope_consensus(gx[valid]+.5,proposal[valid]+.5,body_slope)
-        except ValueError:continue
-        if error>3 and kept.mean()>=.6:
-            fitx=gx[valid][kept]+.5;fity=proposal[valid][kept]+.5
-            curve=np.polyfit(fitx,fity,2)
-            curve_error=float(np.percentile(np.abs(np.polyval(curve,fitx)-fity),95))
-            displacement=np.polyval(curve,np.array([x0,(x0+x1)/2,x1]))-np.polyval(fitted,np.array([x0,(x0+x1)/2,x1]))
-            if curve_error<=3 and np.max(np.abs(displacement))<=6:
-                fitted,error=curve,curve_error
-        slope=float(np.polyval(np.polyder(fitted),(x0+x1)/2))
-        if error<=3 and kept.mean()>=.6 and abs(slope)<=np.tan(np.deg2rad(4)):
-            # Keep the source-derived plate edge, not a stronger inner glass
-            # transition. Alpha at exposed phone columns supplies a separate
-            # outward-conservation constraint.
-            delta=bottom[exposed]-np.polyval(fitted,x[exposed]+.5)
-            near=delta[np.abs(delta)<12]
-            if len(near)>=max(20,exposed.sum()*.6) and abs(float(np.median(near)))<=5 and np.percentile(near,75)<=4:
-                options.append((float(np.polyval(fitted,(x0+x1)/2)),fitted,error,float(kept.mean())))
+    options=[];valid=np.zeros(len(gx),bool);any_strong_rgb=False;weak_shelf_seeds=[]
+    for seed in seed_candidates:
+        search=np.arange(max(0,seed-8),min(h,seed+max(12,int(bw*.02))+1))
+        strength=gradient[search[:,None],gx[None,:]]
+        local_peak=(strength>=np.roll(strength,1,axis=0))&(strength>=np.roll(strength,-1,axis=0))
+        local_peak[0]=False;local_peak[-1]=False
+        local_peak &= strength>=np.max(strength,axis=0)[None,:]*.20
+        # The inner display/rim transition can be stronger than the outer body
+        # boundary. Select the last supported source peak, not the brightest one.
+        gy=np.max(np.where(local_peak,search[:,None],-1),axis=0)
+        absent=gy<0;gy[absent]=search[np.argmax(strength[:,absent],axis=0)]
+        cand_valid=np.max(strength,axis=0)>3
+        if paper is not None:cand_valid &= ~paper[np.clip(gy,0,h-1),gx]
+        if cand_valid.sum()<.2*bw:
+            weak_shelf_seeds.append(seed)
+            continue
+        any_strong_rgb=True
+        seed_options=[]
+        for proposal in (gy,search[np.argmax(strength,axis=0)]):
+            try:fitted,kept,error=fixed_slope_consensus(gx[cand_valid]+.5,proposal[cand_valid]+.5,body_slope)
+            except ValueError:continue
+            if error>3 and kept.mean()>=.6:
+                fitx=gx[cand_valid][kept]+.5;fity=proposal[cand_valid][kept]+.5
+                curve=np.polyfit(fitx,fity,2)
+                curve_error=float(np.percentile(np.abs(np.polyval(curve,fitx)-fity),95))
+                displacement=np.polyval(curve,np.array([x0,(x0+x1)/2,x1]))-np.polyval(fitted,np.array([x0,(x0+x1)/2,x1]))
+                if curve_error<=3 and np.max(np.abs(displacement))<=6:
+                    fitted,error=curve,curve_error
+            slope=float(np.polyval(np.polyder(fitted),(x0+x1)/2))
+            if error<=3 and kept.mean()>=.6 and abs(slope)<=np.tan(np.deg2rad(4)):
+                # Keep the source-derived plate edge, not a stronger inner glass
+                # transition. Alpha at exposed phone columns supplies a separate
+                # outward-conservation constraint. If an earlier taller peak far
+                # below this rail had weak raw RGB (a flat white stand shelf),
+                # exclude that shelf from the exposed phone denominator.
+                y_mid=float(np.polyval(fitted,(x0+x1)/2))
+                eff_exposed=exposed.copy()
+                for ws in weak_shelf_seeds:
+                    if ws > y_mid + 18:
+                        eff_exposed &= bottom < ws - 10
+                if eff_exposed.sum() < max(20, .08 * bw):
+                    eff_exposed = exposed
+                delta=bottom[eff_exposed]-np.polyval(fitted,x[eff_exposed]+.5)
+                near=delta[np.abs(delta)<12]
+                if len(near)>=max(20,eff_exposed.sum()*.6) and abs(float(np.median(near)))<=5 and np.percentile(near,75)<=4:
+                    seed_options.append((y_mid,fitted,error,float(kept.mean())))
+        if seed_options:
+            options=seed_options;valid=cand_valid
+            break
+    if not any_strong_rgb:
+        raise ValueError('Weak source RGB lower boundary')
     if not options:
         if face == 'back' or _front_closure_evidence:
             from .joined_stand import cut_joined_stand
@@ -1058,7 +1090,7 @@ def _plate_geometry_strict(matte, face, paper=None, stage_sink=None,source_image
     support_columns=ndimage.binary_dilation(far.any(axis=0),iterations=8)
     paper=paper_without_stand(paper,limit,allow_tail=reconstruct_paper_tail)
     corner_wedge_proof=None
-    if face == 'back':
+    if face in ('back', 'front'):
         remote=(yy>np.polyval(line,xx)+12)&(a[...,3]>0)
         wedge_support=ndimage.binary_dilation(remote.any(axis=0),iterations=24)
         wedge_limit,corner_wedge_proof=plate_corner_wedge_limit(a,raw_rgb,rows,line,wedge_support,paper)
